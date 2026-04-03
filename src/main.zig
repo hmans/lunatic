@@ -24,33 +24,32 @@ const Vertex = extern struct {
 };
 
 // ============================================================
-// Cube mesh data — 36 vertices (6 faces, 2 tris each)
+// Built-in cube mesh
 // ============================================================
 
-fn v(x: f32, y: f32, z: f32, r: f32, g: f32, b: f32) Vertex {
+fn vtx(x: f32, y: f32, z: f32, r: f32, g: f32, b: f32) Vertex {
     return .{ .x = x, .y = y, .z = z, .r = r, .g = g, .b = b };
 }
 
-// Unit cube centered at origin, each face a different color
 const cube_vertices = [36]Vertex{
-    // Front face (red)
-    v(-0.5, -0.5, 0.5, 0.9, 0.2, 0.2), v(0.5, -0.5, 0.5, 0.9, 0.2, 0.2), v(0.5, 0.5, 0.5, 0.9, 0.2, 0.2),
-    v(-0.5, -0.5, 0.5, 0.9, 0.2, 0.2), v(0.5, 0.5, 0.5, 0.9, 0.2, 0.2),  v(-0.5, 0.5, 0.5, 0.9, 0.2, 0.2),
-    // Back face (green)
-    v(0.5, -0.5, -0.5, 0.2, 0.8, 0.2),  v(-0.5, -0.5, -0.5, 0.2, 0.8, 0.2), v(-0.5, 0.5, -0.5, 0.2, 0.8, 0.2),
-    v(0.5, -0.5, -0.5, 0.2, 0.8, 0.2),  v(-0.5, 0.5, -0.5, 0.2, 0.8, 0.2),  v(0.5, 0.5, -0.5, 0.2, 0.8, 0.2),
-    // Top face (blue)
-    v(-0.5, 0.5, 0.5, 0.2, 0.3, 0.9),  v(0.5, 0.5, 0.5, 0.2, 0.3, 0.9),  v(0.5, 0.5, -0.5, 0.2, 0.3, 0.9),
-    v(-0.5, 0.5, 0.5, 0.2, 0.3, 0.9),  v(0.5, 0.5, -0.5, 0.2, 0.3, 0.9), v(-0.5, 0.5, -0.5, 0.2, 0.3, 0.9),
-    // Bottom face (yellow)
-    v(-0.5, -0.5, -0.5, 0.9, 0.8, 0.1), v(0.5, -0.5, -0.5, 0.9, 0.8, 0.1), v(0.5, -0.5, 0.5, 0.9, 0.8, 0.1),
-    v(-0.5, -0.5, -0.5, 0.9, 0.8, 0.1), v(0.5, -0.5, 0.5, 0.9, 0.8, 0.1),  v(-0.5, -0.5, 0.5, 0.9, 0.8, 0.1),
-    // Right face (magenta)
-    v(0.5, -0.5, 0.5, 0.8, 0.2, 0.8),  v(0.5, -0.5, -0.5, 0.8, 0.2, 0.8), v(0.5, 0.5, -0.5, 0.8, 0.2, 0.8),
-    v(0.5, -0.5, 0.5, 0.8, 0.2, 0.8),  v(0.5, 0.5, -0.5, 0.8, 0.2, 0.8),  v(0.5, 0.5, 0.5, 0.8, 0.2, 0.8),
-    // Left face (cyan)
-    v(-0.5, -0.5, -0.5, 0.2, 0.8, 0.8), v(-0.5, -0.5, 0.5, 0.2, 0.8, 0.8),  v(-0.5, 0.5, 0.5, 0.2, 0.8, 0.8),
-    v(-0.5, -0.5, -0.5, 0.2, 0.8, 0.8), v(-0.5, 0.5, 0.5, 0.2, 0.8, 0.8),   v(-0.5, 0.5, -0.5, 0.2, 0.8, 0.8),
+    // Front (red)
+    vtx(-0.5, -0.5, 0.5, 0.9, 0.2, 0.2), vtx(0.5, -0.5, 0.5, 0.9, 0.2, 0.2), vtx(0.5, 0.5, 0.5, 0.9, 0.2, 0.2),
+    vtx(-0.5, -0.5, 0.5, 0.9, 0.2, 0.2), vtx(0.5, 0.5, 0.5, 0.9, 0.2, 0.2),  vtx(-0.5, 0.5, 0.5, 0.9, 0.2, 0.2),
+    // Back (green)
+    vtx(0.5, -0.5, -0.5, 0.2, 0.8, 0.2),  vtx(-0.5, -0.5, -0.5, 0.2, 0.8, 0.2), vtx(-0.5, 0.5, -0.5, 0.2, 0.8, 0.2),
+    vtx(0.5, -0.5, -0.5, 0.2, 0.8, 0.2),  vtx(-0.5, 0.5, -0.5, 0.2, 0.8, 0.2),  vtx(0.5, 0.5, -0.5, 0.2, 0.8, 0.2),
+    // Top (blue)
+    vtx(-0.5, 0.5, 0.5, 0.2, 0.3, 0.9),  vtx(0.5, 0.5, 0.5, 0.2, 0.3, 0.9),  vtx(0.5, 0.5, -0.5, 0.2, 0.3, 0.9),
+    vtx(-0.5, 0.5, 0.5, 0.2, 0.3, 0.9),  vtx(0.5, 0.5, -0.5, 0.2, 0.3, 0.9), vtx(-0.5, 0.5, -0.5, 0.2, 0.3, 0.9),
+    // Bottom (yellow)
+    vtx(-0.5, -0.5, -0.5, 0.9, 0.8, 0.1), vtx(0.5, -0.5, -0.5, 0.9, 0.8, 0.1), vtx(0.5, -0.5, 0.5, 0.9, 0.8, 0.1),
+    vtx(-0.5, -0.5, -0.5, 0.9, 0.8, 0.1), vtx(0.5, -0.5, 0.5, 0.9, 0.8, 0.1),  vtx(-0.5, -0.5, 0.5, 0.9, 0.8, 0.1),
+    // Right (magenta)
+    vtx(0.5, -0.5, 0.5, 0.8, 0.2, 0.8),  vtx(0.5, -0.5, -0.5, 0.8, 0.2, 0.8), vtx(0.5, 0.5, -0.5, 0.8, 0.2, 0.8),
+    vtx(0.5, -0.5, 0.5, 0.8, 0.2, 0.8),  vtx(0.5, 0.5, -0.5, 0.8, 0.2, 0.8),  vtx(0.5, 0.5, 0.5, 0.8, 0.2, 0.8),
+    // Left (cyan)
+    vtx(-0.5, -0.5, -0.5, 0.2, 0.8, 0.8), vtx(-0.5, -0.5, 0.5, 0.2, 0.8, 0.8),  vtx(-0.5, 0.5, 0.5, 0.2, 0.8, 0.8),
+    vtx(-0.5, -0.5, -0.5, 0.2, 0.8, 0.8), vtx(-0.5, 0.5, 0.5, 0.2, 0.8, 0.8),   vtx(-0.5, 0.5, -0.5, 0.2, 0.8, 0.8),
 };
 
 // ============================================================
@@ -101,26 +100,79 @@ const fragment_shader_msl =
 ;
 
 // ============================================================
+// Mesh registry
+// ============================================================
+
+const Mesh = struct {
+    buffer: *c.SDL_GPUBuffer,
+    vertex_count: u32,
+};
+
+const max_meshes = 64;
+var meshes: [max_meshes]?Mesh = .{null} ** max_meshes;
+var mesh_names: [max_meshes]?[*:0]const u8 = .{null} ** max_meshes;
+var mesh_count: u32 = 0;
+
+fn registerMesh(name: [*:0]const u8, buffer: *c.SDL_GPUBuffer, vertex_count: u32) u32 {
+    const id = mesh_count;
+    meshes[id] = .{ .buffer = buffer, .vertex_count = vertex_count };
+    mesh_names[id] = name;
+    mesh_count += 1;
+    return id;
+}
+
+fn findMesh(name: [*:0]const u8) ?u32 {
+    const needle = std.mem.span(name);
+    for (0..mesh_count) |i| {
+        if (mesh_names[i]) |n| {
+            if (std.mem.eql(u8, std.mem.span(n), needle)) return @intCast(i);
+        }
+    }
+    return null;
+}
+
+// ============================================================
+// Per-frame draw list
+// ============================================================
+
+const DrawCmd = struct {
+    mesh_id: u32,
+    position: Vec3,
+    rotation: Vec3, // euler angles in degrees (rx, ry, rz)
+};
+
+const max_draws = 4096;
+var draw_list: [max_draws]DrawCmd = undefined;
+var draw_count: u32 = 0;
+
+fn resetDrawList() void {
+    draw_count = 0;
+}
+
+fn pushDraw(mesh_id: u32, pos: Vec3, rot: Vec3) void {
+    if (draw_count >= max_draws) return;
+    draw_list[draw_count] = .{ .mesh_id = mesh_id, .position = pos, .rotation = rot };
+    draw_count += 1;
+}
+
+// ============================================================
 // Engine globals
 // ============================================================
 
 var gpu_device: ?*c.SDL_GPUDevice = null;
 var window: ?*c.SDL_Window = null;
 var pipeline: ?*c.SDL_GPUGraphicsPipeline = null;
-var vertex_buffer: ?*c.SDL_GPUBuffer = null;
 var depth_texture: ?*c.SDL_GPUTexture = null;
 
-// Camera/transform state — Lua can write to these
 var camera_eye = Vec3.new(0, 1.5, 4);
 var camera_target = Vec3.new(0, 0, 0);
-var model_rotation_y: f32 = 0;
-var model_rotation_x: f32 = 0;
 var clear_color = [4]f32{ 0.08, 0.08, 0.12, 1.0 };
 
 // ============================================================
 // Lua API
 // ============================================================
 
+/// gammo.key_down(name) -> bool
 fn luaKeyDown(L: ?*c.lua_State) callconv(.c) c_int {
     const name = c.luaL_checklstring(L, 1, null);
     const scancode = c.SDL_GetScancodeFromName(name);
@@ -129,6 +181,7 @@ fn luaKeyDown(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+/// gammo.set_camera(ex, ey, ez, tx, ty, tz)
 fn luaSetCamera(L: ?*c.lua_State) callconv(.c) c_int {
     camera_eye.x = @floatCast(c.luaL_checknumber(L, 1));
     camera_eye.y = @floatCast(c.luaL_checknumber(L, 2));
@@ -139,12 +192,7 @@ fn luaSetCamera(L: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
-fn luaSetRotation(L: ?*c.lua_State) callconv(.c) c_int {
-    model_rotation_x = @floatCast(c.luaL_checknumber(L, 1));
-    model_rotation_y = @floatCast(c.luaL_checknumber(L, 2));
-    return 0;
-}
-
+/// gammo.set_clear_color(r, g, b)
 fn luaSetClearColor(L: ?*c.lua_State) callconv(.c) c_int {
     clear_color[0] = @floatCast(c.luaL_checknumber(L, 1));
     clear_color[1] = @floatCast(c.luaL_checknumber(L, 2));
@@ -152,11 +200,32 @@ fn luaSetClearColor(L: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+/// gammo.draw_mesh(name, x, y, z, rx, ry, rz)
+fn luaDrawMesh(L: ?*c.lua_State) callconv(.c) c_int {
+    const name = c.luaL_checklstring(L, 1, null);
+    const mesh_id = findMesh(name) orelse {
+        _ = c.luaL_error(L, "unknown mesh: %s", name);
+        return 0;
+    };
+    const pos = Vec3.new(
+        @floatCast(c.luaL_optnumber(L, 2, 0)),
+        @floatCast(c.luaL_optnumber(L, 3, 0)),
+        @floatCast(c.luaL_optnumber(L, 4, 0)),
+    );
+    const rot = Vec3.new(
+        @floatCast(c.luaL_optnumber(L, 5, 0)),
+        @floatCast(c.luaL_optnumber(L, 6, 0)),
+        @floatCast(c.luaL_optnumber(L, 7, 0)),
+    );
+    pushDraw(mesh_id, pos, rot);
+    return 0;
+}
+
 const gammo_lib = [_]c.luaL_Reg{
     .{ .name = "key_down", .func = luaKeyDown },
     .{ .name = "set_camera", .func = luaSetCamera },
-    .{ .name = "set_rotation", .func = luaSetRotation },
     .{ .name = "set_clear_color", .func = luaSetClearColor },
+    .{ .name = "draw_mesh", .func = luaDrawMesh },
     .{ .name = null, .func = null },
 };
 
@@ -180,17 +249,15 @@ fn createShader(device: *c.SDL_GPUDevice, code: [*:0]const u8, stage: c.SDL_GPUS
     return c.SDL_CreateGPUShader(device, &info);
 }
 
-fn uploadVertexBuffer(device: *c.SDL_GPUDevice) ?*c.SDL_GPUBuffer {
-    const data_size: u32 = @sizeOf(@TypeOf(cube_vertices));
+fn uploadVertexData(device: *c.SDL_GPUDevice, data: []const u8) ?*c.SDL_GPUBuffer {
+    const data_size: u32 = @intCast(data.len);
 
-    // Create GPU vertex buffer
     const buf = c.SDL_CreateGPUBuffer(device, &c.SDL_GPUBufferCreateInfo{
         .usage = c.SDL_GPU_BUFFERUSAGE_VERTEX,
         .size = data_size,
         .props = 0,
     }) orelse return null;
 
-    // Create transfer buffer, map, copy, upload
     const transfer = c.SDL_CreateGPUTransferBuffer(device, &c.SDL_GPUTransferBufferCreateInfo{
         .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
         .size = data_size,
@@ -198,7 +265,7 @@ fn uploadVertexBuffer(device: *c.SDL_GPUDevice) ?*c.SDL_GPUBuffer {
     }) orelse return null;
 
     const ptr = c.SDL_MapGPUTransferBuffer(device, transfer, false) orelse return null;
-    @memcpy(@as([*]u8, @ptrCast(ptr))[0..data_size], std.mem.asBytes(&cube_vertices));
+    @memcpy(@as([*]u8, @ptrCast(ptr))[0..data_size], data);
     c.SDL_UnmapGPUTransferBuffer(device, transfer);
 
     const cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse return null;
@@ -237,14 +304,12 @@ fn createDepthTexture(device: *c.SDL_GPUDevice, w: u32, h: u32) ?*c.SDL_GPUTextu
 // ============================================================
 
 pub fn main() !void {
-    // ----- SDL3 init -----
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
         std.debug.print("SDL_Init failed: {s}\n", .{c.SDL_GetError()});
         return error.SDLInitFailed;
     }
     defer c.SDL_Quit();
 
-    // ----- GPU device -----
     gpu_device = c.SDL_CreateGPUDevice(c.SDL_GPU_SHADERFORMAT_MSL, true, null);
     if (gpu_device == null) {
         std.debug.print("SDL_CreateGPUDevice failed: {s}\n", .{c.SDL_GetError()});
@@ -253,7 +318,6 @@ pub fn main() !void {
     const device = gpu_device.?;
     defer c.SDL_DestroyGPUDevice(device);
 
-    // ----- Window -----
     window = c.SDL_CreateWindow("gammo", 800, 600, 0);
     if (window == null) {
         std.debug.print("SDL_CreateWindow failed: {s}\n", .{c.SDL_GetError()});
@@ -266,7 +330,7 @@ pub fn main() !void {
         return error.ClaimWindowFailed;
     }
 
-    // ----- Shaders -----
+    // Shaders
     const vert_shader = createShader(device, vertex_shader_msl, c.SDL_GPU_SHADERSTAGE_VERTEX, 1) orelse {
         std.debug.print("Failed to create vertex shader: {s}\n", .{c.SDL_GetError()});
         return error.ShaderFailed;
@@ -279,7 +343,7 @@ pub fn main() !void {
     };
     defer c.SDL_ReleaseGPUShader(device, frag_shader);
 
-    // ----- Pipeline -----
+    // Pipeline
     const swapchain_format = c.SDL_GetGPUSwapchainTextureFormat(device, window);
 
     const vertex_attrs = [_]c.SDL_GPUVertexAttribute{
@@ -292,10 +356,7 @@ pub fn main() !void {
     };
 
     const color_target_desc = [_]c.SDL_GPUColorTargetDescription{
-        .{
-            .format = swapchain_format,
-            .blend_state = std.mem.zeroes(c.SDL_GPUColorTargetBlendState),
-        },
+        .{ .format = swapchain_format, .blend_state = std.mem.zeroes(c.SDL_GPUColorTargetBlendState) },
     };
 
     pipeline = c.SDL_CreateGPUGraphicsPipeline(device, &c.SDL_GPUGraphicsPipelineCreateInfo{
@@ -357,27 +418,30 @@ pub fn main() !void {
     };
     defer c.SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
 
-    // ----- Vertex buffer -----
-    vertex_buffer = uploadVertexBuffer(device) orelse {
-        std.debug.print("Failed to upload vertex buffer: {s}\n", .{c.SDL_GetError()});
+    // Register built-in meshes
+    const cube_buf = uploadVertexData(device, std.mem.asBytes(&cube_vertices)) orelse {
+        std.debug.print("Failed to upload cube mesh: {s}\n", .{c.SDL_GetError()});
         return error.BufferFailed;
     };
-    defer c.SDL_ReleaseGPUBuffer(device, vertex_buffer);
+    _ = registerMesh("cube", cube_buf, cube_vertices.len);
 
-    // ----- Depth texture -----
+    // Depth texture
     depth_texture = createDepthTexture(device, 800, 600) orelse {
         std.debug.print("Failed to create depth texture: {s}\n", .{c.SDL_GetError()});
         return error.DepthTextureFailed;
     };
     defer c.SDL_ReleaseGPUTexture(device, depth_texture);
 
-    // ----- Lua init -----
+    // Lua init
     const L = c.luaL_newstate() orelse return error.LuaInitFailed;
     defer c.lua_close(L);
     c.luaL_openlibs(L);
 
     c.luaL_register(L, "gammo", &gammo_lib);
     c.lua_pop(L, 1);
+
+    // Add game/ to Lua's require search path
+    _ = c.luaL_dostring(L, "package.path = 'game/?.lua;' .. package.path");
 
     if (c.luaL_loadfile(L, "game/main.lua") != 0 or c.lua_pcall(L, 0, 0, 0) != 0) {
         const err = c.lua_tolstring(L, -1, null);
@@ -387,7 +451,7 @@ pub fn main() !void {
 
     callLua(L, "init", 0);
 
-    // ----- Game loop -----
+    // Game loop
     var running = true;
     var last_time = c.SDL_GetPerformanceCounter();
     const freq: f64 = @floatFromInt(c.SDL_GetPerformanceFrequency());
@@ -402,14 +466,13 @@ pub fn main() !void {
         smooth_dt += dt_smoothing * (raw_dt - smooth_dt);
         const dt = smooth_dt;
 
-        // Events
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
             if (event.type == c.SDL_EVENT_QUIT) running = false;
             if (event.type == c.SDL_EVENT_KEY_DOWN and event.key.scancode == c.SDL_SCANCODE_ESCAPE) running = false;
         }
 
-        // Lua update
+        // Lua update (game logic)
         _ = c.lua_getglobal(L, "update");
         c.lua_pushnumber(L, dt);
         if (c.lua_pcall(L, 1, 0, 0) != 0) {
@@ -418,7 +481,11 @@ pub fn main() !void {
             c.lua_pop(L, 1);
         }
 
-        // ----- Render -----
+        // Lua draw (populates draw list via gammo.draw_mesh calls)
+        resetDrawList();
+        callLua(L, "draw", 0);
+
+        // Render the draw list
         const cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse continue;
 
         var swapchain_tex: ?*c.SDL_GPUTexture = null;
@@ -433,14 +500,11 @@ pub fn main() !void {
             continue;
         }
 
-        // Build MVP
         const aspect: f32 = @as(f32, @floatFromInt(sw_w)) / @as(f32, @floatFromInt(sw_h));
         const proj = Mat4.perspective(60.0, aspect, 0.1, 100.0);
         const view = Mat4.lookAt(camera_eye, camera_target, Vec3.new(0, 1, 0));
-        const model = Mat4.mul(Mat4.rotateY(model_rotation_y), Mat4.rotateX(model_rotation_x));
-        const mvp = Mat4.mul(proj, Mat4.mul(view, model));
+        const vp = Mat4.mul(proj, view);
 
-        // Begin render pass
         const color_target = c.SDL_GPUColorTargetInfo{
             .texture = swapchain_tex,
             .mip_level = 0,
@@ -477,14 +541,28 @@ pub fn main() !void {
 
         c.SDL_BindGPUGraphicsPipeline(render_pass, pipeline);
 
-        const binding = c.SDL_GPUBufferBinding{ .buffer = vertex_buffer, .offset = 0 };
-        c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
+        // Flush the draw list
+        for (0..draw_count) |i| {
+            const draw = draw_list[i];
+            const mesh = meshes[draw.mesh_id] orelse continue;
 
-        c.SDL_PushGPUVertexUniformData(cmd, 0, &mvp.m, @sizeOf(Mat4));
+            const rotation = Mat4.mul(
+                Mat4.rotateY(draw.rotation.y),
+                Mat4.rotateX(draw.rotation.x),
+            );
+            const model = Mat4.mul(
+                Mat4.translate(draw.position.x, draw.position.y, draw.position.z),
+                rotation,
+            );
+            const mvp = Mat4.mul(vp, model);
 
-        c.SDL_DrawGPUPrimitives(render_pass, 36, 1, 0, 0);
+            const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.buffer, .offset = 0 };
+            c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
+            c.SDL_PushGPUVertexUniformData(cmd, 0, &mvp.m, @sizeOf(Mat4));
+            c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, 1, 0, 0);
+        }
+
         c.SDL_EndGPURenderPass(render_pass);
-
         _ = c.SDL_SubmitGPUCommandBuffer(cmd);
     }
 }

@@ -116,6 +116,14 @@ pub const Mat4 = struct {
         return result;
     }
 
+    pub fn translate(tx: f32, ty: f32, tz: f32) Mat4 {
+        var result = Mat4.identity();
+        result.m[3][0] = tx;
+        result.m[3][1] = ty;
+        result.m[3][2] = tz;
+        return result;
+    }
+
     pub fn mul(a: Mat4, b: Mat4) Mat4 {
         var result: Mat4 = undefined;
         for (0..4) |col| {
