@@ -1,16 +1,26 @@
 -- game/main.lua
--- Multiple cubes driven by ECS.
+-- Multiple cubes with lighting and fog, driven by ECS.
 
 local ecs = require("ecs")
 local world = ecs.world()
 
 function init()
-  gammo.set_clear_color(0.08, 0.08, 0.12)
+  -- Sky/clear color
+  gammo.set_clear_color(0.55, 0.7, 0.85)
+
+  -- Camera
   gammo.set_camera(0, 8, 12, 0, 0, 0)
 
-  -- Spawn a grid of cubes
-  for x = -2, 2 do
-    for z = -2, 2 do
+  -- Lighting
+  gammo.set_light(0.3, 0.8, 0.5)
+  gammo.set_ambient(0.15, 0.15, 0.25)
+
+  -- Fog — fades to sky color
+  gammo.set_fog(8, 25, 0.55, 0.7, 0.85)
+
+  -- Spawn a bigger grid of cubes
+  for x = -4, 4 do
+    for z = -4, 4 do
       world:spawn({
         position = { x = x * 2, y = 0, z = z * 2 },
         rotation = { x = 0, y = math.random() * 360, z = 0 },
@@ -20,7 +30,7 @@ function init()
     end
   end
 
-  -- Spawn a player cube (bigger spin, starts at origin)
+  -- Player cube
   player = world:spawn({
     position = { x = 0, y = 0.5, z = 0 },
     rotation = { x = 0, y = 0, z = 0 },
@@ -29,7 +39,7 @@ function init()
     player = true,
   })
 
-  print("gammo ECS is alive! " .. 26 .. " entities spawned.")
+  print("gammo is alive! Cubes with lighting and fog.")
 end
 
 -- Systems

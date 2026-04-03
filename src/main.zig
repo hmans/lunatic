@@ -11,45 +11,45 @@ const c = @cImport({
 });
 
 // ============================================================
-// Vertex format
+// Vertex format: position + normal
 // ============================================================
 
 const Vertex = extern struct {
-    x: f32,
-    y: f32,
-    z: f32,
-    r: f32,
-    g: f32,
-    b: f32,
+    px: f32,
+    py: f32,
+    pz: f32,
+    nx: f32,
+    ny: f32,
+    nz: f32,
 };
 
 // ============================================================
-// Built-in cube mesh
+// Built-in cube mesh (white albedo, face normals)
 // ============================================================
 
-fn vtx(x: f32, y: f32, z: f32, r: f32, g: f32, b: f32) Vertex {
-    return .{ .x = x, .y = y, .z = z, .r = r, .g = g, .b = b };
+fn vtx(px: f32, py: f32, pz: f32, nx: f32, ny: f32, nz: f32) Vertex {
+    return .{ .px = px, .py = py, .pz = pz, .nx = nx, .ny = ny, .nz = nz };
 }
 
 const cube_vertices = [36]Vertex{
-    // Front (red)
-    vtx(-0.5, -0.5, 0.5, 0.9, 0.2, 0.2), vtx(0.5, -0.5, 0.5, 0.9, 0.2, 0.2), vtx(0.5, 0.5, 0.5, 0.9, 0.2, 0.2),
-    vtx(-0.5, -0.5, 0.5, 0.9, 0.2, 0.2), vtx(0.5, 0.5, 0.5, 0.9, 0.2, 0.2),  vtx(-0.5, 0.5, 0.5, 0.9, 0.2, 0.2),
-    // Back (green)
-    vtx(0.5, -0.5, -0.5, 0.2, 0.8, 0.2),  vtx(-0.5, -0.5, -0.5, 0.2, 0.8, 0.2), vtx(-0.5, 0.5, -0.5, 0.2, 0.8, 0.2),
-    vtx(0.5, -0.5, -0.5, 0.2, 0.8, 0.2),  vtx(-0.5, 0.5, -0.5, 0.2, 0.8, 0.2),  vtx(0.5, 0.5, -0.5, 0.2, 0.8, 0.2),
-    // Top (blue)
-    vtx(-0.5, 0.5, 0.5, 0.2, 0.3, 0.9),  vtx(0.5, 0.5, 0.5, 0.2, 0.3, 0.9),  vtx(0.5, 0.5, -0.5, 0.2, 0.3, 0.9),
-    vtx(-0.5, 0.5, 0.5, 0.2, 0.3, 0.9),  vtx(0.5, 0.5, -0.5, 0.2, 0.3, 0.9), vtx(-0.5, 0.5, -0.5, 0.2, 0.3, 0.9),
-    // Bottom (yellow)
-    vtx(-0.5, -0.5, -0.5, 0.9, 0.8, 0.1), vtx(0.5, -0.5, -0.5, 0.9, 0.8, 0.1), vtx(0.5, -0.5, 0.5, 0.9, 0.8, 0.1),
-    vtx(-0.5, -0.5, -0.5, 0.9, 0.8, 0.1), vtx(0.5, -0.5, 0.5, 0.9, 0.8, 0.1),  vtx(-0.5, -0.5, 0.5, 0.9, 0.8, 0.1),
-    // Right (magenta)
-    vtx(0.5, -0.5, 0.5, 0.8, 0.2, 0.8),  vtx(0.5, -0.5, -0.5, 0.8, 0.2, 0.8), vtx(0.5, 0.5, -0.5, 0.8, 0.2, 0.8),
-    vtx(0.5, -0.5, 0.5, 0.8, 0.2, 0.8),  vtx(0.5, 0.5, -0.5, 0.8, 0.2, 0.8),  vtx(0.5, 0.5, 0.5, 0.8, 0.2, 0.8),
-    // Left (cyan)
-    vtx(-0.5, -0.5, -0.5, 0.2, 0.8, 0.8), vtx(-0.5, -0.5, 0.5, 0.2, 0.8, 0.8),  vtx(-0.5, 0.5, 0.5, 0.2, 0.8, 0.8),
-    vtx(-0.5, -0.5, -0.5, 0.2, 0.8, 0.8), vtx(-0.5, 0.5, 0.5, 0.2, 0.8, 0.8),   vtx(-0.5, 0.5, -0.5, 0.2, 0.8, 0.8),
+    // Front face (normal: 0, 0, 1)
+    vtx(-0.5, -0.5, 0.5, 0, 0, 1), vtx(0.5, -0.5, 0.5, 0, 0, 1), vtx(0.5, 0.5, 0.5, 0, 0, 1),
+    vtx(-0.5, -0.5, 0.5, 0, 0, 1), vtx(0.5, 0.5, 0.5, 0, 0, 1),  vtx(-0.5, 0.5, 0.5, 0, 0, 1),
+    // Back face (normal: 0, 0, -1)
+    vtx(0.5, -0.5, -0.5, 0, 0, -1),  vtx(-0.5, -0.5, -0.5, 0, 0, -1), vtx(-0.5, 0.5, -0.5, 0, 0, -1),
+    vtx(0.5, -0.5, -0.5, 0, 0, -1),  vtx(-0.5, 0.5, -0.5, 0, 0, -1),  vtx(0.5, 0.5, -0.5, 0, 0, -1),
+    // Top face (normal: 0, 1, 0)
+    vtx(-0.5, 0.5, 0.5, 0, 1, 0),  vtx(0.5, 0.5, 0.5, 0, 1, 0),  vtx(0.5, 0.5, -0.5, 0, 1, 0),
+    vtx(-0.5, 0.5, 0.5, 0, 1, 0),  vtx(0.5, 0.5, -0.5, 0, 1, 0), vtx(-0.5, 0.5, -0.5, 0, 1, 0),
+    // Bottom face (normal: 0, -1, 0)
+    vtx(-0.5, -0.5, -0.5, 0, -1, 0), vtx(0.5, -0.5, -0.5, 0, -1, 0), vtx(0.5, -0.5, 0.5, 0, -1, 0),
+    vtx(-0.5, -0.5, -0.5, 0, -1, 0), vtx(0.5, -0.5, 0.5, 0, -1, 0),  vtx(-0.5, -0.5, 0.5, 0, -1, 0),
+    // Right face (normal: 1, 0, 0)
+    vtx(0.5, -0.5, 0.5, 1, 0, 0),  vtx(0.5, -0.5, -0.5, 1, 0, 0), vtx(0.5, 0.5, -0.5, 1, 0, 0),
+    vtx(0.5, -0.5, 0.5, 1, 0, 0),  vtx(0.5, 0.5, -0.5, 1, 0, 0),  vtx(0.5, 0.5, 0.5, 1, 0, 0),
+    // Left face (normal: -1, 0, 0)
+    vtx(-0.5, -0.5, -0.5, -1, 0, 0), vtx(-0.5, -0.5, 0.5, -1, 0, 0),  vtx(-0.5, 0.5, 0.5, -1, 0, 0),
+    vtx(-0.5, -0.5, -0.5, -1, 0, 0), vtx(-0.5, 0.5, 0.5, -1, 0, 0),   vtx(-0.5, 0.5, -0.5, -1, 0, 0),
 };
 
 // ============================================================
@@ -62,25 +62,28 @@ const vertex_shader_msl =
     \\
     \\struct Vertex {
     \\    float3 position [[attribute(0)]];
-    \\    float3 color    [[attribute(1)]];
+    \\    float3 normal   [[attribute(1)]];
     \\};
     \\
-    \\struct Uniforms {
+    \\struct VertexUniforms {
     \\    float4x4 mvp;
+    \\    float4x4 model;
     \\};
     \\
     \\struct VertexOut {
     \\    float4 position [[position]];
-    \\    float3 color;
+    \\    float3 world_pos;
+    \\    float3 world_normal;
     \\};
     \\
     \\vertex VertexOut vertex_main(
     \\    Vertex in [[stage_in]],
-    \\    constant Uniforms &uniforms [[buffer(0)]]
+    \\    constant VertexUniforms &u [[buffer(0)]]
     \\) {
     \\    VertexOut out;
-    \\    out.position = uniforms.mvp * float4(in.position, 1.0);
-    \\    out.color = in.color;
+    \\    out.position = u.mvp * float4(in.position, 1.0);
+    \\    out.world_pos = (u.model * float4(in.position, 1.0)).xyz;
+    \\    out.world_normal = normalize((u.model * float4(in.normal, 0.0)).xyz);
     \\    return out;
     \\}
 ;
@@ -91,13 +94,62 @@ const fragment_shader_msl =
     \\
     \\struct VertexOut {
     \\    float4 position [[position]];
-    \\    float3 color;
+    \\    float3 world_pos;
+    \\    float3 world_normal;
     \\};
     \\
-    \\fragment float4 fragment_main(VertexOut in [[stage_in]]) {
-    \\    return float4(in.color, 1.0);
+    \\struct FragUniforms {
+    \\    float4 light_dir;       // xyz = direction (toward light), w = unused
+    \\    float4 camera_pos;      // xyz = eye position, w = unused
+    \\    float4 fog_color;       // xyz = color, w = fog_start
+    \\    float4 fog_params;      // x = fog_end, y = fog_enabled, zw = unused
+    \\    float4 albedo;          // xyz = surface color, w = unused
+    \\    float4 ambient;         // xyz = ambient color, w = unused
+    \\};
+    \\
+    \\fragment float4 fragment_main(
+    \\    VertexOut in [[stage_in]],
+    \\    constant FragUniforms &u [[buffer(0)]]
+    \\) {
+    \\    // Directional light (half-Lambert for softer shading)
+    \\    float3 N = normalize(in.world_normal);
+    \\    float3 L = normalize(u.light_dir.xyz);
+    \\    float ndotl = dot(N, L);
+    \\    float diffuse = ndotl * 0.5 + 0.5; // half-Lambert wrap
+    \\    diffuse = diffuse * diffuse;        // square for contrast
+    \\
+    \\    float3 color = u.albedo.xyz * (u.ambient.xyz + diffuse);
+    \\
+    \\    // Fog
+    \\    if (u.fog_params.y > 0.5) {
+    \\        float dist = length(in.world_pos - u.camera_pos.xyz);
+    \\        float fog_start = u.fog_color.w;
+    \\        float fog_end = u.fog_params.x;
+    \\        float fog_factor = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
+    \\        color = mix(color, u.fog_color.xyz, fog_factor);
+    \\    }
+    \\
+    \\    return float4(color, 1.0);
     \\}
 ;
+
+// ============================================================
+// Uniform structs (std140 layout — vec4 aligned)
+// ============================================================
+
+const VertexUniforms = extern struct {
+    mvp: [4][4]f32,
+    model: [4][4]f32,
+};
+
+const FragUniforms = extern struct {
+    light_dir: [4]f32,     // xyz = direction, w = pad
+    camera_pos: [4]f32,    // xyz = eye, w = pad
+    fog_color: [4]f32,     // xyz = color, w = fog_start
+    fog_params: [4]f32,    // x = fog_end, y = fog_enabled, zw = pad
+    albedo: [4]f32,        // xyz = surface color, w = pad
+    ambient: [4]f32,       // xyz = ambient light color, w = pad
+};
 
 // ============================================================
 // Mesh registry
@@ -138,7 +190,7 @@ fn findMesh(name: [*:0]const u8) ?u32 {
 const DrawCmd = struct {
     mesh_id: u32,
     position: Vec3,
-    rotation: Vec3, // euler angles in degrees (rx, ry, rz)
+    rotation: Vec3,
 };
 
 const max_draws = 4096;
@@ -147,6 +199,14 @@ var draw_count: u32 = 0;
 
 fn resetDrawList() void {
     draw_count = 0;
+}
+
+fn sortDrawList() void {
+    std.mem.sort(DrawCmd, draw_list[0..draw_count], {}, struct {
+        fn lessThan(_: void, a: DrawCmd, b: DrawCmd) bool {
+            return a.mesh_id < b.mesh_id;
+        }
+    }.lessThan);
 }
 
 fn pushDraw(mesh_id: u32, pos: Vec3, rot: Vec3) void {
@@ -168,11 +228,20 @@ var camera_eye = Vec3.new(0, 1.5, 4);
 var camera_target = Vec3.new(0, 0, 0);
 var clear_color = [4]f32{ 0.08, 0.08, 0.12, 1.0 };
 
+// Lighting
+var light_dir = [4]f32{ 0.4, 0.8, 0.4, 0.0 }; // direction toward light
+var ambient_color = [4]f32{ 0.15, 0.15, 0.2, 0.0 };
+
+// Fog
+var fog_enabled: bool = false;
+var fog_start: f32 = 10.0;
+var fog_end: f32 = 30.0;
+var fog_color = [3]f32{ 0.08, 0.08, 0.12 }; // defaults to clear color
+
 // ============================================================
 // Lua API
 // ============================================================
 
-/// gammo.key_down(name) -> bool
 fn luaKeyDown(L: ?*c.lua_State) callconv(.c) c_int {
     const name = c.luaL_checklstring(L, 1, null);
     const scancode = c.SDL_GetScancodeFromName(name);
@@ -181,7 +250,6 @@ fn luaKeyDown(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// gammo.set_camera(ex, ey, ez, tx, ty, tz)
 fn luaSetCamera(L: ?*c.lua_State) callconv(.c) c_int {
     camera_eye.x = @floatCast(c.luaL_checknumber(L, 1));
     camera_eye.y = @floatCast(c.luaL_checknumber(L, 2));
@@ -192,7 +260,6 @@ fn luaSetCamera(L: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
-/// gammo.set_clear_color(r, g, b)
 fn luaSetClearColor(L: ?*c.lua_State) callconv(.c) c_int {
     clear_color[0] = @floatCast(c.luaL_checknumber(L, 1));
     clear_color[1] = @floatCast(c.luaL_checknumber(L, 2));
@@ -200,7 +267,38 @@ fn luaSetClearColor(L: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
-/// gammo.draw_mesh(name, x, y, z, rx, ry, rz)
+/// gammo.set_fog(start, end, r, g, b) — enable fog
+/// gammo.set_fog(false) — disable fog
+fn luaSetFog(L: ?*c.lua_State) callconv(.c) c_int {
+    if (c.lua_isboolean(L, 1) and c.lua_toboolean(L, 1) == 0) {
+        fog_enabled = false;
+        return 0;
+    }
+    fog_enabled = true;
+    fog_start = @floatCast(c.luaL_checknumber(L, 1));
+    fog_end = @floatCast(c.luaL_checknumber(L, 2));
+    fog_color[0] = @floatCast(c.luaL_optnumber(L, 3, clear_color[0]));
+    fog_color[1] = @floatCast(c.luaL_optnumber(L, 4, clear_color[1]));
+    fog_color[2] = @floatCast(c.luaL_optnumber(L, 5, clear_color[2]));
+    return 0;
+}
+
+/// gammo.set_light(dx, dy, dz) — set directional light direction (toward light)
+fn luaSetLight(L: ?*c.lua_State) callconv(.c) c_int {
+    light_dir[0] = @floatCast(c.luaL_checknumber(L, 1));
+    light_dir[1] = @floatCast(c.luaL_checknumber(L, 2));
+    light_dir[2] = @floatCast(c.luaL_checknumber(L, 3));
+    return 0;
+}
+
+/// gammo.set_ambient(r, g, b) — set ambient light color
+fn luaSetAmbient(L: ?*c.lua_State) callconv(.c) c_int {
+    ambient_color[0] = @floatCast(c.luaL_checknumber(L, 1));
+    ambient_color[1] = @floatCast(c.luaL_checknumber(L, 2));
+    ambient_color[2] = @floatCast(c.luaL_checknumber(L, 3));
+    return 0;
+}
+
 fn luaDrawMesh(L: ?*c.lua_State) callconv(.c) c_int {
     const name = c.luaL_checklstring(L, 1, null);
     const mesh_id = findMesh(name) orelse {
@@ -225,6 +323,9 @@ const gammo_lib = [_]c.luaL_Reg{
     .{ .name = "key_down", .func = luaKeyDown },
     .{ .name = "set_camera", .func = luaSetCamera },
     .{ .name = "set_clear_color", .func = luaSetClearColor },
+    .{ .name = "set_fog", .func = luaSetFog },
+    .{ .name = "set_light", .func = luaSetLight },
+    .{ .name = "set_ambient", .func = luaSetAmbient },
     .{ .name = "draw_mesh", .func = luaDrawMesh },
     .{ .name = null, .func = null },
 };
@@ -330,14 +431,14 @@ pub fn main() !void {
         return error.ClaimWindowFailed;
     }
 
-    // Shaders
+    // Shaders — vertex has 1 uniform buffer, fragment has 1 uniform buffer
     const vert_shader = createShader(device, vertex_shader_msl, c.SDL_GPU_SHADERSTAGE_VERTEX, 1) orelse {
         std.debug.print("Failed to create vertex shader: {s}\n", .{c.SDL_GetError()});
         return error.ShaderFailed;
     };
     defer c.SDL_ReleaseGPUShader(device, vert_shader);
 
-    const frag_shader = createShader(device, fragment_shader_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 0) orelse {
+    const frag_shader = createShader(device, fragment_shader_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 1) orelse {
         std.debug.print("Failed to create fragment shader: {s}\n", .{c.SDL_GetError()});
         return error.ShaderFailed;
     };
@@ -347,8 +448,8 @@ pub fn main() !void {
     const swapchain_format = c.SDL_GetGPUSwapchainTextureFormat(device, window);
 
     const vertex_attrs = [_]c.SDL_GPUVertexAttribute{
-        .{ .location = 0, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = @offsetOf(Vertex, "x") },
-        .{ .location = 1, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = @offsetOf(Vertex, "r") },
+        .{ .location = 0, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = @offsetOf(Vertex, "px") },
+        .{ .location = 1, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = @offsetOf(Vertex, "nx") },
     };
 
     const vertex_buf_desc = [_]c.SDL_GPUVertexBufferDescription{
@@ -440,7 +541,6 @@ pub fn main() !void {
     c.luaL_register(L, "gammo", &gammo_lib);
     c.lua_pop(L, 1);
 
-    // Add game/ to Lua's require search path
     _ = c.luaL_dostring(L, "package.path = 'game/?.lua;' .. package.path");
 
     if (c.luaL_loadfile(L, "game/main.lua") != 0 or c.lua_pcall(L, 0, 0, 0) != 0) {
@@ -472,7 +572,7 @@ pub fn main() !void {
             if (event.type == c.SDL_EVENT_KEY_DOWN and event.key.scancode == c.SDL_SCANCODE_ESCAPE) running = false;
         }
 
-        // Lua update (game logic)
+        // Lua update
         _ = c.lua_getglobal(L, "update");
         c.lua_pushnumber(L, dt);
         if (c.lua_pcall(L, 1, 0, 0) != 0) {
@@ -481,11 +581,11 @@ pub fn main() !void {
             c.lua_pop(L, 1);
         }
 
-        // Lua draw (populates draw list via gammo.draw_mesh calls)
+        // Lua draw
         resetDrawList();
         callLua(L, "draw", 0);
 
-        // Render the draw list
+        // Render
         const cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse continue;
 
         var swapchain_tex: ?*c.SDL_GPUTexture = null;
@@ -504,6 +604,16 @@ pub fn main() !void {
         const proj = Mat4.perspective(60.0, aspect, 0.1, 100.0);
         const view = Mat4.lookAt(camera_eye, camera_target, Vec3.new(0, 1, 0));
         const vp = Mat4.mul(proj, view);
+
+        // Build fragment uniforms (same for all draws this frame)
+        const frag_uniforms = FragUniforms{
+            .light_dir = light_dir,
+            .camera_pos = .{ camera_eye.x, camera_eye.y, camera_eye.z, 0.0 },
+            .fog_color = .{ fog_color[0], fog_color[1], fog_color[2], fog_start },
+            .fog_params = .{ fog_end, if (fog_enabled) 1.0 else 0.0, 0.0, 0.0 },
+            .albedo = .{ 1.0, 1.0, 1.0, 0.0 },
+            .ambient = ambient_color,
+        };
 
         const color_target = c.SDL_GPUColorTargetInfo{
             .texture = swapchain_tex,
@@ -541,10 +651,21 @@ pub fn main() !void {
 
         c.SDL_BindGPUGraphicsPipeline(render_pass, pipeline);
 
-        // Flush the draw list
+        // Push fragment uniforms once per frame
+        c.SDL_PushGPUFragmentUniformData(cmd, 0, &frag_uniforms, @sizeOf(FragUniforms));
+
+        sortDrawList();
+
+        var bound_mesh: ?u32 = null;
         for (0..draw_count) |i| {
             const draw = draw_list[i];
             const mesh = meshes[draw.mesh_id] orelse continue;
+
+            if (bound_mesh == null or bound_mesh.? != draw.mesh_id) {
+                const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.buffer, .offset = 0 };
+                c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
+                bound_mesh = draw.mesh_id;
+            }
 
             const rotation = Mat4.mul(
                 Mat4.rotateY(draw.rotation.y),
@@ -556,9 +677,12 @@ pub fn main() !void {
             );
             const mvp = Mat4.mul(vp, model);
 
-            const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.buffer, .offset = 0 };
-            c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
-            c.SDL_PushGPUVertexUniformData(cmd, 0, &mvp.m, @sizeOf(Mat4));
+            const vert_uniforms = VertexUniforms{
+                .mvp = mvp.m,
+                .model = model.m,
+            };
+
+            c.SDL_PushGPUVertexUniformData(cmd, 0, &vert_uniforms, @sizeOf(VertexUniforms));
             c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, 1, 0, 0);
         }
 
