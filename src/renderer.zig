@@ -48,6 +48,7 @@ const SceneUniforms = extern struct {
 
 const MaterialUniforms = extern struct {
     albedo: [4]f32,
+    has_texture: [4]f32 = .{ 0, 0, 0, 0 }, // .x = 1.0 if textured
 };
 
 // ============================================================
@@ -65,7 +66,7 @@ pub const DrawEntry = struct {
 // GPU helpers
 // ============================================================
 
-fn createShader(device: *c.SDL_GPUDevice, spv: []const u8, msl: []const u8, stage: c.SDL_GPUShaderStage, num_uniform_buffers: u32) ?*c.SDL_GPUShader {
+fn createShader(device: *c.SDL_GPUDevice, spv: []const u8, msl: []const u8, stage: c.SDL_GPUShaderStage, num_uniform_buffers: u32, num_samplers: u32) ?*c.SDL_GPUShader {
     const formats = c.SDL_GetGPUShaderFormats(device);
 
     var code: [*]const u8 = undefined;
@@ -94,7 +95,7 @@ fn createShader(device: *c.SDL_GPUDevice, spv: []const u8, msl: []const u8, stag
         .entrypoint = entrypoint,
         .format = format,
         .stage = stage,
-        .num_samplers = 0,
+        .num_samplers = num_samplers,
         .num_storage_textures = 0,
         .num_storage_buffers = 0,
         .num_uniform_buffers = num_uniform_buffers,
@@ -137,13 +138,13 @@ fn createMsaaColorTexture(device: *c.SDL_GPUDevice, format: c.SDL_GPUTextureForm
 pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
     const device = self.gpu_device.?;
 
-    const vert_shader = createShader(device, vert_spv, vert_msl, c.SDL_GPU_SHADERSTAGE_VERTEX, 1) orelse {
+    const vert_shader = createShader(device, vert_spv, vert_msl, c.SDL_GPU_SHADERSTAGE_VERTEX, 1, 0) orelse {
         std.debug.print("Failed to create vertex shader: {s}\n", .{c.SDL_GetError()});
         return error.ShaderFailed;
     };
     defer c.SDL_ReleaseGPUShader(device, vert_shader);
 
-    const frag_shader = createShader(device, frag_spv, frag_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 2) orelse {
+    const frag_shader = createShader(device, frag_spv, frag_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1) orelse {
         std.debug.print("Failed to create fragment shader: {s}\n", .{c.SDL_GetError()});
         return error.ShaderFailed;
     };
@@ -289,7 +290,7 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
         }
     }
 
-    const default_material = MaterialUniforms{ .albedo = .{ 1.0, 1.0, 1.0, 1.0 } };
+    const default_material = MaterialUniforms{ .albedo = .{ 1.0, 1.0, 1.0, 1.0 }, .has_texture = .{ 0, 0, 0, 0 } };
     const sw_w_f: f32 = @floatFromInt(sw_w);
     const sw_h_f: f32 = @floatFromInt(sw_h);
 
@@ -444,11 +445,22 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
             }
 
             if (bound_mat == null or bound_mat.? != mat_id) {
-                const mat_uniforms = if (self.material_registry[mat_id]) |mat|
-                    MaterialUniforms{ .albedo = mat.albedo }
-                else
-                    default_material;
-                c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
+                if (self.material_registry[mat_id]) |mat| {
+                    const has_tex: f32 = if (mat.texture_id != null) 1.0 else 0.0;
+                    const mat_uniforms = MaterialUniforms{ .albedo = mat.albedo, .has_texture = .{ has_tex, 0, 0, 0 } };
+                    c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
+
+                    if (mat.texture_id) |tex_id| {
+                        if (self.texture_registry[tex_id]) |tex| {
+                            const tex_sampler_binding = [_]c.SDL_GPUTextureSamplerBinding{
+                                .{ .texture = tex.texture, .sampler = tex.sampler },
+                            };
+                            c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_sampler_binding, 1);
+                        }
+                    }
+                } else {
+                    c.SDL_PushGPUFragmentUniformData(cmd, 1, &default_material, @sizeOf(MaterialUniforms));
+                }
                 bound_mat = mat_id;
             }
 

@@ -14,6 +14,9 @@ const lc = lua.c;
 pub const c = @cImport({
     @cInclude("SDL3/SDL.h");
 });
+const stbi = @cImport({
+    @cInclude("stb_image.h");
+});
 
 const Vertex = geometry.Vertex;
 
@@ -28,12 +31,21 @@ pub const MeshData = struct {
     index_count: u32 = 0,
 };
 
+pub const TextureData = struct {
+    texture: *c.SDL_GPUTexture,
+    sampler: *c.SDL_GPUSampler,
+    width: u32,
+    height: u32,
+};
+
 pub const MaterialData = struct {
     albedo: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 },
+    texture_id: ?u32 = null, // index into texture_registry
 };
 
 pub const max_meshes = 64;
 pub const max_materials = 64;
+pub const max_textures = 64;
 pub const max_lua_systems = 64;
 
 // ============================================================
@@ -102,6 +114,11 @@ pub const Engine = struct {
     material_names: [max_materials]?[*:0]const u8 = .{null} ** max_materials,
     material_count: u32 = 0,
 
+    // Texture registry
+    texture_registry: [max_textures]?TextureData = .{null} ** max_textures,
+    texture_count: u32 = 0,
+    default_sampler: ?*c.SDL_GPUSampler = null,
+
     // Draw sorting scratch buffer
     draw_list: [renderer.max_renderables]renderer.DrawEntry = undefined,
 
@@ -148,6 +165,10 @@ pub const Engine = struct {
         if (self.lua_state) |L| lc.lua_close(L);
 
         if (self.gpu_device) |device| {
+            for (0..self.texture_count) |i| {
+                if (self.texture_registry[i]) |tex| c.SDL_ReleaseGPUTexture(device, tex.texture);
+            }
+            if (self.default_sampler) |s| c.SDL_ReleaseGPUSampler(device, s);
             for (0..self.mesh_count) |i| {
                 if (self.mesh_registry[i]) |mesh| {
                     c.SDL_ReleaseGPUBuffer(device, mesh.vertex_buffer);
@@ -228,6 +249,29 @@ pub const Engine = struct {
             std.debug.print("SDL_ClaimWindowForGPUDevice failed: {s}\n", .{c.SDL_GetError()});
             return error.ClaimWindowFailed;
         }
+
+        // Default sampler (linear filtering, repeat wrap)
+        self.default_sampler = c.SDL_CreateGPUSampler(self.gpu_device.?, &c.SDL_GPUSamplerCreateInfo{
+            .min_filter = c.SDL_GPU_FILTER_LINEAR,
+            .mag_filter = c.SDL_GPU_FILTER_LINEAR,
+            .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_LINEAR,
+            .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_REPEAT,
+            .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_REPEAT,
+            .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_REPEAT,
+            .mip_lod_bias = 0,
+            .max_anisotropy = 1,
+            .compare_op = 0,
+            .min_lod = 0,
+            .max_lod = 1000,
+            .enable_anisotropy = false,
+            .enable_compare = false,
+            .padding1 = 0,
+            .padding2 = 0,
+            .props = 0,
+        }) orelse {
+            std.debug.print("Failed to create default sampler: {s}\n", .{c.SDL_GetError()});
+            return error.SamplerFailed;
+        };
 
         // Pipeline + render targets
         try renderer.initPipeline(self, config);
@@ -327,6 +371,95 @@ pub const Engine = struct {
             }
         }
         return null;
+    }
+
+    // ---- Texture API ----
+
+    pub fn createTextureFromMemory(self: *Engine, pixels: [*]const u8, width: u32, height: u32) !u32 {
+        if (self.texture_count >= max_textures) return error.TooManyTextures;
+        const device = self.gpu_device orelse return error.NotInitialized;
+        const sampler = self.default_sampler orelse return error.NotInitialized;
+
+        const tex = c.SDL_CreateGPUTexture(device, &c.SDL_GPUTextureCreateInfo{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = width,
+            .height = height,
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .props = 0,
+        }) orelse return error.TextureFailed;
+
+        // Upload pixel data
+        const data_size = width * height * 4;
+        const transfer = c.SDL_CreateGPUTransferBuffer(device, &c.SDL_GPUTransferBufferCreateInfo{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = data_size,
+            .props = 0,
+        }) orelse {
+            c.SDL_ReleaseGPUTexture(device, tex);
+            return error.BufferFailed;
+        };
+
+        const ptr = c.SDL_MapGPUTransferBuffer(device, transfer, false) orelse {
+            c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+            c.SDL_ReleaseGPUTexture(device, tex);
+            return error.BufferFailed;
+        };
+        @memcpy(@as([*]u8, @ptrCast(ptr))[0..data_size], pixels[0..data_size]);
+        c.SDL_UnmapGPUTransferBuffer(device, transfer);
+
+        const cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse {
+            c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+            c.SDL_ReleaseGPUTexture(device, tex);
+            return error.BufferFailed;
+        };
+        const copy_pass = c.SDL_BeginGPUCopyPass(cmd) orelse {
+            _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+            c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+            c.SDL_ReleaseGPUTexture(device, tex);
+            return error.BufferFailed;
+        };
+        c.SDL_UploadToGPUTexture(copy_pass, &c.SDL_GPUTextureTransferInfo{
+            .transfer_buffer = transfer,
+            .offset = 0,
+            .pixels_per_row = width,
+            .rows_per_layer = height,
+        }, &c.SDL_GPUTextureRegion{
+            .texture = tex,
+            .mip_level = 0,
+            .layer = 0,
+            .x = 0,
+            .y = 0,
+            .z = 0,
+            .w = width,
+            .h = height,
+            .d = 1,
+        }, false);
+        c.SDL_EndGPUCopyPass(copy_pass);
+        _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+        c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+
+        const id = self.texture_count;
+        self.texture_registry[id] = .{
+            .texture = tex,
+            .sampler = sampler,
+            .width = width,
+            .height = height,
+        };
+        self.texture_count += 1;
+        return id;
+    }
+
+    pub fn createTextureFromFile(self: *Engine, path: [*:0]const u8) !u32 {
+        var w: c_int = 0;
+        var h: c_int = 0;
+        var channels: c_int = 0;
+        const pixels = stbi.stbi_load(path, &w, &h, &channels, 4) orelse return error.ImageLoadFailed;
+        defer stbi.stbi_image_free(pixels);
+        return self.createTextureFromMemory(@ptrCast(pixels), @intCast(w), @intCast(h));
     }
 
     // ---- Lua systems ----

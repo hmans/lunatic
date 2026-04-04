@@ -76,6 +76,10 @@ pub fn build(b: *std.Build) void {
     exe.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/luajit-2.1" });
     exe.linkSystemLibrary("luajit-5.1");
 
+    // stb_image
+    exe.addIncludePath(b.path("vendor"));
+    exe.addCSourceFile(.{ .file = b.path("vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
+
     // Compile shaders (GLSL → SPIR-V + MSL)
     addShaders(b, exe);
 
@@ -110,6 +114,9 @@ pub fn build(b: *std.Build) void {
     tests.linkSystemLibrary("SDL3");
     tests.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/luajit-2.1" });
     tests.linkSystemLibrary("luajit-5.1");
+
+    tests.addIncludePath(b.path("vendor"));
+    tests.addCSourceFile(.{ .file = b.path("vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
 
     // Tests also need the compiled shaders
     addShaders(b, tests);

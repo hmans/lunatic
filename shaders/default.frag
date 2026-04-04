@@ -14,7 +14,10 @@ layout(set = 3, binding = 0) uniform SceneUniforms {
 
 layout(set = 3, binding = 1) uniform MaterialUniforms {
     vec4 albedo;
+    vec4 has_texture; // .x = 1.0 if textured
 } mat;
+
+layout(set = 2, binding = 0) uniform sampler2D base_color_tex;
 
 layout(location = 0) out vec4 out_color;
 
@@ -25,7 +28,12 @@ void main() {
     float diffuse = ndotl * 0.5 + 0.5;
     diffuse = diffuse * diffuse;
 
-    vec3 color = mat.albedo.xyz * (scene.ambient.xyz + diffuse);
+    vec3 base_color = mat.albedo.xyz;
+    if (mat.has_texture.x > 0.5) {
+        base_color *= texture(base_color_tex, frag_uv).xyz;
+    }
+
+    vec3 color = base_color * (scene.ambient.xyz + diffuse);
 
     if (scene.fog_color.w > 0.5) {
         float dist = length(world_pos - scene.camera_pos.xyz);
