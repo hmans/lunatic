@@ -1,11 +1,11 @@
 ---
 # lunatic-dtea
 title: GLTF parser and loader
-status: todo
+status: in-progress
 type: task
 priority: normal
 created_at: 2026-04-04T16:24:30Z
-updated_at: 2026-04-04T16:24:36Z
+updated_at: 2026-04-04T16:38:02Z
 parent: lunatic-8uei
 blocked_by:
     - lunatic-13gg

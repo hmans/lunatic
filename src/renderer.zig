@@ -445,21 +445,29 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
             }
 
             if (bound_mat == null or bound_mat.? != mat_id) {
+                const sampler = self.default_sampler.?;
+                const dummy_tex = self.dummy_texture.?;
+
                 if (self.material_registry[mat_id]) |mat| {
                     const has_tex: f32 = if (mat.texture_id != null) 1.0 else 0.0;
                     const mat_uniforms = MaterialUniforms{ .albedo = mat.albedo, .has_texture = .{ has_tex, 0, 0, 0 } };
                     c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
 
-                    if (mat.texture_id) |tex_id| {
-                        if (self.texture_registry[tex_id]) |tex| {
-                            const tex_sampler_binding = [_]c.SDL_GPUTextureSamplerBinding{
-                                .{ .texture = tex.texture, .sampler = tex.sampler },
-                            };
-                            c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_sampler_binding, 1);
-                        }
-                    }
+                    const bound_texture = if (mat.texture_id) |tex_id|
+                        if (self.texture_registry[tex_id]) |tex| tex.texture else dummy_tex
+                    else
+                        dummy_tex;
+
+                    const tex_sampler_binding = [_]c.SDL_GPUTextureSamplerBinding{
+                        .{ .texture = bound_texture, .sampler = sampler },
+                    };
+                    c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_sampler_binding, 1);
                 } else {
                     c.SDL_PushGPUFragmentUniformData(cmd, 1, &default_material, @sizeOf(MaterialUniforms));
+                    const tex_sampler_binding = [_]c.SDL_GPUTextureSamplerBinding{
+                        .{ .texture = dummy_tex, .sampler = sampler },
+                    };
+                    c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_sampler_binding, 1);
                 }
                 bound_mat = mat_id;
             }

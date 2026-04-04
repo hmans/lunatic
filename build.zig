@@ -79,6 +79,7 @@ pub fn build(b: *std.Build) void {
     // stb_image
     exe.addIncludePath(b.path("vendor"));
     exe.addCSourceFile(.{ .file = b.path("vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
+    exe.addCSourceFile(.{ .file = b.path("vendor/cgltf_impl.c"), .flags = &.{"-std=c99"} });
 
     // Compile shaders (GLSL → SPIR-V + MSL)
     addShaders(b, exe);
@@ -117,6 +118,7 @@ pub fn build(b: *std.Build) void {
 
     tests.addIncludePath(b.path("vendor"));
     tests.addCSourceFile(.{ .file = b.path("vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
+    tests.addCSourceFile(.{ .file = b.path("vendor/cgltf_impl.c"), .flags = &.{"-std=c99"} });
 
     // Tests also need the compiled shaders
     addShaders(b, tests);

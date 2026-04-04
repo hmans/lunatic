@@ -20,13 +20,16 @@ local yellow = lunatic.create_material({ albedo = { 0.9, 0.8, 0.2 } })
 local materials = { lunatic.material.default, red, green, blue, yellow }
 local meshes = { lunatic.mesh.cube, lunatic.mesh.sphere }
 
--- Player sphere
+-- Load GLTF model
+local helmet = lunatic.load_gltf("assets/DamagedHelmet.glb")
+
+-- Helmet entity
 local player = lunatic.spawn()
-lunatic.add(player, "position", 0, 0.5, 0)
+lunatic.add(player, "position", 0, 1, 0)
 lunatic.add(player, "rotation", 0, 0, 0)
-lunatic.add(player, "spin", 120)
-lunatic.add(player, "mesh", lunatic.mesh.sphere)
-lunatic.add(player, "material", yellow)
+lunatic.add(player, "spin", 30)
+lunatic.add(player, "mesh", helmet.meshes[1])
+lunatic.add(player, "material", helmet.materials[1])
 lunatic.add(player, "player")
 
 -- Main camera (follows player with offset, looks at player)

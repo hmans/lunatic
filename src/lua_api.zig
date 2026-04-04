@@ -7,6 +7,7 @@ const ecs = @import("zig-ecs");
 const engine_mod = @import("engine.zig");
 const Engine = engine_mod.Engine;
 const c = engine_mod.c;
+const gltf_mod = engine_mod.gltf;
 
 const lua = @import("lua.zig");
 const lc = lua.c;
@@ -187,6 +188,7 @@ pub fn registerLuaApi(self: *Engine) void {
         .{ "create_material", &luaCreateMaterial },
         .{ "create_cube_mesh", &luaCreateCubeMesh },
         .{ "create_sphere_mesh", &luaCreateSphereMesh },
+        .{ "load_gltf", &luaLoadGltf },
         .{ "system", &luaSystemRegister },
     };
 
@@ -645,6 +647,38 @@ fn refNewIndex(L: ?*lc.lua_State) callconv(.c) c_int {
         }
     }
     return 0;
+}
+
+fn luaLoadGltf(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const path = lc.luaL_checklstring(L, 1, null);
+
+    var model = gltf_mod.load(self, path) catch {
+        _ = lc.luaL_error(L, "failed to load gltf: %s", path);
+        unreachable;
+    };
+    defer model.deinit();
+
+    // Return table: { meshes = { id, id, ... }, materials = { id, id, ... } }
+    lc.lua_newtable(L);
+
+    // meshes array
+    lc.lua_newtable(L);
+    for (model.mesh_ids, 0..) |id, i| {
+        lc.lua_pushinteger(L, @intCast(id));
+        lc.lua_rawseti(L, -2, @intCast(i + 1));
+    }
+    lc.lua_setfield(L, -2, "meshes");
+
+    // materials array
+    lc.lua_newtable(L);
+    for (model.material_ids, 0..) |id, i| {
+        lc.lua_pushinteger(L, @intCast(id));
+        lc.lua_rawseti(L, -2, @intCast(i + 1));
+    }
+    lc.lua_setfield(L, -2, "materials");
+
+    return 1;
 }
 
 fn luaSystemRegister(L: ?*lc.lua_State) callconv(.c) c_int {

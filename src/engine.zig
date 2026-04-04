@@ -8,6 +8,7 @@ const ecs = @import("zig-ecs");
 const geometry = @import("geometry.zig");
 const renderer = @import("renderer.zig");
 const lua_api = @import("lua_api.zig");
+pub const gltf = @import("gltf.zig");
 
 const lua = @import("lua.zig");
 const lc = lua.c;
@@ -118,6 +119,7 @@ pub const Engine = struct {
     texture_registry: [max_textures]?TextureData = .{null} ** max_textures,
     texture_count: u32 = 0,
     default_sampler: ?*c.SDL_GPUSampler = null,
+    dummy_texture: ?*c.SDL_GPUTexture = null,
 
     // Draw sorting scratch buffer
     draw_list: [renderer.max_renderables]renderer.DrawEntry = undefined,
@@ -273,6 +275,10 @@ pub const Engine = struct {
             return error.SamplerFailed;
         };
 
+        // 1x1 white dummy texture (bound when material has no texture)
+        const white_pixel = [4]u8{ 255, 255, 255, 255 };
+        self.dummy_texture = try self.createDummyTexture(&white_pixel);
+
         // Pipeline + render targets
         try renderer.initPipeline(self, config);
 
@@ -371,6 +377,11 @@ pub const Engine = struct {
             }
         }
         return null;
+    }
+
+    fn createDummyTexture(self: *Engine, pixel: *const [4]u8) !*c.SDL_GPUTexture {
+        const id = try self.createTextureFromMemory(pixel, 1, 1);
+        return self.texture_registry[id].?.texture;
     }
 
     // ---- Texture API ----
