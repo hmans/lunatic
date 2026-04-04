@@ -545,6 +545,20 @@ pub const Engine = struct {
         return id;
     }
 
+    pub fn createCubeMesh(self: *Engine) !u32 {
+        const allocator = std.heap.c_allocator;
+        const verts = try geometry.cube(allocator);
+        defer allocator.free(verts);
+        return self.createMesh(null, verts);
+    }
+
+    pub fn createSphereMesh(self: *Engine, segments: u32, rings: u32) !u32 {
+        const allocator = std.heap.c_allocator;
+        const verts = try geometry.sphere(allocator, segments, rings);
+        defer allocator.free(verts);
+        return self.createMesh(null, verts);
+    }
+
     fn findMesh(self: *Engine, name: [*:0]const u8) ?u32 {
         const needle = std.mem.span(name);
         for (0..self.mesh_count) |i| {
@@ -813,6 +827,8 @@ pub const Engine = struct {
             .{ "query", &luaQuery },
             .{ "ref", &luaRef },
             .{ "create_material", &luaCreateMaterial },
+            .{ "create_cube_mesh", &luaCreateCubeMesh },
+            .{ "create_sphere_mesh", &luaCreateSphereMesh },
             .{ "system", &luaSystemRegister },
         };
 
@@ -968,6 +984,38 @@ fn luaSetAmbient(L: ?*lc.lua_State) callconv(.c) c_int {
     self.ambient_color[1] = @floatCast(lc.luaL_checknumber(L, 2));
     self.ambient_color[2] = @floatCast(lc.luaL_checknumber(L, 3));
     return 0;
+}
+
+fn luaCreateCubeMesh(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const id = self.createCubeMesh() catch {
+        _ = lc.luaL_error(L, "failed to create cube mesh");
+        unreachable;
+    };
+    lc.lua_pushinteger(L, @intCast(id));
+    return 1;
+}
+
+fn luaCreateSphereMesh(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const segments: u32 = if (lc.lua_type(L, 1) == lc.LUA_TTABLE) blk: {
+        lc.lua_getfield(L, 1, "segments");
+        const s: u32 = @intCast(lc.luaL_optinteger(L, -1, 32));
+        lc.lua_pop(L, 1);
+        break :blk s;
+    } else 32;
+    const rings: u32 = if (lc.lua_type(L, 1) == lc.LUA_TTABLE) blk: {
+        lc.lua_getfield(L, 1, "rings");
+        const r: u32 = @intCast(lc.luaL_optinteger(L, -1, 16));
+        lc.lua_pop(L, 1);
+        break :blk r;
+    } else 16;
+    const id = self.createSphereMesh(segments, rings) catch {
+        _ = lc.luaL_error(L, "failed to create sphere mesh");
+        unreachable;
+    };
+    lc.lua_pushinteger(L, @intCast(id));
+    return 1;
 }
 
 fn luaCreateMaterial(L: ?*lc.lua_State) callconv(.c) c_int {
