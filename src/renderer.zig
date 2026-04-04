@@ -246,7 +246,7 @@ pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
 }
 
 // ============================================================
-// Render system
+// Render system — decomposed into focused phases
 // ============================================================
 
 fn resolveTexture(self: *Engine, tex_id: ?u32, dummy: *c.SDL_GPUTexture) *c.SDL_GPUTexture {
@@ -256,8 +256,136 @@ fn resolveTexture(self: *Engine, tex_id: ?u32, dummy: *c.SDL_GPUTexture) *c.SDL_
     return dummy;
 }
 
+/// Query the ECS for the first directional light, or return defaults.
+fn gatherLights(registry: *ecs.Registry) [4]f32 {
+    var light_dir = [4]f32{ 0.4, 0.8, 0.4, 0.0 };
+    var light_view = registry.view(.{DirectionalLight}, .{});
+    var light_iter = light_view.entityIterator();
+    if (light_iter.next()) |light_entity| {
+        const dl = light_view.getConst(light_entity);
+        const len_sq = dl.dir_x * dl.dir_x + dl.dir_y * dl.dir_y + dl.dir_z * dl.dir_z;
+        if (len_sq > 1e-8) {
+            light_dir = .{ dl.dir_x, dl.dir_y, dl.dir_z, 0.0 };
+        }
+    }
+    return light_dir;
+}
+
+/// Collect all renderable entities into the draw list, sorted by mesh+material
+/// to minimize GPU state changes. Returns the number of entries.
+fn buildDrawList(self: *Engine) u32 {
+    var draw_count: u32 = 0;
+    var ecs_view = self.registry.view(.{ Position, Rotation, MeshHandle }, .{});
+    var iter = ecs_view.entityIterator();
+    while (iter.next()) |entity| {
+        if (draw_count >= max_renderables) break;
+        const mesh_id: u64 = ecs_view.getConst(MeshHandle, entity).id;
+        const mat_id: u64 = if (self.registry.tryGet(MaterialHandle, entity)) |mh| mh.id else 0;
+        self.draw_list[draw_count] = .{
+            .sort_key = (mesh_id << 32) | mat_id,
+            .entity = entity,
+        };
+        draw_count += 1;
+    }
+
+    std.mem.sort(DrawEntry, self.draw_list[0..draw_count], {}, struct {
+        fn lessThan(_: void, a: DrawEntry, b: DrawEntry) bool {
+            return a.sort_key < b.sort_key;
+        }
+    }.lessThan);
+
+    return draw_count;
+}
+
+/// Submit draw calls for the sorted draw list within a render pass.
+fn submitDrawCalls(
+    self: *Engine,
+    cmd: *c.SDL_GPUCommandBuffer,
+    render_pass: *c.SDL_GPURenderPass,
+    vp: Mat4,
+    draw_count: u32,
+) void {
+    const default_material = MaterialUniforms{ .albedo = .{ 1, 1, 1, 1 } };
+    var bound_mesh: ?u32 = null;
+    var bound_mat: ?u32 = null;
+
+    for (self.draw_list[0..draw_count]) |entry| {
+        const pos = self.registry.getConst(Position, entry.entity);
+        const rot = self.registry.getConst(Rotation, entry.entity);
+        const mesh_id: u32 = @truncate(entry.sort_key >> 32);
+        const mat_id: u32 = @truncate(entry.sort_key);
+        const mesh = self.assets.mesh_registry[mesh_id] orelse continue;
+
+        if (bound_mesh == null or bound_mesh.? != mesh_id) {
+            const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.vertex_buffer, .offset = 0 };
+            c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
+            if (mesh.index_buffer) |ib| {
+                c.SDL_BindGPUIndexBuffer(render_pass, &c.SDL_GPUBufferBinding{ .buffer = ib, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
+            }
+            bound_mesh = mesh_id;
+        }
+
+        if (bound_mat == null or bound_mat.? != mat_id) {
+            const sampler = self.assets.default_sampler.?;
+            const dummy = self.assets.dummy_texture.?;
+
+            if (self.assets.material_registry[mat_id]) |mat| {
+                const has_bc: f32 = if (mat.base_color_texture != null) 1.0 else 0.0;
+                const has_mr: f32 = if (mat.metallic_roughness_texture != null) 1.0 else 0.0;
+                const has_nm: f32 = if (mat.normal_texture != null) 1.0 else 0.0;
+                const has_em: f32 = if (mat.emissive_texture != null) 1.0 else 0.0;
+                const has_ao: f32 = if (mat.occlusion_texture != null) 1.0 else 0.0;
+
+                const mat_uniforms = MaterialUniforms{
+                    .albedo = mat.albedo,
+                    .material_params = .{ mat.metallic, mat.roughness, 0, 0 },
+                    .texture_flags = .{ has_bc, has_mr, has_nm, has_em },
+                    .emissive = .{ mat.emissive[0], mat.emissive[1], mat.emissive[2], has_ao },
+                };
+                c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
+
+                const tex_bindings = [5]c.SDL_GPUTextureSamplerBinding{
+                    .{ .texture = resolveTexture(self, mat.base_color_texture, dummy), .sampler = sampler },
+                    .{ .texture = resolveTexture(self, mat.metallic_roughness_texture, dummy), .sampler = sampler },
+                    .{ .texture = resolveTexture(self, mat.normal_texture, dummy), .sampler = sampler },
+                    .{ .texture = resolveTexture(self, mat.emissive_texture, dummy), .sampler = sampler },
+                    .{ .texture = resolveTexture(self, mat.occlusion_texture, dummy), .sampler = sampler },
+                };
+                c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_bindings, 5);
+            } else {
+                c.SDL_PushGPUFragmentUniformData(cmd, 1, &default_material, @sizeOf(MaterialUniforms));
+                const tex_bindings = [5]c.SDL_GPUTextureSamplerBinding{
+                    .{ .texture = dummy, .sampler = sampler },
+                    .{ .texture = dummy, .sampler = sampler },
+                    .{ .texture = dummy, .sampler = sampler },
+                    .{ .texture = dummy, .sampler = sampler },
+                    .{ .texture = dummy, .sampler = sampler },
+                };
+                c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_bindings, 5);
+            }
+            bound_mat = mat_id;
+        }
+
+        const rotation = Mat4.mul(Mat4.mul(Mat4.rotateZ(rot.z), Mat4.rotateY(rot.y)), Mat4.rotateX(rot.x));
+        const scl = if (self.registry.tryGet(Scale, entry.entity)) |s|
+            Mat4.scale(s.x, s.y, s.z)
+        else
+            Mat4.identity();
+        const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), Mat4.mul(rotation, scl));
+        const mvp = Mat4.mul(vp, model);
+
+        const vert_uniforms = VertexUniforms{ .mvp = mvp.m, .model = model.m };
+        c.SDL_PushGPUVertexUniformData(cmd, 0, &vert_uniforms, @sizeOf(VertexUniforms));
+        if (mesh.index_buffer != null) {
+            c.SDL_DrawGPUIndexedPrimitives(render_pass, mesh.index_count, 1, 0, 0, 0);
+        } else {
+            c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, 1, 0, 0);
+        }
+    }
+}
+
 pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice, dt: f32) void {
-    _ = dt; // Available for future use (GPU-side animation, particle systems, etc.)
+    _ = dt;
     const cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse return;
 
     var swapchain_tex: ?*c.SDL_GPUTexture = null;
@@ -288,28 +416,18 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice, dt: f32) void {
         }
     }
 
-    // Find first directional light (or use defaults)
-    var light_dir = [4]f32{ 0.4, 0.8, 0.4, 0.0 };
-    {
-        var light_view = self.registry.view(.{DirectionalLight}, .{});
-        var light_iter = light_view.entityIterator();
-        if (light_iter.next()) |light_entity| {
-            const dl = light_view.getConst(light_entity);
-            const len_sq = dl.dir_x * dl.dir_x + dl.dir_y * dl.dir_y + dl.dir_z * dl.dir_z;
-            if (len_sq > 1e-8) {
-                light_dir = .{ dl.dir_x, dl.dir_y, dl.dir_z, 0.0 };
-            }
-        }
-    }
+    // Phase 1: Gather scene data
+    const light_dir = gatherLights(&self.registry);
 
-    const default_material = MaterialUniforms{ .albedo = .{ 1, 1, 1, 1 } };
+    // Phase 2: Build sorted draw list (once, shared across all cameras)
+    const draw_count = buildDrawList(self);
+
+    // Phase 3: Render pass per camera
     const sw_w_f: f32 = @floatFromInt(sw_w);
     const sw_h_f: f32 = @floatFromInt(sw_h);
-
     const clear_color = c.SDL_FColor{ .r = self.clear_color[0], .g = self.clear_color[1], .b = self.clear_color[2], .a = self.clear_color[3] };
     const is_msaa = self.sample_count.isMultisample();
 
-    // One render pass per camera — each clears depth, first clears color
     var cam_view = self.registry.view(.{ Position, Camera }, .{});
     var cam_iter = cam_view.entityIterator();
     var first_camera = true;
@@ -367,7 +485,7 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice, dt: f32) void {
         const render_pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target) orelse continue;
         c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
 
-        // Set viewport and scissor for this camera
+        // Viewport and scissor
         const vp_x = cam.viewport_x * sw_w_f;
         const vp_y = cam.viewport_y * sw_h_f;
         const vp_w = cam.viewport_w * sw_w_f;
@@ -387,6 +505,7 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice, dt: f32) void {
             .h = @intFromFloat(vp_h),
         });
 
+        // View-projection matrix
         const aspect: f32 = vp_w / vp_h;
         const proj = Mat4.perspective(cam.fov, aspect, cam.near, cam.far);
 
@@ -405,6 +524,7 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice, dt: f32) void {
 
         const vp = Mat4.mul(proj, view);
 
+        // Scene uniforms
         const scene_uniforms = SceneUniforms{
             .light_dir = light_dir,
             .camera_pos = .{ cam_pos.x, cam_pos.y, cam_pos.z, 0.0 },
@@ -414,107 +534,7 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice, dt: f32) void {
         };
         c.SDL_PushGPUFragmentUniformData(cmd, 0, &scene_uniforms, @sizeOf(SceneUniforms));
 
-        // Collect renderable entities and sort by mesh+material to minimize state changes
-        var draw_count: u32 = 0;
-        {
-            var ecs_view = self.registry.view(.{ Position, Rotation, MeshHandle }, .{});
-            var iter = ecs_view.entityIterator();
-            while (iter.next()) |entity| {
-                if (draw_count >= max_renderables) break;
-                const mesh_id: u64 = ecs_view.getConst(MeshHandle, entity).id;
-                const mat_id: u64 = if (self.registry.tryGet(MaterialHandle, entity)) |mh| mh.id else 0;
-                self.draw_list[draw_count] = .{
-                    .sort_key = (mesh_id << 32) | mat_id,
-                    .entity = entity,
-                };
-                draw_count += 1;
-            }
-        }
-
-        std.mem.sort(DrawEntry, self.draw_list[0..draw_count], {}, struct {
-            fn lessThan(_: void, a: DrawEntry, b: DrawEntry) bool {
-                return a.sort_key < b.sort_key;
-            }
-        }.lessThan);
-
-        // Draw in sorted order
-        var bound_mesh: ?u32 = null;
-        var bound_mat: ?u32 = null;
-
-        for (self.draw_list[0..draw_count]) |entry| {
-            const pos = self.registry.getConst(Position, entry.entity);
-            const rot = self.registry.getConst(Rotation, entry.entity);
-            const mesh_id: u32 = @truncate(entry.sort_key >> 32);
-            const mat_id: u32 = @truncate(entry.sort_key);
-            const mesh = self.assets.mesh_registry[mesh_id] orelse continue;
-
-            if (bound_mesh == null or bound_mesh.? != mesh_id) {
-                const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.vertex_buffer, .offset = 0 };
-                c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
-                if (mesh.index_buffer) |ib| {
-                    c.SDL_BindGPUIndexBuffer(render_pass, &c.SDL_GPUBufferBinding{ .buffer = ib, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
-                }
-                bound_mesh = mesh_id;
-            }
-
-            if (bound_mat == null or bound_mat.? != mat_id) {
-                const sampler = self.assets.default_sampler.?;
-                const dummy = self.assets.dummy_texture.?;
-
-                if (self.assets.material_registry[mat_id]) |mat| {
-                    const has_bc: f32 = if (mat.base_color_texture != null) 1.0 else 0.0;
-                    const has_mr: f32 = if (mat.metallic_roughness_texture != null) 1.0 else 0.0;
-                    const has_nm: f32 = if (mat.normal_texture != null) 1.0 else 0.0;
-                    const has_em: f32 = if (mat.emissive_texture != null) 1.0 else 0.0;
-                    const has_ao: f32 = if (mat.occlusion_texture != null) 1.0 else 0.0;
-
-                    const mat_uniforms = MaterialUniforms{
-                        .albedo = mat.albedo,
-                        .material_params = .{ mat.metallic, mat.roughness, 0, 0 },
-                        .texture_flags = .{ has_bc, has_mr, has_nm, has_em },
-                        .emissive = .{ mat.emissive[0], mat.emissive[1], mat.emissive[2], has_ao },
-                    };
-                    c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
-
-                    const tex_bindings = [5]c.SDL_GPUTextureSamplerBinding{
-                        .{ .texture = resolveTexture(self, mat.base_color_texture, dummy), .sampler = sampler },
-                        .{ .texture = resolveTexture(self, mat.metallic_roughness_texture, dummy), .sampler = sampler },
-                        .{ .texture = resolveTexture(self, mat.normal_texture, dummy), .sampler = sampler },
-                        .{ .texture = resolveTexture(self, mat.emissive_texture, dummy), .sampler = sampler },
-                        .{ .texture = resolveTexture(self, mat.occlusion_texture, dummy), .sampler = sampler },
-                    };
-                    c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_bindings, 5);
-                } else {
-                    c.SDL_PushGPUFragmentUniformData(cmd, 1, &default_material, @sizeOf(MaterialUniforms));
-                    const tex_bindings = [5]c.SDL_GPUTextureSamplerBinding{
-                        .{ .texture = dummy, .sampler = sampler },
-                        .{ .texture = dummy, .sampler = sampler },
-                        .{ .texture = dummy, .sampler = sampler },
-                        .{ .texture = dummy, .sampler = sampler },
-                        .{ .texture = dummy, .sampler = sampler },
-                    };
-                    c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_bindings, 5);
-                }
-                bound_mat = mat_id;
-            }
-
-            const rotation = Mat4.mul(Mat4.mul(Mat4.rotateZ(rot.z), Mat4.rotateY(rot.y)), Mat4.rotateX(rot.x));
-            const scl = if (self.registry.tryGet(Scale, entry.entity)) |s|
-                Mat4.scale(s.x, s.y, s.z)
-            else
-                Mat4.identity();
-            const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), Mat4.mul(rotation, scl));
-            const mvp = Mat4.mul(vp, model);
-
-            const vert_uniforms = VertexUniforms{ .mvp = mvp.m, .model = model.m };
-            c.SDL_PushGPUVertexUniformData(cmd, 0, &vert_uniforms, @sizeOf(VertexUniforms));
-            if (mesh.index_buffer != null) {
-                c.SDL_DrawGPUIndexedPrimitives(render_pass, mesh.index_count, 1, 0, 0, 0);
-            } else {
-                c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, 1, 0, 0);
-            }
-        }
-
+        submitDrawCalls(self, cmd, render_pass, vp, draw_count);
         c.SDL_EndGPURenderPass(render_pass);
     }
 
