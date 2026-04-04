@@ -4,10 +4,18 @@
 
 -- Setup
 lunatic.set_clear_color(0.55, 0.7, 0.85)
-lunatic.set_camera(0, 8, 12, 0, 0, 0)
-lunatic.set_light(0.3, 0.8, 0.5)
 lunatic.set_ambient(0.15, 0.15, 0.25)
 lunatic.set_fog(8, 25, 0.55, 0.7, 0.85)
+
+-- Camera
+local cam = lunatic.spawn()
+lunatic.add(cam, "position", 0, 8, 12)
+lunatic.add(cam, "rotation", 34, 0, 0)
+lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1)
+
+-- Directional light
+local light = lunatic.spawn()
+lunatic.add(light, "directional_light", 0.3, 0.8, 0.5, 1, 1, 1)
 
 -- Materials (create_material returns a numeric handle)
 local red    = lunatic.create_material({ albedo = { 0.9, 0.2, 0.2 } })

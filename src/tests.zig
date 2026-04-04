@@ -352,11 +352,14 @@ test "multiple systems run in order" {
 // Settings API (no GPU needed)
 // ============================================================
 
-test "set_camera accepts 6 numbers" {
+test "camera entity can be created" {
     const L = try setup();
     defer teardown();
     try run(L,
-        \\lunatic.set_camera(0, 5, 10, 0, 0, 0)
+        \\local cam = lunatic.spawn()
+        \\lunatic.add(cam, "position", 0, 5, 10)
+        \\lunatic.add(cam, "rotation", -30, 0, 0)
+        \\lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1)
     );
 }
 

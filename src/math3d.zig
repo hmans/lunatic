@@ -149,6 +149,32 @@ pub const Mat4 = struct {
         }
         return result;
     }
+
+    /// Build a view matrix from euler angles (degrees) and position.
+    /// Convention: an unrotated camera looks down -Z (right-handed),
+    /// matching the convention used by lookAt().
+    pub fn viewFromTransform(px: f32, py: f32, pz: f32, rx: f32, ry: f32, rz: f32) Mat4 {
+        // The model matrix is: T * Rz * Ry * Rx
+        // The view matrix is its inverse: (T * R)^-1 = R^T * T^-1
+        // Since R is orthogonal, R^-1 = R^T.
+        const model = Mat4.mul(
+            Mat4.translate(px, py, pz),
+            Mat4.mul(Mat4.mul(Mat4.rotateZ(rz), Mat4.rotateY(ry)), Mat4.rotateX(rx)),
+        );
+
+        // Invert the rigid-body transform:
+        // Transpose the 3x3 rotation part, then apply negated translation.
+        var view = Mat4.identity();
+        for (0..3) |col| {
+            for (0..3) |row| {
+                view.m[col][row] = model.m[row][col];
+            }
+        }
+        view.m[3][0] = -(model.m[3][0] * view.m[0][0] + model.m[3][1] * view.m[1][0] + model.m[3][2] * view.m[2][0]);
+        view.m[3][1] = -(model.m[3][0] * view.m[0][1] + model.m[3][1] * view.m[1][1] + model.m[3][2] * view.m[2][1]);
+        view.m[3][2] = -(model.m[3][0] * view.m[0][2] + model.m[3][1] * view.m[1][2] + model.m[3][2] * view.m[2][2]);
+        return view;
+    }
 };
 
 // ============================================================

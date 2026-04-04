@@ -35,5 +35,26 @@ pub const MaterialHandle = struct {
     pub const lua_name = "material";
 };
 
+pub const Camera = struct {
+    fov: f32 = 60,
+    near: f32 = 0.1,
+    far: f32 = 100.0,
+    viewport_x: f32 = 0.0,
+    viewport_y: f32 = 0.0,
+    viewport_w: f32 = 1.0,
+    viewport_h: f32 = 1.0,
+    pub const Lua = lua.Component("camera", @This());
+};
+
+pub const DirectionalLight = struct {
+    dir_x: f32 = 0.4,
+    dir_y: f32 = 0.8,
+    dir_z: f32 = 0.4,
+    r: f32 = 1.0,
+    g: f32 = 1.0,
+    b: f32 = 1.0,
+    pub const Lua = lua.Component("directional_light", @This());
+};
+
 /// Single source of truth: all component types exposed to Lua.
-pub const all = .{ Position, Rotation, Spin, Player, MeshHandle, MaterialHandle };
+pub const all = .{ Position, Rotation, Spin, Player, MeshHandle, MaterialHandle, Camera, DirectionalLight };

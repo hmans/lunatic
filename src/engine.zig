@@ -20,6 +20,8 @@ const Position = components.Position;
 const Rotation = components.Rotation;
 const MeshHandle = components.MeshHandle;
 const MaterialHandle = components.MaterialHandle;
+const Camera = components.Camera;
+const DirectionalLight = components.DirectionalLight;
 const Spin = components.Spin;
 
 const Vertex = geometry.Vertex;
@@ -312,13 +314,8 @@ pub const Engine = struct {
     rt_w: u32 = 0,
     rt_h: u32 = 0,
 
-    // Camera
-    camera_eye: Vec3 = Vec3.new(0, 1.5, 4),
-    camera_target: Vec3 = Vec3.new(0, 0, 0),
+    // Scene
     clear_color: [4]f32 = .{ 0.08, 0.08, 0.12, 1.0 },
-
-    // Lighting
-    light_dir: [4]f32 = .{ 0.4, 0.8, 0.4, 0.0 },
     ambient_color: [4]f32 = .{ 0.15, 0.15, 0.2, 0.0 },
 
     // Fog
@@ -758,20 +755,20 @@ pub const Engine = struct {
             }
         }
 
-        const aspect: f32 = @as(f32, @floatFromInt(sw_w)) / @as(f32, @floatFromInt(sw_h));
-        const proj = Mat4.perspective(60.0, aspect, 0.1, 100.0);
-        const view = Mat4.lookAt(self.camera_eye, self.camera_target, Vec3.new(0, 1, 0));
-        const vp = Mat4.mul(proj, view);
-
-        const scene_uniforms = SceneUniforms{
-            .light_dir = self.light_dir,
-            .camera_pos = .{ self.camera_eye.x, self.camera_eye.y, self.camera_eye.z, 0.0 },
-            .fog_color = .{ self.fog_color[0], self.fog_color[1], self.fog_color[2], if (self.fog_enabled) 1.0 else 0.0 },
-            .fog_params = .{ self.fog_start, self.fog_end, 0.0, 0.0 },
-            .ambient = self.ambient_color,
-        };
+        // Find first directional light (or use defaults)
+        var light_dir = [4]f32{ 0.4, 0.8, 0.4, 0.0 };
+        {
+            var light_view = self.registry.view(.{DirectionalLight}, .{});
+            var light_iter = light_view.entityIterator();
+            if (light_iter.next()) |light_entity| {
+                const dl = light_view.getConst(light_entity);
+                light_dir = .{ dl.dir_x, dl.dir_y, dl.dir_z, 0.0 };
+            }
+        }
 
         const default_material = MaterialUniforms{ .albedo = .{ 1.0, 1.0, 1.0, 1.0 } };
+        const sw_w_f: f32 = @floatFromInt(sw_w);
+        const sw_h_f: f32 = @floatFromInt(sw_h);
 
         const color_target = if (self.sample_count.isMultisample()) c.SDL_GPUColorTargetInfo{
             .texture = self.msaa_color_texture,
@@ -822,41 +819,83 @@ pub const Engine = struct {
         };
 
         c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
-        c.SDL_PushGPUFragmentUniformData(cmd, 0, &scene_uniforms, @sizeOf(SceneUniforms));
 
-        var ecs_view = self.registry.view(.{ Position, Rotation, MeshHandle }, .{});
-        var iter = ecs_view.entityIterator();
+        // Render once per camera entity
+        var cam_view = self.registry.view(.{ Position, Rotation, Camera }, .{});
+        var cam_iter = cam_view.entityIterator();
+        while (cam_iter.next()) |cam_entity| {
+            const cam_pos = cam_view.getConst(Position, cam_entity);
+            const cam_rot = cam_view.getConst(Rotation, cam_entity);
+            const cam = cam_view.getConst(Camera, cam_entity);
 
-        var bound_mesh: ?u32 = null;
-        while (iter.next()) |entity| {
-            const pos = ecs_view.getConst(Position, entity);
-            const rot = ecs_view.getConst(Rotation, entity);
-            const mesh_handle = ecs_view.getConst(MeshHandle, entity);
-            const mesh = self.mesh_registry[mesh_handle.id] orelse continue;
+            // Set viewport and scissor for this camera
+            const vp_x = cam.viewport_x * sw_w_f;
+            const vp_y = cam.viewport_y * sw_h_f;
+            const vp_w = cam.viewport_w * sw_w_f;
+            const vp_h = cam.viewport_h * sw_h_f;
+            c.SDL_SetGPUViewport(render_pass, &c.SDL_GPUViewport{
+                .x = vp_x,
+                .y = vp_y,
+                .w = vp_w,
+                .h = vp_h,
+                .min_depth = 0.0,
+                .max_depth = 1.0,
+            });
+            c.SDL_SetGPUScissor(render_pass, &c.SDL_Rect{
+                .x = @intFromFloat(vp_x),
+                .y = @intFromFloat(vp_y),
+                .w = @intFromFloat(vp_w),
+                .h = @intFromFloat(vp_h),
+            });
 
-            if (bound_mesh == null or bound_mesh.? != mesh_handle.id) {
-                const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.buffer, .offset = 0 };
-                c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
-                bound_mesh = mesh_handle.id;
-            }
+            const aspect: f32 = vp_w / vp_h;
+            const proj = Mat4.perspective(cam.fov, aspect, cam.near, cam.far);
+            const view = Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, cam_rot.x, cam_rot.y, cam_rot.z);
+            const vp = Mat4.mul(proj, view);
 
-            // Per-entity material: look up MaterialHandle if present, else use default
-            const mat_uniforms = if (self.registry.tryGet(MaterialHandle, entity)) |mat_handle|
-                if (self.material_registry[mat_handle.id]) |mat|
-                    MaterialUniforms{ .albedo = mat.albedo }
+            const scene_uniforms = SceneUniforms{
+                .light_dir = light_dir,
+                .camera_pos = .{ cam_pos.x, cam_pos.y, cam_pos.z, 0.0 },
+                .fog_color = .{ self.fog_color[0], self.fog_color[1], self.fog_color[2], if (self.fog_enabled) 1.0 else 0.0 },
+                .fog_params = .{ self.fog_start, self.fog_end, 0.0, 0.0 },
+                .ambient = self.ambient_color,
+            };
+            c.SDL_PushGPUFragmentUniformData(cmd, 0, &scene_uniforms, @sizeOf(SceneUniforms));
+
+            var ecs_view = self.registry.view(.{ Position, Rotation, MeshHandle }, .{});
+            var iter = ecs_view.entityIterator();
+
+            var bound_mesh: ?u32 = null;
+            while (iter.next()) |entity| {
+                const pos = ecs_view.getConst(Position, entity);
+                const rot = ecs_view.getConst(Rotation, entity);
+                const mesh_handle = ecs_view.getConst(MeshHandle, entity);
+                const mesh = self.mesh_registry[mesh_handle.id] orelse continue;
+
+                if (bound_mesh == null or bound_mesh.? != mesh_handle.id) {
+                    const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.buffer, .offset = 0 };
+                    c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
+                    bound_mesh = mesh_handle.id;
+                }
+
+                // Per-entity material
+                const mat_uniforms = if (self.registry.tryGet(MaterialHandle, entity)) |mat_handle|
+                    if (self.material_registry[mat_handle.id]) |mat|
+                        MaterialUniforms{ .albedo = mat.albedo }
+                    else
+                        default_material
                 else
-                    default_material
-            else
-                default_material;
+                    default_material;
 
-            const rotation = Mat4.mul(Mat4.mul(Mat4.rotateZ(rot.z), Mat4.rotateY(rot.y)), Mat4.rotateX(rot.x));
-            const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), rotation);
-            const mvp = Mat4.mul(vp, model);
+                const rotation = Mat4.mul(Mat4.mul(Mat4.rotateZ(rot.z), Mat4.rotateY(rot.y)), Mat4.rotateX(rot.x));
+                const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), rotation);
+                const mvp = Mat4.mul(vp, model);
 
-            const vert_uniforms = VertexUniforms{ .mvp = mvp.m, .model = model.m };
-            c.SDL_PushGPUVertexUniformData(cmd, 0, &vert_uniforms, @sizeOf(VertexUniforms));
-            c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
-            c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, 1, 0, 0);
+                const vert_uniforms = VertexUniforms{ .mvp = mvp.m, .model = model.m };
+                c.SDL_PushGPUVertexUniformData(cmd, 0, &vert_uniforms, @sizeOf(VertexUniforms));
+                c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
+                c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, 1, 0, 0);
+            }
         }
 
         c.SDL_EndGPURenderPass(render_pass);
@@ -874,10 +913,8 @@ pub const Engine = struct {
 
         const fns = .{
             .{ "key_down", &luaKeyDown },
-            .{ "set_camera", &luaSetCamera },
             .{ "set_clear_color", &luaSetClearColor },
             .{ "set_fog", &luaSetFog },
-            .{ "set_light", &luaSetLight },
             .{ "set_ambient", &luaSetAmbient },
             .{ "spawn", &luaSpawn },
             .{ "destroy", &luaDestroy },
@@ -996,17 +1033,6 @@ fn luaKeyDown(L: ?*lc.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-fn luaSetCamera(L: ?*lc.lua_State) callconv(.c) c_int {
-    const self = getEngine(L);
-    self.camera_eye.x = @floatCast(lc.luaL_checknumber(L, 1));
-    self.camera_eye.y = @floatCast(lc.luaL_checknumber(L, 2));
-    self.camera_eye.z = @floatCast(lc.luaL_checknumber(L, 3));
-    self.camera_target.x = @floatCast(lc.luaL_checknumber(L, 4));
-    self.camera_target.y = @floatCast(lc.luaL_checknumber(L, 5));
-    self.camera_target.z = @floatCast(lc.luaL_checknumber(L, 6));
-    return 0;
-}
-
 fn luaSetClearColor(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     self.clear_color[0] = @floatCast(lc.luaL_checknumber(L, 1));
@@ -1027,14 +1053,6 @@ fn luaSetFog(L: ?*lc.lua_State) callconv(.c) c_int {
     self.fog_color[0] = @floatCast(lc.luaL_optnumber(L, 3, self.clear_color[0]));
     self.fog_color[1] = @floatCast(lc.luaL_optnumber(L, 4, self.clear_color[1]));
     self.fog_color[2] = @floatCast(lc.luaL_optnumber(L, 5, self.clear_color[2]));
-    return 0;
-}
-
-fn luaSetLight(L: ?*lc.lua_State) callconv(.c) c_int {
-    const self = getEngine(L);
-    self.light_dir[0] = @floatCast(lc.luaL_checknumber(L, 1));
-    self.light_dir[1] = @floatCast(lc.luaL_checknumber(L, 2));
-    self.light_dir[2] = @floatCast(lc.luaL_checknumber(L, 3));
     return 0;
 }
 
