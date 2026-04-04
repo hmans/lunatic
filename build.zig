@@ -25,7 +25,7 @@ fn addShader(
 
     // SPIR-V → MSL (via spirv-cross)
     const spirv_cross = b.addSystemCommand(&.{
-        "spirv-cross", "--msl",
+        "spirv-cross", "--msl", "--msl-decoration-binding",
     });
     spirv_cross.addFileArg(spv);
     spirv_cross.addArg("--output");

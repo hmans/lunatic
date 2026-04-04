@@ -12,6 +12,10 @@ pub const Vertex = extern struct {
     nz: f32,
     u: f32 = 0,
     v: f32 = 0,
+    tx: f32 = 1, // tangent
+    ty: f32 = 0,
+    tz: f32 = 0,
+    tw: f32 = 1, // handedness
 };
 
 pub const Mesh = struct {

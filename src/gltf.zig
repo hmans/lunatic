@@ -68,17 +68,22 @@ pub fn load(engine: *Engine, path: [*:0]const u8) !GltfModel {
                 pbr.base_color_factor[2],
                 pbr.base_color_factor[3],
             };
+            mat_data.metallic = pbr.metallic_factor;
+            mat_data.roughness = pbr.roughness_factor;
 
-            // Base color texture
-            if (pbr.base_color_texture.texture) |tex| {
-                if (tex.*.image) |img| {
-                    const img_index = (@intFromPtr(img) - @intFromPtr(gltf.images)) / @sizeOf(cgltf.cgltf_image);
-                    if (img_index < tex_count) {
-                        mat_data.texture_id = texture_ids[img_index];
-                    }
-                }
-            }
+            mat_data.base_color_texture = resolveImageIndex(gltf, pbr.base_color_texture.texture, texture_ids, tex_count);
+            mat_data.metallic_roughness_texture = resolveImageIndex(gltf, pbr.metallic_roughness_texture.texture, texture_ids, tex_count);
         }
+
+        // Normal texture
+        mat_data.normal_texture = resolveImageIndex(gltf, mat.normal_texture.texture, texture_ids, tex_count);
+
+        // Emissive
+        mat_data.emissive = .{ mat.emissive_factor[0], mat.emissive_factor[1], mat.emissive_factor[2] };
+        mat_data.emissive_texture = resolveImageIndex(gltf, mat.emissive_texture.texture, texture_ids, tex_count);
+
+        // Occlusion
+        mat_data.occlusion_texture = resolveImageIndex(gltf, mat.occlusion_texture.texture, texture_ids, tex_count);
 
         material_ids[i] = try engine.createNamedMaterial(null, mat_data);
     }
@@ -103,12 +108,21 @@ pub fn load(engine: *Engine, path: [*:0]const u8) !GltfModel {
     };
 }
 
+fn resolveImageIndex(gltf: *cgltf.cgltf_data, texture_ptr: ?*cgltf.cgltf_texture, texture_ids: []u32, tex_count: usize) ?u32 {
+    const tex = texture_ptr orelse return null;
+    const img = tex.*.image orelse return null;
+    const img_index = (@intFromPtr(img) - @intFromPtr(gltf.images)) / @sizeOf(cgltf.cgltf_image);
+    if (img_index < tex_count) return texture_ids[img_index];
+    return null;
+}
+
 fn loadPrimitive(engine: *Engine, allocator: std.mem.Allocator, prim: *const cgltf.cgltf_primitive) !u32 {
 
     // Find accessors for position, normal, texcoord
     var pos_accessor: ?*cgltf.cgltf_accessor = null;
     var norm_accessor: ?*cgltf.cgltf_accessor = null;
     var uv_accessor: ?*cgltf.cgltf_accessor = null;
+    var tan_accessor: ?*cgltf.cgltf_accessor = null;
 
     for (0..prim.attributes_count) |ai| {
         const attr = &prim.attributes[ai];
@@ -116,6 +130,7 @@ fn loadPrimitive(engine: *Engine, allocator: std.mem.Allocator, prim: *const cgl
             cgltf.cgltf_attribute_type_position => pos_accessor = attr.data,
             cgltf.cgltf_attribute_type_normal => norm_accessor = attr.data,
             cgltf.cgltf_attribute_type_texcoord => uv_accessor = attr.data,
+            cgltf.cgltf_attribute_type_tangent => tan_accessor = attr.data,
             else => {},
         }
     }
@@ -151,6 +166,18 @@ fn loadPrimitive(engine: *Engine, allocator: std.mem.Allocator, prim: *const cgl
             _ = cgltf.cgltf_accessor_read_float(acc, vi, &uv, 2);
             vertices[vi].u = uv[0];
             vertices[vi].v = uv[1];
+        }
+    }
+
+    // Read tangents
+    if (tan_accessor) |acc| {
+        for (0..vertex_count) |vi| {
+            var tan: [4]f32 = undefined;
+            _ = cgltf.cgltf_accessor_read_float(acc, vi, &tan, 4);
+            vertices[vi].tx = tan[0];
+            vertices[vi].ty = tan[1];
+            vertices[vi].tz = tan[2];
+            vertices[vi].tw = tan[3];
         }
     }
 

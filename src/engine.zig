@@ -41,7 +41,14 @@ pub const TextureData = struct {
 
 pub const MaterialData = struct {
     albedo: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 },
-    texture_id: ?u32 = null, // index into texture_registry
+    metallic: f32 = 0.0,
+    roughness: f32 = 0.5,
+    emissive: [3]f32 = .{ 0, 0, 0 },
+    base_color_texture: ?u32 = null,
+    metallic_roughness_texture: ?u32 = null,
+    normal_texture: ?u32 = null,
+    emissive_texture: ?u32 = null,
+    occlusion_texture: ?u32 = null,
 };
 
 pub const max_meshes = 64;

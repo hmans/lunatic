@@ -48,7 +48,9 @@ const SceneUniforms = extern struct {
 
 const MaterialUniforms = extern struct {
     albedo: [4]f32,
-    has_texture: [4]f32 = .{ 0, 0, 0, 0 }, // .x = 1.0 if textured
+    material_params: [4]f32 = .{ 0, 0.5, 0, 0 }, // .x = metallic, .y = roughness
+    texture_flags: [4]f32 = .{ 0, 0, 0, 0 }, // .x = has_base_color, .y = has_metallic_roughness, .z = has_normal, .w = has_emissive
+    emissive: [4]f32 = .{ 0, 0, 0, 0 }, // .xyz = emissive factor, .w = has_occlusion
 };
 
 // ============================================================
@@ -144,7 +146,7 @@ pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
     };
     defer c.SDL_ReleaseGPUShader(device, vert_shader);
 
-    const frag_shader = createShader(device, frag_spv, frag_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1) orelse {
+    const frag_shader = createShader(device, frag_spv, frag_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 5) orelse {
         std.debug.print("Failed to create fragment shader: {s}\n", .{c.SDL_GetError()});
         return error.ShaderFailed;
     };
@@ -158,6 +160,7 @@ pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
         .{ .location = 0, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = @offsetOf(Vertex, "px") },
         .{ .location = 1, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = @offsetOf(Vertex, "nx") },
         .{ .location = 2, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = @offsetOf(Vertex, "u") },
+        .{ .location = 3, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, .offset = @offsetOf(Vertex, "tx") },
     };
 
     const vertex_buf_desc = [_]c.SDL_GPUVertexBufferDescription{
@@ -245,6 +248,13 @@ pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
 // Render system
 // ============================================================
 
+fn resolveTexture(self: *Engine, tex_id: ?u32, dummy: *c.SDL_GPUTexture) *c.SDL_GPUTexture {
+    if (tex_id) |id| {
+        if (self.texture_registry[id]) |tex| return tex.texture;
+    }
+    return dummy;
+}
+
 pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
     const cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse return;
 
@@ -290,7 +300,7 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
         }
     }
 
-    const default_material = MaterialUniforms{ .albedo = .{ 1.0, 1.0, 1.0, 1.0 }, .has_texture = .{ 0, 0, 0, 0 } };
+    const default_material = MaterialUniforms{ .albedo = .{ 1, 1, 1, 1 } };
     const sw_w_f: f32 = @floatFromInt(sw_w);
     const sw_h_f: f32 = @floatFromInt(sw_h);
 
@@ -428,6 +438,7 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
         // Draw in sorted order
         var bound_mesh: ?u32 = null;
         var bound_mat: ?u32 = null;
+
         for (self.draw_list[0..draw_count]) |entry| {
             const pos = self.registry.getConst(Position, entry.entity);
             const rot = self.registry.getConst(Rotation, entry.entity);
@@ -446,28 +457,41 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
 
             if (bound_mat == null or bound_mat.? != mat_id) {
                 const sampler = self.default_sampler.?;
-                const dummy_tex = self.dummy_texture.?;
+                const dummy = self.dummy_texture.?;
 
                 if (self.material_registry[mat_id]) |mat| {
-                    const has_tex: f32 = if (mat.texture_id != null) 1.0 else 0.0;
-                    const mat_uniforms = MaterialUniforms{ .albedo = mat.albedo, .has_texture = .{ has_tex, 0, 0, 0 } };
+                    const has_bc: f32 = if (mat.base_color_texture != null) 1.0 else 0.0;
+                    const has_mr: f32 = if (mat.metallic_roughness_texture != null) 1.0 else 0.0;
+                    const has_nm: f32 = if (mat.normal_texture != null) 1.0 else 0.0;
+                    const has_em: f32 = if (mat.emissive_texture != null) 1.0 else 0.0;
+                    const has_ao: f32 = if (mat.occlusion_texture != null) 1.0 else 0.0;
+
+                    const mat_uniforms = MaterialUniforms{
+                        .albedo = mat.albedo,
+                        .material_params = .{ mat.metallic, mat.roughness, 0, 0 },
+                        .texture_flags = .{ has_bc, has_mr, has_nm, has_em },
+                        .emissive = .{ mat.emissive[0], mat.emissive[1], mat.emissive[2], has_ao },
+                    };
                     c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
 
-                    const bound_texture = if (mat.texture_id) |tex_id|
-                        if (self.texture_registry[tex_id]) |tex| tex.texture else dummy_tex
-                    else
-                        dummy_tex;
-
-                    const tex_sampler_binding = [_]c.SDL_GPUTextureSamplerBinding{
-                        .{ .texture = bound_texture, .sampler = sampler },
+                    const tex_bindings = [5]c.SDL_GPUTextureSamplerBinding{
+                        .{ .texture = resolveTexture(self, mat.base_color_texture, dummy), .sampler = sampler },
+                        .{ .texture = resolveTexture(self, mat.metallic_roughness_texture, dummy), .sampler = sampler },
+                        .{ .texture = resolveTexture(self, mat.normal_texture, dummy), .sampler = sampler },
+                        .{ .texture = resolveTexture(self, mat.emissive_texture, dummy), .sampler = sampler },
+                        .{ .texture = resolveTexture(self, mat.occlusion_texture, dummy), .sampler = sampler },
                     };
-                    c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_sampler_binding, 1);
+                    c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_bindings, 5);
                 } else {
                     c.SDL_PushGPUFragmentUniformData(cmd, 1, &default_material, @sizeOf(MaterialUniforms));
-                    const tex_sampler_binding = [_]c.SDL_GPUTextureSamplerBinding{
-                        .{ .texture = dummy_tex, .sampler = sampler },
+                    const tex_bindings = [5]c.SDL_GPUTextureSamplerBinding{
+                        .{ .texture = dummy, .sampler = sampler },
+                        .{ .texture = dummy, .sampler = sampler },
+                        .{ .texture = dummy, .sampler = sampler },
+                        .{ .texture = dummy, .sampler = sampler },
+                        .{ .texture = dummy, .sampler = sampler },
                     };
-                    c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_sampler_binding, 1);
+                    c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_bindings, 5);
                 }
                 bound_mat = mat_id;
             }
