@@ -5,13 +5,19 @@
 -- Setup
 lunatic.set_clear_color(0.55, 0.7, 0.85)
 lunatic.set_ambient(0.15, 0.15, 0.25)
-lunatic.set_fog(8, 25, 0.55, 0.7, 0.85)
+lunatic.set_fog(8, 50, 0.55, 0.7, 0.85)
 
--- Camera
-local cam = lunatic.spawn()
-lunatic.add(cam, "position", 0, 8, 12)
-lunatic.add(cam, "rotation", 34, 0, 0)
-lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1)
+-- Main camera (fullscreen)
+local cam1 = lunatic.spawn()
+lunatic.add(cam1, "position", 0, 8, 12)
+lunatic.add(cam1, "rotation", 34, 0, 0)
+lunatic.add(cam1, "camera", 60, 0.1, 100, 0, 0, 1, 1)
+
+-- Minimap camera (top-right corner, top-down)
+local cam2 = lunatic.spawn()
+lunatic.add(cam2, "position", 0, 25, 0.1)
+lunatic.add(cam2, "rotation", 89, 0, 0)
+lunatic.add(cam2, "camera", 50, 0.1, 100, 0.73, 0.02, 0.25, 0.25)
 
 -- Directional light
 local light = lunatic.spawn()

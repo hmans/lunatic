@@ -770,63 +770,67 @@ pub const Engine = struct {
         const sw_w_f: f32 = @floatFromInt(sw_w);
         const sw_h_f: f32 = @floatFromInt(sw_h);
 
-        const color_target = if (self.sample_count.isMultisample()) c.SDL_GPUColorTargetInfo{
-            .texture = self.msaa_color_texture,
-            .mip_level = 0,
-            .layer_or_depth_plane = 0,
-            .clear_color = .{ .r = self.clear_color[0], .g = self.clear_color[1], .b = self.clear_color[2], .a = self.clear_color[3] },
-            .load_op = c.SDL_GPU_LOADOP_CLEAR,
-            .store_op = c.SDL_GPU_STOREOP_RESOLVE,
-            .resolve_texture = swapchain_tex,
-            .resolve_mip_level = 0,
-            .resolve_layer = 0,
-            .cycle = true,
-            .cycle_resolve_texture = false,
-            .padding1 = 0,
-            .padding2 = 0,
-        } else c.SDL_GPUColorTargetInfo{
-            .texture = swapchain_tex,
-            .mip_level = 0,
-            .layer_or_depth_plane = 0,
-            .clear_color = .{ .r = self.clear_color[0], .g = self.clear_color[1], .b = self.clear_color[2], .a = self.clear_color[3] },
-            .load_op = c.SDL_GPU_LOADOP_CLEAR,
-            .store_op = c.SDL_GPU_STOREOP_STORE,
-            .resolve_texture = null,
-            .resolve_mip_level = 0,
-            .resolve_layer = 0,
-            .cycle = false,
-            .cycle_resolve_texture = false,
-            .padding1 = 0,
-            .padding2 = 0,
-        };
+        const clear_color = c.SDL_FColor{ .r = self.clear_color[0], .g = self.clear_color[1], .b = self.clear_color[2], .a = self.clear_color[3] };
+        const is_msaa = self.sample_count.isMultisample();
 
-        const depth_target = c.SDL_GPUDepthStencilTargetInfo{
-            .texture = self.depth_texture,
-            .clear_depth = 1.0,
-            .load_op = c.SDL_GPU_LOADOP_CLEAR,
-            .store_op = c.SDL_GPU_STOREOP_DONT_CARE,
-            .stencil_load_op = c.SDL_GPU_LOADOP_DONT_CARE,
-            .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
-            .cycle = true,
-            .clear_stencil = 0,
-            .mip_level = 0,
-            .layer = 0,
-        };
-
-        const render_pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target) orelse {
-            _ = c.SDL_SubmitGPUCommandBuffer(cmd);
-            return;
-        };
-
-        c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
-
-        // Render once per camera entity
+        // One render pass per camera — each clears depth, first clears color
         var cam_view = self.registry.view(.{ Position, Rotation, Camera }, .{});
         var cam_iter = cam_view.entityIterator();
+        var first_camera = true;
         while (cam_iter.next()) |cam_entity| {
             const cam_pos = cam_view.getConst(Position, cam_entity);
             const cam_rot = cam_view.getConst(Rotation, cam_entity);
             const cam = cam_view.getConst(Camera, cam_entity);
+
+            const color_load_op: c_uint = if (first_camera) c.SDL_GPU_LOADOP_CLEAR else c.SDL_GPU_LOADOP_LOAD;
+
+            const color_target = if (is_msaa) c.SDL_GPUColorTargetInfo{
+                .texture = self.msaa_color_texture,
+                .mip_level = 0,
+                .layer_or_depth_plane = 0,
+                .clear_color = clear_color,
+                .load_op = color_load_op,
+                .store_op = c.SDL_GPU_STOREOP_RESOLVE_AND_STORE,
+                .resolve_texture = swapchain_tex,
+                .resolve_mip_level = 0,
+                .resolve_layer = 0,
+                .cycle = first_camera,
+                .cycle_resolve_texture = false,
+                .padding1 = 0,
+                .padding2 = 0,
+            } else c.SDL_GPUColorTargetInfo{
+                .texture = swapchain_tex,
+                .mip_level = 0,
+                .layer_or_depth_plane = 0,
+                .clear_color = clear_color,
+                .load_op = color_load_op,
+                .store_op = c.SDL_GPU_STOREOP_STORE,
+                .resolve_texture = null,
+                .resolve_mip_level = 0,
+                .resolve_layer = 0,
+                .cycle = first_camera,
+                .cycle_resolve_texture = false,
+                .padding1 = 0,
+                .padding2 = 0,
+            };
+
+            const depth_target = c.SDL_GPUDepthStencilTargetInfo{
+                .texture = self.depth_texture,
+                .clear_depth = 1.0,
+                .load_op = c.SDL_GPU_LOADOP_CLEAR,
+                .store_op = c.SDL_GPU_STOREOP_DONT_CARE,
+                .stencil_load_op = c.SDL_GPU_LOADOP_DONT_CARE,
+                .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
+                .cycle = first_camera,
+                .clear_stencil = 0,
+                .mip_level = 0,
+                .layer = 0,
+            };
+
+            first_camera = false;
+
+            const render_pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target) orelse continue;
+            c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
 
             // Set viewport and scissor for this camera
             const vp_x = cam.viewport_x * sw_w_f;
@@ -896,9 +900,10 @@ pub const Engine = struct {
                 c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
                 c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, 1, 0, 0);
             }
+
+            c.SDL_EndGPURenderPass(render_pass);
         }
 
-        c.SDL_EndGPURenderPass(render_pass);
         _ = c.SDL_SubmitGPUCommandBuffer(cmd);
     }
 
