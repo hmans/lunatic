@@ -175,6 +175,9 @@ pub fn registerLuaApi(self: *Engine) void {
 
     const fns = .{
         .{ "key_down", &luaKeyDown },
+        .{ "mouse_delta", &luaMouseDelta },
+        .{ "set_mouse_grab", &luaSetMouseGrab },
+        .{ "camera_axes", &luaCameraAxes },
         .{ "set_clear_color", &luaSetClearColor },
         .{ "set_fog", &luaSetFog },
         .{ "set_ambient", &luaSetAmbient },
@@ -281,6 +284,36 @@ fn resolveHandle(self: *Engine, L: ?*lc.lua_State, idx: c_int, kind: HandleKind)
     };
     _ = lc.luaL_error(L, label, name);
     unreachable;
+}
+
+fn luaCameraAxes(L: ?*lc.lua_State) callconv(.c) c_int {
+    _ = getEngine(L);
+    const rx: f32 = @floatCast(lc.luaL_checknumber(L, 1));
+    const ry: f32 = @floatCast(lc.luaL_checknumber(L, 2));
+    const rz: f32 = @floatCast(lc.luaL_checknumber(L, 3));
+    const axes = Engine.getCameraAxes(rx, ry, rz);
+    lc.lua_pushnumber(L, axes.forward[0]);
+    lc.lua_pushnumber(L, axes.forward[1]);
+    lc.lua_pushnumber(L, axes.forward[2]);
+    lc.lua_pushnumber(L, axes.right[0]);
+    lc.lua_pushnumber(L, axes.right[1]);
+    lc.lua_pushnumber(L, axes.right[2]);
+    return 6;
+}
+
+fn luaMouseDelta(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const delta = self.getMouseDelta();
+    lc.lua_pushnumber(L, delta.dx);
+    lc.lua_pushnumber(L, delta.dy);
+    return 2;
+}
+
+fn luaSetMouseGrab(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const grab = lc.lua_toboolean(L, 1) != 0;
+    self.setMouseGrab(grab);
+    return 0;
 }
 
 fn luaKeyDown(L: ?*lc.lua_State) callconv(.c) c_int {

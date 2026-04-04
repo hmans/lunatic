@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const math3d = @import("math3d.zig");
+const Mat4 = math3d.Mat4;
 const components = @import("components.zig");
 const ecs = @import("zig-ecs");
 const geometry = @import("geometry.zig");
@@ -146,6 +147,8 @@ pub const Engine = struct {
 
     // ---- Lifecycle ----
 
+    /// Initialize the engine: ECS, Lua, GPU device, pipeline, built-in resources.
+    /// Must be called on a pointer-stable location (e.g. `var engine: Engine = undefined;`).
     pub fn init(self: *Engine, config: Config) !void {
         self.* = Engine{
             .registry = ecs.Registry.init(std.heap.c_allocator),
@@ -170,6 +173,7 @@ pub const Engine = struct {
         }
     }
 
+    /// Release all GPU resources, Lua state, and ECS storage.
     pub fn deinit(self: *Engine) void {
         if (self.lua_state) |L| lc.lua_close(L);
 
@@ -195,6 +199,7 @@ pub const Engine = struct {
         self.registry.deinit();
     }
 
+    /// Load and execute a Lua script file.
     pub fn loadScript(self: *Engine, path: [*:0]const u8) !void {
         const L = self.lua_state.?;
         if (lc.luaL_loadfile(L, path) != 0 or lc.lua_pcall(L, 0, 0, 0) != 0) {
@@ -204,6 +209,7 @@ pub const Engine = struct {
         }
     }
 
+    /// Enter the main loop: polls events, runs Lua systems, renders. Returns on quit.
     pub fn run(self: *Engine) !void {
         const device = self.gpu_device orelse return error.NotInitialized;
 
@@ -308,6 +314,8 @@ pub const Engine = struct {
 
     // ---- Mesh API ----
 
+    /// Upload vertex (and optional index) data to the GPU. Returns a mesh handle.
+    /// Pass a name for built-in meshes (accessible via `lunatic.mesh.*` in Lua), or null.
     pub fn createMesh(self: *Engine, name: ?[*:0]const u8, vertices: []const Vertex, indices: ?[]const u16) !u32 {
         if (self.mesh_count >= max_meshes) return error.TooManyMeshes;
         const device = self.gpu_device orelse return error.NotInitialized;
@@ -335,6 +343,7 @@ pub const Engine = struct {
         return id;
     }
 
+    /// Generate and upload a unit cube mesh. Returns a mesh handle.
     pub fn createCubeMesh(self: *Engine) !u32 {
         const allocator = std.heap.c_allocator;
         const mesh = try geometry.cube(allocator);
@@ -343,6 +352,7 @@ pub const Engine = struct {
         return self.createMesh(null, mesh.vertices, mesh.indices);
     }
 
+    /// Generate and upload a UV sphere mesh. Returns a mesh handle.
     pub fn createSphereMesh(self: *Engine, segments: u32, rings: u32) !u32 {
         const allocator = std.heap.c_allocator;
         const mesh = try geometry.sphere(allocator, segments, rings);
@@ -351,6 +361,7 @@ pub const Engine = struct {
         return self.createMesh(null, mesh.vertices, mesh.indices);
     }
 
+    /// Look up a named mesh by string. Returns the handle or null.
     pub fn findMesh(self: *Engine, name: [*:0]const u8) ?u32 {
         const needle = std.mem.span(name);
         for (0..self.mesh_count) |i| {
@@ -363,10 +374,12 @@ pub const Engine = struct {
 
     // ---- Material API ----
 
+    /// Create an unnamed material. Returns a material handle.
     pub fn createMaterial(self: *Engine, data: MaterialData) !u32 {
         return self.createNamedMaterial(null, data);
     }
 
+    /// Create a material with an optional name (accessible via `lunatic.material.*` in Lua).
     pub fn createNamedMaterial(self: *Engine, name: ?[*:0]const u8, data: MaterialData) !u32 {
         if (self.material_count >= max_materials) return error.TooManyMaterials;
         const id = self.material_count;
@@ -376,6 +389,7 @@ pub const Engine = struct {
         return id;
     }
 
+    /// Look up a named material by string. Returns the handle or null.
     pub fn findMaterial(self: *Engine, name: [*:0]const u8) ?u32 {
         const needle = std.mem.span(name);
         for (0..self.material_count) |i| {
@@ -393,6 +407,7 @@ pub const Engine = struct {
 
     // ---- Texture API ----
 
+    /// Create a texture from raw RGBA pixel data. Returns a texture handle.
     pub fn createTextureFromMemory(self: *Engine, pixels: [*]const u8, width: u32, height: u32) !u32 {
         if (self.texture_count >= max_textures) return error.TooManyTextures;
         const device = self.gpu_device orelse return error.NotInitialized;
@@ -471,6 +486,7 @@ pub const Engine = struct {
         return id;
     }
 
+    /// Load an image file (PNG, JPEG, etc.) and create a GPU texture. Returns a texture handle.
     pub fn createTextureFromFile(self: *Engine, path: [*:0]const u8) !u32 {
         var w: c_int = 0;
         var h: c_int = 0;
@@ -482,6 +498,44 @@ pub const Engine = struct {
 
     // ---- Lua systems ----
 
+    // ---- Input API ----
+
+    /// Get relative mouse movement since the last call. Requires mouse grab to be enabled.
+    pub fn getMouseDelta(self: *Engine) struct { dx: f32, dy: f32 } {
+        _ = self;
+        var dx: f32 = 0;
+        var dy: f32 = 0;
+        _ = c.SDL_GetRelativeMouseState(&dx, &dy);
+        return .{ .dx = dx, .dy = dy };
+    }
+
+    /// Enable or disable relative mouse mode (hides cursor, provides delta movement).
+    pub fn setMouseGrab(self: *Engine, grab: bool) void {
+        if (self.sdl_window) |win| {
+            _ = c.SDL_SetWindowRelativeMouseMode(win, grab);
+        }
+    }
+
+    // ---- Math utilities ----
+
+    pub const CameraAxes = struct {
+        forward: [3]f32,
+        right: [3]f32,
+    };
+
+    /// Compute forward and right direction vectors from euler angles (degrees).
+    /// Uses the same rotation convention as the renderer (Rz * Ry * Rx, camera looks down -Z).
+    pub fn getCameraAxes(rx: f32, ry: f32, rz: f32) CameraAxes {
+        const rot = Mat4.mul(Mat4.mul(Mat4.rotateZ(rz), Mat4.rotateY(ry)), Mat4.rotateX(rx));
+        return .{
+            .forward = .{ -rot.m[2][0], -rot.m[2][1], -rot.m[2][2] },
+            .right = .{ rot.m[0][0], rot.m[0][1], rot.m[0][2] },
+        };
+    }
+
+    // ---- Lua systems ----
+
+    /// Run all registered Lua systems with the given delta time. Disables systems that error.
     pub fn runLuaSystems(self: *Engine, dt: f32) void {
         const L = self.lua_state orelse return;
         for (0..self.lua_system_count) |i| {
@@ -499,6 +553,7 @@ pub const Engine = struct {
         }
     }
 
+    /// Unregister all Lua systems and free their registry references.
     pub fn resetSystems(self: *Engine) void {
         if (self.lua_state) |L| {
             for (0..self.lua_system_count) |i| {
