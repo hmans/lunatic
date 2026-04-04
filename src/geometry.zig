@@ -73,12 +73,12 @@ pub fn cube(allocator: std.mem.Allocator) ![]Vertex {
         };
 
         const base = fi * 6;
-        verts[base + 0] = corners[0];
-        verts[base + 1] = corners[1];
-        verts[base + 2] = corners[2];
-        verts[base + 3] = corners[0];
-        verts[base + 4] = corners[2];
-        verts[base + 5] = corners[3];
+        verts[base + 0] = corners[1];
+        verts[base + 1] = corners[0];
+        verts[base + 2] = corners[3];
+        verts[base + 3] = corners[1];
+        verts[base + 4] = corners[3];
+        verts[base + 5] = corners[2];
     }
 
     return verts;
@@ -117,7 +117,7 @@ pub fn sphere(allocator: std.mem.Allocator, segments: u32, rings: u32) ![]Vertex
             const p01 = spherePoint(r, theta0, phi1);
             const p11 = spherePoint(r, theta1, phi1);
 
-            // Triangle 1
+            // Triangle 1 (CCW when viewed from outside)
             verts[vi] = p00;
             verts[vi + 1] = p10;
             verts[vi + 2] = p11;

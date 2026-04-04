@@ -18,3 +18,10 @@ A 3D game engine: Zig core + SDL3 GPU + LuaJIT scripting + zig-ecs.
 - `lc` = Lua C namespace, `c` = SDL C namespace (separate `@cImport`s to avoid type conflicts)
 - Query results are cached per frame via FNV-1a hash of component names
 - Any new APIs must be made available to Zig first, and then (optionally, where it makes sense) to Lua.
+
+- Mesh winding order is CCW (counter-clockwise) when viewed from outside. Pipeline uses `CULLMODE_BACK` + `FRONTFACE_COUNTER_CLOCKWISE`. New geometry generators should verify winding with the cross-product dot normal test.
+
+## Gotchas
+
+- **Shader cache staleness**: The zig build cache doesn't always invalidate spirv-cross MSL output when GLSL sources change. Run `rm -rf .zig-cache` after modifying shaders if you see stale behavior.
+- **MSAA + multiple render passes**: Use `STOREOP_RESOLVE_AND_STORE` (not `STOREOP_RESOLVE`) when subsequent render passes need to load from the MSAA color texture. Plain RESOLVE discards MSAA contents.

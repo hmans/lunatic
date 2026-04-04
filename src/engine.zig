@@ -73,6 +73,12 @@ const max_meshes = 64;
 const max_materials = 64;
 const max_cached_queries = 64;
 const max_lua_systems = 64;
+const max_renderables = 16384;
+
+const DrawEntry = struct {
+    sort_key: u64, // mesh_id << 32 | material_id
+    entity: ecs.Entity,
+};
 
 const QueryCacheEntry = struct {
     lua_ref: c_int = lc.LUA_NOREF,
@@ -333,6 +339,9 @@ pub const Engine = struct {
     material_registry: [max_materials]?MaterialData = .{null} ** max_materials,
     material_names: [max_materials]?[*:0]const u8 = .{null} ** max_materials,
     material_count: u32 = 0,
+
+    // Draw sorting scratch buffer
+    draw_list: [max_renderables]DrawEntry = undefined,
 
     // Query cache
     current_frame: u64 = 0,
@@ -866,30 +875,53 @@ pub const Engine = struct {
             };
             c.SDL_PushGPUFragmentUniformData(cmd, 0, &scene_uniforms, @sizeOf(SceneUniforms));
 
-            var ecs_view = self.registry.view(.{ Position, Rotation, MeshHandle }, .{});
-            var iter = ecs_view.entityIterator();
+            // Collect renderable entities and sort by mesh+material to minimize state changes
+            var draw_count: u32 = 0;
+            {
+                var ecs_view = self.registry.view(.{ Position, Rotation, MeshHandle }, .{});
+                var iter = ecs_view.entityIterator();
+                while (iter.next()) |entity| {
+                    if (draw_count >= max_renderables) break;
+                    const mesh_id: u64 = ecs_view.getConst(MeshHandle, entity).id;
+                    const mat_id: u64 = if (self.registry.tryGet(MaterialHandle, entity)) |mh| mh.id else 0;
+                    self.draw_list[draw_count] = .{
+                        .sort_key = (mesh_id << 32) | mat_id,
+                        .entity = entity,
+                    };
+                    draw_count += 1;
+                }
+            }
 
+            std.mem.sort(DrawEntry, self.draw_list[0..draw_count], {}, struct {
+                fn lessThan(_: void, a: DrawEntry, b: DrawEntry) bool {
+                    return a.sort_key < b.sort_key;
+                }
+            }.lessThan);
+
+            // Draw in sorted order
             var bound_mesh: ?u32 = null;
-            while (iter.next()) |entity| {
-                const pos = ecs_view.getConst(Position, entity);
-                const rot = ecs_view.getConst(Rotation, entity);
-                const mesh_handle = ecs_view.getConst(MeshHandle, entity);
-                const mesh = self.mesh_registry[mesh_handle.id] orelse continue;
+            var bound_mat: ?u32 = null;
+            for (self.draw_list[0..draw_count]) |entry| {
+                const pos = self.registry.getConst(Position, entry.entity);
+                const rot = self.registry.getConst(Rotation, entry.entity);
+                const mesh_id: u32 = @truncate(entry.sort_key >> 32);
+                const mat_id: u32 = @truncate(entry.sort_key);
+                const mesh = self.mesh_registry[mesh_id] orelse continue;
 
-                if (bound_mesh == null or bound_mesh.? != mesh_handle.id) {
+                if (bound_mesh == null or bound_mesh.? != mesh_id) {
                     const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.buffer, .offset = 0 };
                     c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
-                    bound_mesh = mesh_handle.id;
+                    bound_mesh = mesh_id;
                 }
 
-                // Per-entity material
-                const mat_uniforms = if (self.registry.tryGet(MaterialHandle, entity)) |mat_handle|
-                    if (self.material_registry[mat_handle.id]) |mat|
+                if (bound_mat == null or bound_mat.? != mat_id) {
+                    const mat_uniforms = if (self.material_registry[mat_id]) |mat|
                         MaterialUniforms{ .albedo = mat.albedo }
                     else
-                        default_material
-                else
-                    default_material;
+                        default_material;
+                    c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
+                    bound_mat = mat_id;
+                }
 
                 const rotation = Mat4.mul(Mat4.mul(Mat4.rotateZ(rot.z), Mat4.rotateY(rot.y)), Mat4.rotateX(rot.x));
                 const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), rotation);
@@ -897,7 +929,6 @@ pub const Engine = struct {
 
                 const vert_uniforms = VertexUniforms{ .mvp = mvp.m, .model = model.m };
                 c.SDL_PushGPUVertexUniformData(cmd, 0, &vert_uniforms, @sizeOf(VertexUniforms));
-                c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
                 c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, 1, 0, 0);
             }
 
