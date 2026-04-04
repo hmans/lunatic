@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const core = @import("core_components");
 const components = @import("components");
 const ecs = @import("zig-ecs");
 const engine_mod = @import("engine");
@@ -12,11 +13,11 @@ const gltf_mod = engine_mod.gltf;
 const lua = @import("lua");
 const lc = lua.c;
 
-const Position = components.Position;
-const Rotation = components.Rotation;
-const MeshHandle = components.MeshHandle;
-const MaterialHandle = components.MaterialHandle;
-const LookAt = components.LookAt;
+const Position = core.Position;
+const Rotation = core.Rotation;
+const MeshHandle = core.MeshHandle;
+const MaterialHandle = core.MaterialHandle;
+const LookAt = core.LookAt;
 
 // ============================================================
 // Query infrastructure
@@ -516,22 +517,22 @@ fn luaGet(L: ?*lc.lua_State) callconv(.c) c_int {
     }
 
     // Handle types without auto-bindings
-    if (std.mem.eql(u8, name, lua.nameOf(components.MeshHandle))) {
-        if (self.registry.tryGet(components.MeshHandle, entity)) |mh| {
+    if (std.mem.eql(u8, name, lua.nameOf(core.MeshHandle))) {
+        if (self.registry.tryGet(core.MeshHandle, entity)) |mh| {
             lc.lua_pushinteger(L, @intCast(mh.id));
             return 1;
         }
         return 0;
     }
-    if (std.mem.eql(u8, name, lua.nameOf(components.MaterialHandle))) {
-        if (self.registry.tryGet(components.MaterialHandle, entity)) |mh| {
+    if (std.mem.eql(u8, name, lua.nameOf(core.MaterialHandle))) {
+        if (self.registry.tryGet(core.MaterialHandle, entity)) |mh| {
             lc.lua_pushinteger(L, @intCast(mh.id));
             return 1;
         }
         return 0;
     }
-    if (std.mem.eql(u8, name, lua.nameOf(components.LookAt))) {
-        if (self.registry.tryGet(components.LookAt, entity)) |la| {
+    if (std.mem.eql(u8, name, lua.nameOf(core.LookAt))) {
+        if (self.registry.tryGet(core.LookAt, entity)) |la| {
             lc.lua_pushinteger(L, @intCast(la.target));
             return 1;
         }

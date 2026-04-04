@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const math3d = @import("math3d");
-const components = @import("components");
+const components = @import("core_components");
 const geometry = @import("geometry");
 const ecs = @import("zig-ecs");
 const engine_mod = @import("engine");

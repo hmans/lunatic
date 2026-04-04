@@ -4,7 +4,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const math3d = @import("math3d");
 const Mat4 = math3d.Mat4;
-const components = @import("components");
 const ecs = @import("zig-ecs");
 const geometry = @import("geometry");
 const renderer = @import("renderer");

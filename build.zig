@@ -57,11 +57,11 @@ fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
     compile.addCSourceFile(.{ .file = b.path("vendor/cgltf_impl.c"), .flags = &.{"-std=c99"} });
 }
 
-/// Build an example executable. The example provides its own main.zig and components.zig.
-/// Engine source files import "components" which is remapped to the example's components.zig.
+/// Build an example executable. If components_file is null, uses core_components.zig.
 fn addExample(
     b: *std.Build,
     comptime name: []const u8,
+    comptime components_file: ?[]const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     entt: *std.Build.Dependency,
@@ -91,15 +91,18 @@ fn addExample(
         },
     });
 
-    const components_mod = b.createModule(.{
-        .root_source_file = b.path("examples/" ++ name ++ "/components.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_components", .module = core_components_mod },
-            .{ .name = "lua", .module = lua_mod },
-        },
-    });
+    const components_mod = if (components_file) |cf|
+        b.createModule(.{
+            .root_source_file = b.path(cf),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core_components", .module = core_components_mod },
+                .{ .name = "lua", .module = lua_mod },
+            },
+        })
+    else
+        core_components_mod;
 
     const geometry_mod = b.createModule(.{
         .root_source_file = b.path("src/geometry.zig"),
@@ -120,7 +123,6 @@ fn addExample(
         .link_libc = true,
         .imports = &.{
             .{ .name = "zig-ecs", .module = ecs_mod },
-            .{ .name = "components", .module = components_mod },
             .{ .name = "lua", .module = lua_mod },
             .{ .name = "geometry", .module = geometry_mod },
             .{ .name = "math3d", .module = math3d_mod },
@@ -136,7 +138,7 @@ fn addExample(
         .link_libc = true,
         .imports = &.{
             .{ .name = "zig-ecs", .module = ecs_mod },
-            .{ .name = "components", .module = components_mod },
+            .{ .name = "core_components", .module = core_components_mod },
             .{ .name = "engine", .module = engine_mod },
             .{ .name = "geometry", .module = geometry_mod },
             .{ .name = "math3d", .module = math3d_mod },
@@ -150,6 +152,7 @@ fn addExample(
         .link_libc = true,
         .imports = &.{
             .{ .name = "zig-ecs", .module = ecs_mod },
+            .{ .name = "core_components", .module = core_components_mod },
             .{ .name = "components", .module = components_mod },
             .{ .name = "engine", .module = engine_mod },
             .{ .name = "lua", .module = lua_mod },
@@ -203,10 +206,14 @@ pub fn build(b: *std.Build) void {
     });
 
     // Examples
-    const example_names = [_][]const u8{ "pbr_test", "primitives" };
+    const Example = struct { name: []const u8, components: ?[]const u8 = null };
+    const examples = [_]Example{
+        .{ .name = "pbr_test" },
+        .{ .name = "primitives", .components = "examples/primitives/components.zig" },
+    };
 
-    inline for (example_names) |name| {
-        const exe = addExample(b, name, target, optimize, entt);
+    inline for (examples) |ex| {
+        const exe = addExample(b, ex.name, ex.components, target, optimize, entt);
         b.installArtifact(exe);
 
         const run_cmd = b.addRunArtifact(exe);
@@ -216,12 +223,12 @@ pub fn build(b: *std.Build) void {
             run_cmd.addArgs(args);
         }
 
-        const run_step = b.step("run-" ++ name, "Run the " ++ name ++ " example");
+        const run_step = b.step("run-" ++ ex.name, "Run the " ++ ex.name ++ " example");
         run_step.dependOn(&run_cmd.step);
     }
 
     // Default run step runs pbr_test
-    const default_exe = addExample(b, "pbr_test", target, optimize, entt);
+    const default_exe = addExample(b, "pbr_test", null, target, optimize, entt);
     const default_run = b.addRunArtifact(default_exe);
     default_run.setCwd(b.path("."));
     default_run.step.dependOn(b.getInstallStep());

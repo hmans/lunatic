@@ -55,3 +55,9 @@ pub const LookAt = struct {
 
 /// Core component tuple — engine modules reference these directly.
 pub const all = .{ Position, Rotation, MeshHandle, MaterialHandle, Camera, DirectionalLight, LookAt };
+
+/// Concatenate core components with example-specific ones.
+/// Usage: `pub const all = core.withExtra(.{ Spin, Player });`
+pub fn withExtra(extra: anytype) @TypeOf(all ++ extra) {
+    return all ++ extra;
+}
