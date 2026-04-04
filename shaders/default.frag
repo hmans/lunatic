@@ -2,6 +2,7 @@
 
 layout(location = 0) in vec3 world_pos;
 layout(location = 1) in vec3 world_normal;
+layout(location = 2) in vec2 frag_uv;
 
 layout(set = 3, binding = 0) uniform SceneUniforms {
     vec4 light_dir;

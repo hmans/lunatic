@@ -10,6 +10,8 @@ pub const Vertex = extern struct {
     nx: f32,
     ny: f32,
     nz: f32,
+    u: f32 = 0,
+    v: f32 = 0,
 };
 
 pub const Mesh = struct {
@@ -65,10 +67,10 @@ pub fn cube(allocator: std.mem.Allocator) !Mesh {
         const cz = nz * s;
 
         const vbase = fi * 4;
-        verts[vbase + 0] = .{ .px = cx - s * tx - s * bx, .py = cy - s * ty - s * by, .pz = cz - s * tz - s * bz, .nx = nx, .ny = ny, .nz = nz };
-        verts[vbase + 1] = .{ .px = cx + s * tx - s * bx, .py = cy + s * ty - s * by, .pz = cz + s * tz - s * bz, .nx = nx, .ny = ny, .nz = nz };
-        verts[vbase + 2] = .{ .px = cx + s * tx + s * bx, .py = cy + s * ty + s * by, .pz = cz + s * tz + s * bz, .nx = nx, .ny = ny, .nz = nz };
-        verts[vbase + 3] = .{ .px = cx - s * tx + s * bx, .py = cy - s * ty + s * by, .pz = cz - s * tz + s * bz, .nx = nx, .ny = ny, .nz = nz };
+        verts[vbase + 0] = .{ .px = cx - s * tx - s * bx, .py = cy - s * ty - s * by, .pz = cz - s * tz - s * bz, .nx = nx, .ny = ny, .nz = nz, .u = 0, .v = 1 };
+        verts[vbase + 1] = .{ .px = cx + s * tx - s * bx, .py = cy + s * ty - s * by, .pz = cz + s * tz - s * bz, .nx = nx, .ny = ny, .nz = nz, .u = 1, .v = 1 };
+        verts[vbase + 2] = .{ .px = cx + s * tx + s * bx, .py = cy + s * ty + s * by, .pz = cz + s * tz + s * bz, .nx = nx, .ny = ny, .nz = nz, .u = 1, .v = 0 };
+        verts[vbase + 3] = .{ .px = cx - s * tx + s * bx, .py = cy - s * ty + s * by, .pz = cz - s * tz + s * bz, .nx = nx, .ny = ny, .nz = nz, .u = 0, .v = 0 };
 
         // CCW winding (matching the old verified order: 1,0,3 + 1,3,2)
         const ibase = fi * 6;
@@ -125,6 +127,8 @@ pub fn sphere(allocator: std.mem.Allocator, segments: u32, rings: u32) !Mesh {
                 .nx = nx,
                 .ny = ny,
                 .nz = nz,
+                .u = @as(f32, @floatFromInt(si)) / segs_f,
+                .v = @as(f32, @floatFromInt(ri)) / rows_f,
             };
             vi += 1;
         }

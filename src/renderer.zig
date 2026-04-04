@@ -156,6 +156,7 @@ pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
     const vertex_attrs = [_]c.SDL_GPUVertexAttribute{
         .{ .location = 0, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = @offsetOf(Vertex, "px") },
         .{ .location = 1, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = @offsetOf(Vertex, "nx") },
+        .{ .location = 2, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = @offsetOf(Vertex, "u") },
     };
 
     const vertex_buf_desc = [_]c.SDL_GPUVertexBufferDescription{
