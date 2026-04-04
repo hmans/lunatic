@@ -14,6 +14,10 @@ A 3D game engine: Zig core + SDL3 GPU + LuaJIT scripting + zig-ecs.
 - Engine code is split by responsibility: `engine.zig` (lifecycle, registries), `renderer.zig` (GPU pipeline, render system), `lua_api.zig` (Lua bindings), `component_ops.zig` (comptime vtable generator). Both renderer and lua_api import the Engine type from engine.zig.
 - Adding a new asset handle type (e.g. `TextureHandle` with string name resolution): define struct with `.resolve = .texture` in its `.lua` metadata, add to the `.all` tuple, add a `.texture` variant to `HandleKind` in `engine.zig`, and add a case to `Engine.resolveHandle()`'s switch.
 
+## Scale Target
+
+The engine must handle tens of thousands to hundreds of thousands of entities efficiently, even if current demos are small. Design all per-entity paths (queries, iteration, rendering) with this scale in mind. Avoid per-entity allocations, per-entity `pcall`, or O(n²) patterns in hot loops.
+
 ## Conventions
 
 - Use Conventional Commit formatting for commit messages

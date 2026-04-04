@@ -352,9 +352,9 @@ fn luaEach(L: ?*lc.lua_State) callconv(.c) c_int {
             lc.lua_pushvalue(L, nargs); // push callback
             const entity_int: u32 = @bitCast(entity);
             lc.lua_pushinteger(L, @intCast(entity_int));
-            if (lc.lua_pcall(L, 1, 0, 0) != 0) {
-                return lc.lua_error(L);
-            }
+            // Use lua_call (not pcall) — errors propagate to the system-level
+            // pcall in runLuaSystems, avoiding per-entity error handler overhead.
+            lc.lua_call(L, 1, 0);
         }
     }
 

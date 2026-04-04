@@ -37,9 +37,9 @@ end
 
 -- Spin system
 lunatic.system("spin", function(dt)
-  for _, e in ipairs(lunatic.query("rotation", "spin")) do
+  lunatic.each("rotation", "spin", function(e)
     local rot = lunatic.ref(e, "rotation")
     local spin = lunatic.ref(e, "spin")
     rot.y = rot.y + spin.speed * dt
-  end
+  end)
 end)
