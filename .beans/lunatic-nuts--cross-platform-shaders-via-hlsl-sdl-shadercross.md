@@ -1,5 +1,5 @@
 ---
-# gammo-nuts
+# lunatic-nuts
 title: Cross-platform shaders via HLSL + SDL_shadercross
 status: todo
 type: task

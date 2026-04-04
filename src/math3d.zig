@@ -116,6 +116,18 @@ pub const Mat4 = struct {
         return result;
     }
 
+    pub fn rotateZ(angle_deg: f32) Mat4 {
+        const a = angle_deg * (math.pi / 180.0);
+        const cos_a = @cos(a);
+        const sin_a = @sin(a);
+        var result = Mat4.identity();
+        result.m[0][0] = cos_a;
+        result.m[0][1] = sin_a;
+        result.m[1][0] = -sin_a;
+        result.m[1][1] = cos_a;
+        return result;
+    }
+
     pub fn translate(tx: f32, ty: f32, tz: f32) Mat4 {
         var result = Mat4.identity();
         result.m[3][0] = tx;
@@ -138,3 +150,133 @@ pub const Mat4 = struct {
         return result;
     }
 };
+
+// ============================================================
+// Tests
+// ============================================================
+
+const testing = std.testing;
+const eps = 1e-6;
+
+fn expectMat4Approx(actual: Mat4, expected: Mat4) !void {
+    for (0..4) |col| {
+        for (0..4) |row| {
+            try testing.expectApproxEqAbs(expected.m[col][row], actual.m[col][row], eps);
+        }
+    }
+}
+
+// ---- Vec3 ----
+
+test "Vec3.sub" {
+    const a = Vec3.new(3, 5, 7);
+    const b = Vec3.new(1, 2, 3);
+    const r = Vec3.sub(a, b);
+    try testing.expectApproxEqAbs(@as(f32, 2), r.x, eps);
+    try testing.expectApproxEqAbs(@as(f32, 3), r.y, eps);
+    try testing.expectApproxEqAbs(@as(f32, 4), r.z, eps);
+}
+
+test "Vec3.dot" {
+    const a = Vec3.new(1, 0, 0);
+    const b = Vec3.new(0, 1, 0);
+    try testing.expectApproxEqAbs(@as(f32, 0), Vec3.dot(a, b), eps);
+    try testing.expectApproxEqAbs(@as(f32, 1), Vec3.dot(a, a), eps);
+}
+
+test "Vec3.cross produces orthogonal vector" {
+    const x = Vec3.new(1, 0, 0);
+    const y = Vec3.new(0, 1, 0);
+    const z = Vec3.cross(x, y);
+    try testing.expectApproxEqAbs(@as(f32, 0), z.x, eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), z.y, eps);
+    try testing.expectApproxEqAbs(@as(f32, 1), z.z, eps);
+}
+
+test "Vec3.normalize unit length" {
+    const v = Vec3.new(3, 4, 0);
+    const n = Vec3.normalize(v);
+    const len = @sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+    try testing.expectApproxEqAbs(@as(f32, 1), len, eps);
+    try testing.expectApproxEqAbs(@as(f32, 0.6), n.x, eps);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), n.y, eps);
+}
+
+test "Vec3.normalize zero vector returns zero" {
+    const v = Vec3.new(0, 0, 0);
+    const n = Vec3.normalize(v);
+    try testing.expectApproxEqAbs(@as(f32, 0), n.x, eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), n.y, eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), n.z, eps);
+}
+
+test "Vec3.negate" {
+    const v = Vec3.new(1, -2, 3);
+    const n = Vec3.negate(v);
+    try testing.expectApproxEqAbs(@as(f32, -1), n.x, eps);
+    try testing.expectApproxEqAbs(@as(f32, 2), n.y, eps);
+    try testing.expectApproxEqAbs(@as(f32, -3), n.z, eps);
+}
+
+// ---- Mat4 ----
+
+test "Mat4.identity * identity = identity" {
+    const i = Mat4.identity();
+    try expectMat4Approx(Mat4.mul(i, i), i);
+}
+
+test "Mat4.translate moves a point" {
+    const t = Mat4.translate(1, 2, 3);
+    // column-major: t * [0,0,0,1] should give [1,2,3,1]
+    // Column 3 holds the translation
+    try testing.expectApproxEqAbs(@as(f32, 1), t.m[3][0], eps);
+    try testing.expectApproxEqAbs(@as(f32, 2), t.m[3][1], eps);
+    try testing.expectApproxEqAbs(@as(f32, 3), t.m[3][2], eps);
+}
+
+test "Mat4.rotateY 90 degrees" {
+    const r = Mat4.rotateY(90);
+    // m[col][row], column 0 = rotated X axis = [cos, 0, -sin, 0]
+    // At 90°: cos=0, sin=1 → column 0 = [0, 0, -1, 0]
+    try testing.expectApproxEqAbs(@as(f32, 0), r.m[0][0], eps);
+    try testing.expectApproxEqAbs(@as(f32, 1), r.m[0][2], eps); // sin(90)
+    try testing.expectApproxEqAbs(@as(f32, -1), r.m[2][0], eps); // -sin(90)
+}
+
+test "Mat4.rotateX 90 degrees" {
+    const r = Mat4.rotateX(90);
+    // Column 1 = rotated Y axis: [0, cos, -sin, 0]
+    // At 90°: cos=0, sin=1 → [0, 0, -1, 0]
+    try testing.expectApproxEqAbs(@as(f32, 0), r.m[1][1], eps);
+    try testing.expectApproxEqAbs(@as(f32, -1), r.m[1][2], eps); // -sin(90)
+    try testing.expectApproxEqAbs(@as(f32, 1), r.m[2][1], eps); // sin(90)
+}
+
+test "Mat4.rotateZ 90 degrees maps +X to +Y" {
+    const r = Mat4.rotateZ(90);
+    // Rotating (1,0,0) by 90° around Z should give (0,1,0)
+    // Result = r * [1,0,0,0] = column 0
+    try testing.expectApproxEqAbs(@as(f32, 0), r.m[0][0], eps); // cos(90)
+    try testing.expectApproxEqAbs(@as(f32, 1), r.m[0][1], eps); // sin(90)
+}
+
+test "Mat4.rotateZ 0 degrees is identity" {
+    try expectMat4Approx(Mat4.rotateZ(0), Mat4.identity());
+}
+
+test "Mat4.perspective produces correct clip planes" {
+    const p = Mat4.perspective(90, 1.0, 0.1, 100.0);
+    // For 90° FOV with aspect 1: f = 1/tan(45°) = 1
+    try testing.expectApproxEqAbs(@as(f32, 1), p.m[0][0], eps); // f/aspect
+    try testing.expectApproxEqAbs(@as(f32, 1), p.m[1][1], eps); // f
+    try testing.expectApproxEqAbs(@as(f32, -1), p.m[2][3], eps); // perspective divide
+}
+
+test "Mat4.mul is associative" {
+    const a = Mat4.rotateX(30);
+    const b = Mat4.rotateY(45);
+    const c = Mat4.translate(1, 2, 3);
+    const ab_c = Mat4.mul(Mat4.mul(a, b), c);
+    const a_bc = Mat4.mul(a, Mat4.mul(b, c));
+    try expectMat4Approx(ab_c, a_bc);
+}

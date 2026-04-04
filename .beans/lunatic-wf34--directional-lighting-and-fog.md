@@ -1,5 +1,5 @@
 ---
-# gammo-wf34
+# lunatic-wf34
 title: Directional lighting and fog
 status: completed
 type: feature

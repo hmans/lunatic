@@ -1,5 +1,5 @@
 ---
-# gammo-ved0
+# lunatic-ved0
 title: Bootstrap Zig + SDL3 + LuaJIT game engine
 status: completed
 type: task

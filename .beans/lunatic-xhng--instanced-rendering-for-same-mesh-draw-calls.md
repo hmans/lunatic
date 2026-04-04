@@ -1,5 +1,5 @@
 ---
-# gammo-xhng
+# lunatic-xhng
 title: Instanced rendering for same-mesh draw calls
 status: todo
 type: feature

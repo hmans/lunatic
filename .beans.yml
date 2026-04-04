@@ -2,12 +2,12 @@
 # See: https://github.com/hmans/beans
 project:
     # Human-readable project name (displayed in the UI)
-    name: gammo
+    name: lunatic
 beans:
     # Directory where bean files are stored
     path: .beans
     # Prefix for bean IDs (e.g., "myproject-abc1")
-    prefix: gammo-
+    prefix: lunatic-
     # Length of the random ID suffix
     id_length: 4
     # Default status for new beans

@@ -1,72 +1,50 @@
 -- game/main.lua
--- Multiple cubes with lighting and fog, driven by ECS.
+-- Systems registered via lunatic.system(). Queries via lunatic.query().
+-- Component refs via lunatic.ref() for natural field access.
 
-local ecs = require("ecs")
-local world = ecs.world()
+-- Setup
+lunatic.set_clear_color(0.55, 0.7, 0.85)
+lunatic.set_camera(0, 8, 12, 0, 0, 0)
+lunatic.set_light(0.3, 0.8, 0.5)
+lunatic.set_ambient(0.15, 0.15, 0.25)
+lunatic.set_fog(8, 25, 0.55, 0.7, 0.85)
 
-function init()
-  -- Sky/clear color
-  gammo.set_clear_color(0.55, 0.7, 0.85)
-
-  -- Camera
-  gammo.set_camera(0, 8, 12, 0, 0, 0)
-
-  -- Lighting
-  gammo.set_light(0.3, 0.8, 0.5)
-  gammo.set_ambient(0.15, 0.15, 0.25)
-
-  -- Fog — fades to sky color
-  gammo.set_fog(8, 25, 0.55, 0.7, 0.85)
-
-  -- Spawn a bigger grid of cubes
-  for x = -4, 4 do
-    for z = -4, 4 do
-      world:spawn({
-        position = { x = x * 2, y = 0, z = z * 2 },
-        rotation = { x = 0, y = math.random() * 360, z = 0 },
-        spin = { speed = 30 + math.random() * 60 },
-        mesh = "cube",
-      })
-    end
+-- Spawn a grid of cubes
+for x = -4, 4 do
+  for z = -4, 4 do
+    local e = lunatic.spawn()
+    lunatic.add(e, "position", x * 2, 0, z * 2)
+    lunatic.add(e, "rotation", 0, math.random() * 360, 0)
+    lunatic.add(e, "spin", 30 + math.random() * 60)
+    lunatic.add(e, "mesh", "cube")
   end
-
-  -- Player cube
-  player = world:spawn({
-    position = { x = 0, y = 0.5, z = 0 },
-    rotation = { x = 0, y = 0, z = 0 },
-    spin = { speed = 120 },
-    mesh = "cube",
-    player = true,
-  })
-
-  print("gammo is alive! Cubes with lighting and fog.")
 end
 
--- Systems
+-- Player cube
+local e = lunatic.spawn()
+lunatic.add(e, "position", 0, 0.5, 0)
+lunatic.add(e, "rotation", 0, 0, 0)
+lunatic.add(e, "spin", 120)
+lunatic.add(e, "mesh", "cube")
+lunatic.add(e, "player")
 
-local function spin_system(dt)
-  for e, rot, spin in world:query("rotation", "spin") do
+-- Spin system
+lunatic.system("spin", function(dt)
+  for _, e in ipairs(lunatic.query("rotation", "spin")) do
+    local rot = lunatic.ref(e, "rotation")
+    local spin = lunatic.ref(e, "spin")
     rot.y = rot.y + spin.speed * dt
   end
-end
+end)
 
-local function player_system(dt)
+-- Player movement system
+lunatic.system("player_movement", function(dt)
   local speed = 5
-  for e, pos in world:query("position", "player") do
-    if gammo.key_down("Left")  then pos.x = pos.x - speed * dt end
-    if gammo.key_down("Right") then pos.x = pos.x + speed * dt end
-    if gammo.key_down("Up")    then pos.z = pos.z - speed * dt end
-    if gammo.key_down("Down")  then pos.z = pos.z + speed * dt end
+  for _, e in ipairs(lunatic.query("player", "position")) do
+    local pos = lunatic.ref(e, "position")
+    if lunatic.key_down("Left")  then pos.x = pos.x - speed * dt end
+    if lunatic.key_down("Right") then pos.x = pos.x + speed * dt end
+    if lunatic.key_down("Up")    then pos.z = pos.z - speed * dt end
+    if lunatic.key_down("Down")  then pos.z = pos.z + speed * dt end
   end
-end
-
-function update(dt)
-  spin_system(dt)
-  player_system(dt)
-end
-
-function draw()
-  for e, pos, rot, mesh in world:query("position", "rotation", "mesh") do
-    gammo.draw_mesh(mesh, pos.x, pos.y, pos.z, rot.x, rot.y, rot.z)
-  end
-end
+end)

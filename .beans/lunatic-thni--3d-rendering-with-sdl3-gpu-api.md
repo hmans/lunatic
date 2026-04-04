@@ -1,5 +1,5 @@
 ---
-# gammo-thni
+# lunatic-thni
 title: 3D rendering with SDL3 GPU API
 status: completed
 type: feature

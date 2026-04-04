@@ -1,5 +1,5 @@
 ---
-# gammo-tgu7
+# lunatic-tgu7
 title: Render a rotating wireframe cube
 status: scrapped
 type: feature

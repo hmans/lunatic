@@ -1,5 +1,5 @@
 ---
-# gammo-l5gr
+# lunatic-l5gr
 title: Immediate-mode draw API + Lua ECS
 status: completed
 type: feature
