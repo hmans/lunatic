@@ -3,23 +3,20 @@
 
 const std = @import("std");
 const testing = std.testing;
-const engine = @import("main.zig");
+const Engine = @import("engine.zig").Engine;
 const lua = @import("lua.zig");
 const lc = lua.c;
 
-/// Set up a fresh engine + Lua state for each test.
-fn setup() *lc.lua_State {
-    engine.initRegistry();
-    engine.resetSystems();
-    const L = lc.luaL_newstate() orelse @panic("failed to create Lua state");
-    lc.luaL_openlibs(L);
-    engine.initLuaApi(L);
-    return L;
+/// Module-level engine instance — pointer-stable across setup/teardown.
+var test_engine: Engine = undefined;
+
+fn setup() !*lc.lua_State {
+    try test_engine.init(.{ .headless = true });
+    return test_engine.lua_state.?;
 }
 
-fn teardown(L: *lc.lua_State) void {
-    lc.lua_close(L);
-    engine.deinitRegistry();
+fn teardown() void {
+    test_engine.deinit();
 }
 
 /// Run a Lua snippet, fail the test if it errors.
@@ -32,23 +29,13 @@ fn run(L: *lc.lua_State, code: [*:0]const u8) !void {
     }
 }
 
-/// Run a Lua snippet, expect it to error. Returns the error message.
-fn runExpectError(L: *lc.lua_State, code: [*:0]const u8) ![]const u8 {
-    if (!lc.luaL_dostring(L, code)) {
-        return error.ExpectedError;
-    }
-    const err = std.mem.span(lc.lua_tolstring(L, -1, null));
-    // Don't pop — caller may want to inspect. We'll pop in teardown.
-    return err;
-}
-
 // ============================================================
 // Entity lifecycle
 // ============================================================
 
 test "spawn returns incrementing IDs" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local a = lunatic.spawn()
         \\local b = lunatic.spawn()
@@ -58,8 +45,8 @@ test "spawn returns incrementing IDs" {
 }
 
 test "destroy then access errors" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\lunatic.destroy(e)
@@ -70,8 +57,8 @@ test "destroy then access errors" {
 }
 
 test "destroy invalid entity errors" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local ok, err = pcall(lunatic.destroy, 999999)
         \\assert(not ok)
@@ -84,8 +71,8 @@ test "destroy invalid entity errors" {
 // ============================================================
 
 test "add and get position" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\lunatic.add(e, "position", 1.5, 2.5, 3.5)
@@ -97,8 +84,8 @@ test "add and get position" {
 }
 
 test "add tag component" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\lunatic.add(e, "player")
@@ -107,8 +94,8 @@ test "add tag component" {
 }
 
 test "get missing component returns nothing" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\local x = lunatic.get(e, "position")
@@ -117,8 +104,8 @@ test "get missing component returns nothing" {
 }
 
 test "remove component" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\lunatic.add(e, "position", 1, 2, 3)
@@ -129,8 +116,8 @@ test "remove component" {
 }
 
 test "add unknown component errors" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\local ok, err = pcall(lunatic.add, e, "nonexistent", 1, 2, 3)
@@ -140,9 +127,8 @@ test "add unknown component errors" {
 }
 
 test "add with missing args errors" {
-    const L = setup();
-    defer teardown(L);
-    // Position requires 3 args (x, y, z). With checknumber, missing arg should error.
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\local ok, err = pcall(lunatic.add, e, "position", 1, 2)
@@ -151,8 +137,8 @@ test "add with missing args errors" {
 }
 
 test "addOrReplace overwrites existing component" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\lunatic.add(e, "position", 1, 2, 3)
@@ -169,8 +155,8 @@ test "addOrReplace overwrites existing component" {
 // ============================================================
 
 test "ref read fields" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\lunatic.add(e, "position", 10, 20, 30)
@@ -182,8 +168,8 @@ test "ref read fields" {
 }
 
 test "ref write fields" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\lunatic.add(e, "position", 0, 0, 0)
@@ -195,8 +181,8 @@ test "ref write fields" {
 }
 
 test "ref on destroyed entity errors" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\lunatic.add(e, "position", 1, 2, 3)
@@ -209,8 +195,8 @@ test "ref on destroyed entity errors" {
 }
 
 test "ref write to destroyed entity errors" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\lunatic.add(e, "position", 1, 2, 3)
@@ -223,8 +209,8 @@ test "ref write to destroyed entity errors" {
 }
 
 test "ref on entity without component errors" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\local ok, err = pcall(lunatic.ref, e, "position")
@@ -234,8 +220,8 @@ test "ref on entity without component errors" {
 }
 
 test "ref invalid field errors" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\lunatic.add(e, "position", 1, 2, 3)
@@ -251,8 +237,8 @@ test "ref invalid field errors" {
 // ============================================================
 
 test "query returns matching entities" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local a = lunatic.spawn()
         \\lunatic.add(a, "position", 0, 0, 0)
@@ -269,8 +255,8 @@ test "query returns matching entities" {
 }
 
 test "query order independence" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
         \\lunatic.add(e, "position", 0, 0, 0)
@@ -284,8 +270,8 @@ test "query order independence" {
 }
 
 test "query empty result" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local results = lunatic.query("position")
         \\assert(#results == 0)
@@ -293,8 +279,8 @@ test "query empty result" {
 }
 
 test "query unknown component errors" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\local ok, err = pcall(lunatic.query, "nonexistent")
         \\assert(not ok)
@@ -307,8 +293,8 @@ test "query unknown component errors" {
 // ============================================================
 
 test "system receives dt" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\received_dt = nil
         \\lunatic.system("test", function(dt)
@@ -316,8 +302,7 @@ test "system receives dt" {
         \\end)
     );
 
-    // Tick with a known dt
-    engine.tickSystems(0.016);
+    test_engine.runLuaSystems(0.016);
 
     try run(L,
         \\assert(received_dt ~= nil, "system was not called")
@@ -326,8 +311,8 @@ test "system receives dt" {
 }
 
 test "failing system is disabled" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\call_count = 0
         \\lunatic.system("bad", function(dt)
@@ -336,10 +321,9 @@ test "failing system is disabled" {
         \\end)
     );
 
-    // Tick multiple times — system should only fire once
-    engine.tickSystems(0.016);
-    engine.tickSystems(0.016);
-    engine.tickSystems(0.016);
+    test_engine.runLuaSystems(0.016);
+    test_engine.runLuaSystems(0.016);
+    test_engine.runLuaSystems(0.016);
 
     try run(L,
         \\assert(call_count == 1, "expected 1 call, got " .. call_count)
@@ -347,15 +331,15 @@ test "failing system is disabled" {
 }
 
 test "multiple systems run in order" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\order = {}
         \\lunatic.system("first", function(dt) table.insert(order, "a") end)
         \\lunatic.system("second", function(dt) table.insert(order, "b") end)
     );
 
-    engine.tickSystems(0.016);
+    test_engine.runLuaSystems(0.016);
 
     try run(L,
         \\assert(#order == 2)
@@ -369,24 +353,24 @@ test "multiple systems run in order" {
 // ============================================================
 
 test "set_camera accepts 6 numbers" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\lunatic.set_camera(0, 5, 10, 0, 0, 0)
     );
 }
 
 test "set_clear_color accepts 3 numbers" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\lunatic.set_clear_color(0.1, 0.2, 0.3)
     );
 }
 
 test "set_fog enable and disable" {
-    const L = setup();
-    defer teardown(L);
+    const L = try setup();
+    defer teardown();
     try run(L,
         \\lunatic.set_fog(5, 20, 0.5, 0.5, 0.5)
         \\lunatic.set_fog(false)
