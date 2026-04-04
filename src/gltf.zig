@@ -1,9 +1,9 @@
 // gltf.zig — GLTF/GLB loader. Parses meshes, materials, and textures into Engine resources.
 
 const std = @import("std");
-const engine_mod = @import("engine.zig");
+const engine_mod = @import("engine");
 const Engine = engine_mod.Engine;
-const geometry = @import("geometry.zig");
+const geometry = @import("geometry");
 const Vertex = geometry.Vertex;
 
 const c = engine_mod.c;

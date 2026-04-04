@@ -1,11 +1,11 @@
 // renderer.zig — GPU rendering: pipeline setup, render system, draw sorting.
 
 const std = @import("std");
-const math3d = @import("math3d.zig");
-const components = @import("components.zig");
-const geometry = @import("geometry.zig");
+const math3d = @import("math3d");
+const components = @import("components");
+const geometry = @import("geometry");
 const ecs = @import("zig-ecs");
-const engine_mod = @import("engine.zig");
+const engine_mod = @import("engine");
 const Engine = engine_mod.Engine;
 const c = engine_mod.c;
 const Mat4 = math3d.Mat4;

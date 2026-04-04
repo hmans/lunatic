@@ -2,14 +2,14 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const components = @import("components.zig");
+const components = @import("components");
 const ecs = @import("zig-ecs");
-const engine_mod = @import("engine.zig");
+const engine_mod = @import("engine");
 const Engine = engine_mod.Engine;
 const c = engine_mod.c;
 const gltf_mod = engine_mod.gltf;
 
-const lua = @import("lua.zig");
+const lua = @import("lua");
 const lc = lua.c;
 
 const Position = components.Position;

@@ -2,16 +2,16 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const math3d = @import("math3d.zig");
+const math3d = @import("math3d");
 const Mat4 = math3d.Mat4;
-const components = @import("components.zig");
+const components = @import("components");
 const ecs = @import("zig-ecs");
-const geometry = @import("geometry.zig");
-const renderer = @import("renderer.zig");
-const lua_api = @import("lua_api.zig");
-pub const gltf = @import("gltf.zig");
+const geometry = @import("geometry");
+const renderer = @import("renderer");
+const lua_api = @import("lua_api");
+pub const gltf = @import("gltf");
 
-const lua = @import("lua.zig");
+const lua = @import("lua");
 const lc = lua.c;
 pub const c = @cImport({
     @cInclude("SDL3/SDL.h");
