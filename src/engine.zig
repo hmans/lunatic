@@ -12,6 +12,7 @@ pub const gltf = @import("gltf");
 
 const lua = @import("lua");
 const lc = lua.c;
+pub const HandleKind = enum { mesh, material };
 pub const c = @cImport({
     @cInclude("SDL3/SDL.h");
 });
@@ -173,11 +174,7 @@ pub const Engine = struct {
     // Draw sorting scratch buffer
     draw_list: [renderer.max_renderables]renderer.DrawEntry = undefined,
 
-    // Query cache
-    query_generation: u64 = 0,
-    query_cache: [lua_api.max_cached_queries]lua_api.QueryCacheEntry = .{lua_api.QueryCacheEntry{}} ** lua_api.max_cached_queries,
-
-    // Frame counter (main loop only — not used for cache invalidation)
+    // Frame counter
     current_frame: u64 = 0,
 
     // Lua
@@ -263,7 +260,6 @@ pub const Engine = struct {
             const dt: f32 = @floatCast(smooth_dt);
 
             self.current_frame += 1;
-            self.query_generation += 1;
 
             var event: c.SDL_Event = undefined;
             while (c.SDL_PollEvent(&event)) {
@@ -422,6 +418,26 @@ pub const Engine = struct {
     /// Look up a named material by string. Returns the handle or null.
     pub fn findMaterial(self: *Engine, name: [*:0]const u8) ?u32 {
         return self.assets.findMaterial(name);
+    }
+
+    /// Resolve a Lua argument to an asset handle ID. Accepts either a numeric ID
+    /// or a string name (e.g. "cube", "default") that gets looked up in the registry.
+    pub fn resolveHandle(self: *Engine, L: ?*lc.lua_State, idx: c_int, kind: HandleKind) u32 {
+        if (lc.lua_type(L, idx) == lc.LUA_TNUMBER) {
+            return @intCast(lc.lua_tointeger(L, idx));
+        }
+        const name = lc.luaL_checklstring(L, idx, null);
+        const id = switch (kind) {
+            .mesh => self.assets.findMesh(name),
+            .material => self.assets.findMaterial(name),
+        };
+        if (id) |found| return found;
+        const label = switch (kind) {
+            .mesh => "unknown mesh: %s",
+            .material => "unknown material: %s",
+        };
+        _ = lc.luaL_error(L, label, name);
+        unreachable;
     }
 
     fn createDummyTexture(self: *Engine, pixel: *const [4]u8) !*c.SDL_GPUTexture {

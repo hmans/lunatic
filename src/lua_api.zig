@@ -1,8 +1,10 @@
 // lua_api.zig — Lua C callbacks and API registration.
+//
+// All component dispatch goes through the ComponentOps vtable generated from
+// components.all. No inline-for loops over the component tuple remain here.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const core = @import("core_components");
 const components = @import("components");
 const ecs = @import("zig-ecs");
 const engine_mod = @import("engine");
@@ -12,157 +14,34 @@ const gltf_mod = engine_mod.gltf;
 
 const lua = @import("lua");
 const lc = lua.c;
-
-const Position = core.Position;
-const Rotation = core.Rotation;
-const MeshHandle = core.MeshHandle;
-const MaterialHandle = core.MaterialHandle;
-const LookAt = core.LookAt;
+const component_ops = @import("component_ops");
+const ComponentOps = component_ops.ComponentOps;
 
 // ============================================================
-// Query infrastructure
+// Component vtable — generated once at comptime
 // ============================================================
 
-pub const QueryCacheEntry = struct {
-    lua_ref: c_int = lc.LUA_NOREF,
-    frame: u64 = 0,
-    hash: u64 = 0,
-};
+const ops_table = component_ops.makeComponentOps(components.all);
 
-pub const max_cached_queries = 64;
+const OpsResult = struct { ops: ComponentOps, index: u8 };
+
+fn findOps(name: []const u8) ?OpsResult {
+    for (ops_table, 0..) |ops, i| {
+        if (std.mem.eql(u8, name, ops.name)) return .{ .ops = ops, .index = @intCast(i) };
+    }
+    return null;
+}
+
+// ============================================================
+// Component ref userdata
+// ============================================================
 
 const ComponentRef = extern struct {
     entity_id: u32,
-    type_tag: u8,
+    ops_index: u8,
 };
 
 const ref_metatable_name: [*:0]const u8 = "lunatic_component_ref";
-
-const HasFn = *const fn (*ecs.Registry, ecs.Entity) bool;
-const LenFn = *const fn (*ecs.Registry) usize;
-const DataFn = *const fn (*ecs.Registry) []ecs.Entity;
-
-const QueryEntry = struct {
-    name: []const u8,
-    hasFn: HasFn,
-    lenFn: LenFn,
-    dataFn: DataFn,
-};
-
-fn makeQueryEntries() [components.all.len]QueryEntry {
-    var entries: [components.all.len]QueryEntry = undefined;
-    inline for (components.all, 0..) |T, i| {
-        entries[i] = .{
-            .name = lua.nameOf(T),
-            .hasFn = &struct {
-                fn has(reg: *ecs.Registry, entity: ecs.Entity) bool {
-                    return reg.has(T, entity);
-                }
-            }.has,
-            .lenFn = &struct {
-                fn len(reg: *ecs.Registry) usize {
-                    return reg.len(T);
-                }
-            }.len,
-            .dataFn = &struct {
-                fn data(reg: *ecs.Registry) []ecs.Entity {
-                    return reg.data(T);
-                }
-            }.data,
-        };
-    }
-    return entries;
-}
-
-const query_entries = makeQueryEntries();
-
-fn findQueryEntry(name: []const u8) ?QueryEntry {
-    for (query_entries) |entry| {
-        if (std.mem.eql(u8, name, entry.name)) return entry;
-    }
-    return null;
-}
-
-fn queryHash(entries: []const QueryEntry, count: usize) u64 {
-    var h: u64 = 0xcbf29ce484222325;
-    for (0..count) |i| {
-        for (entries[i].name) |byte| {
-            h ^= byte;
-            h *%= 0x100000001b3;
-        }
-        h ^= 0xff;
-        h *%= 0x100000001b3;
-    }
-    return h;
-}
-
-// ============================================================
-// Query cache helpers (operate on Engine fields)
-// ============================================================
-
-fn findCachedQuery(self: *Engine, hash: u64) ?usize {
-    for (0..max_cached_queries) |i| {
-        if (self.query_cache[i].hash == hash and self.query_cache[i].frame == self.query_generation) {
-            return i;
-        }
-    }
-    return null;
-}
-
-fn findCacheSlot(self: *Engine, hash: u64) usize {
-    for (0..max_cached_queries) |i| {
-        if (self.query_cache[i].hash == hash) return i;
-    }
-    var oldest_idx: usize = 0;
-    var oldest_frame: u64 = std.math.maxInt(u64);
-    for (0..max_cached_queries) |i| {
-        if (self.query_cache[i].lua_ref == lc.LUA_NOREF) return i;
-        if (self.query_cache[i].frame < oldest_frame) {
-            oldest_frame = self.query_cache[i].frame;
-            oldest_idx = i;
-        }
-    }
-    if (self.query_cache[oldest_idx].lua_ref != lc.LUA_NOREF) {
-        if (self.lua_state) |L| {
-            lc.luaL_unref(L, lc.LUA_REGISTRYINDEX, self.query_cache[oldest_idx].lua_ref);
-        }
-        self.query_cache[oldest_idx].lua_ref = lc.LUA_NOREF;
-    }
-    return oldest_idx;
-}
-
-fn buildQueryTable(self: *Engine, L: ?*lc.lua_State, entries: []const QueryEntry, count: usize) void {
-    var smallest_idx: usize = 0;
-    var smallest_len: usize = entries[0].lenFn(&self.registry);
-    for (1..count) |i| {
-        const l = entries[i].lenFn(&self.registry);
-        if (l < smallest_len) {
-            smallest_len = l;
-            smallest_idx = i;
-        }
-    }
-
-    const entity_list = entries[smallest_idx].dataFn(&self.registry);
-    lc.lua_createtable(L, @intCast(smallest_len), 0);
-    var table_idx: c_int = 1;
-
-    for (entity_list) |entity| {
-        var match = true;
-        for (0..count) |i| {
-            if (i == smallest_idx) continue;
-            if (!entries[i].hasFn(&self.registry, entity)) {
-                match = false;
-                break;
-            }
-        }
-        if (match) {
-            const entity_int: u32 = @bitCast(entity);
-            lc.lua_pushinteger(L, @intCast(entity_int));
-            lc.lua_rawseti(L, -2, table_idx);
-            table_idx += 1;
-        }
-    }
-}
 
 // ============================================================
 // Lua API registration
@@ -188,6 +67,7 @@ pub fn registerLuaApi(self: *Engine) void {
         .{ "get", &luaGet },
         .{ "remove", &luaRemove },
         .{ "query", &luaQuery },
+        .{ "each", &luaEach },
         .{ "ref", &luaRef },
         .{ "create_material", &luaCreateMaterial },
         .{ "create_cube_mesh", &luaCreateCubeMesh },
@@ -244,7 +124,7 @@ pub fn publishHandlesToLua(self: *Engine) void {
 }
 
 // ============================================================
-// Lua C callbacks
+// Lua C callbacks — helpers
 // ============================================================
 
 fn getEngine(L: ?*lc.lua_State) *Engine {
@@ -265,26 +145,6 @@ fn entityFromLua(self: *Engine, L: ?*lc.lua_State, idx: c_int) ecs.Entity {
 
 fn componentName(L: ?*lc.lua_State, idx: c_int) []const u8 {
     return std.mem.span(lc.luaL_checklstring(L, idx, null));
-}
-
-const HandleKind = enum { mesh, material };
-
-fn resolveHandle(self: *Engine, L: ?*lc.lua_State, idx: c_int, kind: HandleKind) u32 {
-    if (lc.lua_type(L, idx) == lc.LUA_TNUMBER) {
-        return @intCast(lc.lua_tointeger(L, idx));
-    }
-    const name = lc.luaL_checklstring(L, idx, null);
-    const id = switch (kind) {
-        .mesh => self.findMesh(name),
-        .material => self.findMaterial(name),
-    };
-    if (id) |found| return found;
-    const label = switch (kind) {
-        .mesh => "unknown mesh: %s",
-        .material => "unknown material: %s",
-    };
-    _ = lc.luaL_error(L, label, name);
-    unreachable;
 }
 
 // ============================================================
@@ -318,7 +178,257 @@ fn checkFloat(L: ?*lc.lua_State, idx: c_int) f32 {
 }
 
 // ============================================================
-// Lua C callbacks
+// ECS callbacks — vtable-dispatched
+// ============================================================
+
+fn luaSpawn(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const entity = self.registry.create();
+    const entity_int: u32 = @bitCast(entity);
+    lc.lua_pushinteger(L, @intCast(entity_int));
+    return 1;
+}
+
+fn luaDestroy(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const entity = entityFromLua(self, L, 1);
+    self.registry.destroy(entity);
+    return 0;
+}
+
+fn luaAdd(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const entity = entityFromLua(self, L, 1);
+    const name = componentName(L, 2);
+    if (findOps(name)) |found| {
+        found.ops.addFn(self, entity, L, 3);
+        return 0;
+    }
+    _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, 2, null));
+    return 0;
+}
+
+fn luaGet(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const entity = entityFromLua(self, L, 1);
+    const name = componentName(L, 2);
+    if (findOps(name)) |found| {
+        return found.ops.getFn(self, entity, L);
+    }
+    _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, 2, null));
+    return 0;
+}
+
+fn luaRemove(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const entity = entityFromLua(self, L, 1);
+    const name = componentName(L, 2);
+    if (findOps(name)) |found| {
+        found.ops.removeFn(&self.registry, entity);
+        return 0;
+    }
+    _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, 2, null));
+    return 0;
+}
+
+// ============================================================
+// Query — cacheless table builder
+// ============================================================
+
+fn luaQuery(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const nargs = lc.lua_gettop(L);
+    if (nargs == 0) {
+        _ = lc.luaL_error(L, "query requires at least one component name");
+        return 0;
+    }
+
+    var ops: [16]ComponentOps = undefined;
+    const count: usize = @intCast(nargs);
+    if (count > 16) {
+        _ = lc.luaL_error(L, "query supports at most 16 components");
+        return 0;
+    }
+
+    for (0..count) |i| {
+        const name = std.mem.span(lc.luaL_checklstring(L, @intCast(i + 1), null));
+        if (findOps(name)) |found| {
+            ops[i] = found.ops;
+        } else {
+            _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, @intCast(i + 1), null));
+            return 0;
+        }
+    }
+
+    // Find smallest component set to iterate
+    var smallest_idx: usize = 0;
+    var smallest_len: usize = ops[0].lenFn(&self.registry);
+    for (1..count) |i| {
+        const l = ops[i].lenFn(&self.registry);
+        if (l < smallest_len) {
+            smallest_len = l;
+            smallest_idx = i;
+        }
+    }
+
+    const entity_list = ops[smallest_idx].dataFn(&self.registry);
+    lc.lua_createtable(L, @intCast(smallest_len), 0);
+    var table_idx: c_int = 1;
+
+    for (entity_list) |entity| {
+        var match = true;
+        for (0..count) |i| {
+            if (i == smallest_idx) continue;
+            if (!ops[i].hasFn(&self.registry, entity)) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            const entity_int: u32 = @bitCast(entity);
+            lc.lua_pushinteger(L, @intCast(entity_int));
+            lc.lua_rawseti(L, -2, table_idx);
+            table_idx += 1;
+        }
+    }
+
+    return 1;
+}
+
+// ============================================================
+// Each — zero-allocation callback iterator
+// ============================================================
+
+fn luaEach(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const nargs = lc.lua_gettop(L);
+    if (nargs < 2) {
+        _ = lc.luaL_error(L, "each requires at least one component name and a callback");
+        return 0;
+    }
+
+    // Last arg is callback
+    lc.luaL_checktype(L, nargs, lc.LUA_TFUNCTION);
+    const comp_count: usize = @intCast(nargs - 1);
+    if (comp_count > 16) {
+        _ = lc.luaL_error(L, "each supports at most 16 components");
+        return 0;
+    }
+
+    var ops: [16]ComponentOps = undefined;
+    for (0..comp_count) |i| {
+        const name = std.mem.span(lc.luaL_checklstring(L, @intCast(i + 1), null));
+        if (findOps(name)) |found| {
+            ops[i] = found.ops;
+        } else {
+            _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, @intCast(i + 1), null));
+            return 0;
+        }
+    }
+
+    // Find smallest component set
+    var smallest_idx: usize = 0;
+    var smallest_len: usize = ops[0].lenFn(&self.registry);
+    for (1..comp_count) |i| {
+        const l = ops[i].lenFn(&self.registry);
+        if (l < smallest_len) {
+            smallest_len = l;
+            smallest_idx = i;
+        }
+    }
+
+    // Iterate and call callback per matching entity
+    const entity_list = ops[smallest_idx].dataFn(&self.registry);
+    for (entity_list) |entity| {
+        var match = true;
+        for (0..comp_count) |i| {
+            if (i == smallest_idx) continue;
+            if (!ops[i].hasFn(&self.registry, entity)) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            lc.lua_pushvalue(L, nargs); // push callback
+            const entity_int: u32 = @bitCast(entity);
+            lc.lua_pushinteger(L, @intCast(entity_int));
+            if (lc.lua_pcall(L, 1, 0, 0) != 0) {
+                return lc.lua_error(L);
+            }
+        }
+    }
+
+    return 0;
+}
+
+// ============================================================
+// Component refs — vtable-dispatched field access
+// ============================================================
+
+fn luaRef(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const entity = entityFromLua(self, L, 1);
+    const entity_id: u32 = @bitCast(entity);
+    const name = componentName(L, 2);
+
+    if (findOps(name)) |found| {
+        if (!found.ops.hasFn(&self.registry, entity)) {
+            _ = lc.luaL_error(L, "entity %d has no component '%s'", @as(c_int, @intCast(entity_id)), lc.luaL_checklstring(L, 2, null));
+            return 0;
+        }
+        const ptr: *ComponentRef = @ptrCast(@alignCast(lc.lua_newuserdata(L, @sizeOf(ComponentRef))));
+        ptr.* = .{ .entity_id = entity_id, .ops_index = found.index };
+        lc.luaL_getmetatable(L, ref_metatable_name);
+        _ = lc.lua_setmetatable(L, -2);
+        return 1;
+    }
+    _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, 2, null));
+    return 0;
+}
+
+fn refIndex(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const ptr: *const ComponentRef = @ptrCast(@alignCast(lc.lua_touserdata(L, 1) orelse return 0));
+    const field_name = std.mem.span(lc.luaL_checklstring(L, 2, null));
+    const entity: ecs.Entity = @bitCast(ptr.entity_id);
+
+    if (!self.registry.valid(entity)) {
+        _ = lc.luaL_error(L, "stale ref: entity %d has been destroyed", @as(c_int, @intCast(ptr.entity_id)));
+        return 0;
+    }
+
+    const ops = ops_table[ptr.ops_index];
+    if (ops.refReadFn) |readFn| {
+        const result = readFn(self, entity, field_name, L);
+        if (result > 0) return result;
+        _ = lc.luaL_error(L, "no field '%s' on component", lc.luaL_checklstring(L, 2, null));
+        return 0;
+    }
+    // Tag component — return boolean presence
+    lc.lua_pushboolean(L, if (ops.hasFn(&self.registry, entity)) 1 else 0);
+    return 1;
+}
+
+fn refNewIndex(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const ptr: *const ComponentRef = @ptrCast(@alignCast(lc.lua_touserdata(L, 1) orelse return 0));
+    const field_name = std.mem.span(lc.luaL_checklstring(L, 2, null));
+    const entity: ecs.Entity = @bitCast(ptr.entity_id);
+
+    if (!self.registry.valid(entity)) {
+        _ = lc.luaL_error(L, "stale ref: entity %d has been destroyed", @as(c_int, @intCast(ptr.entity_id)));
+        return 0;
+    }
+
+    const ops = ops_table[ptr.ops_index];
+    if (ops.refWriteFn) |writeFn| {
+        writeFn(self, entity, field_name, L);
+    }
+    return 0;
+}
+
+// ============================================================
+// Input/scene callbacks (unchanged)
 // ============================================================
 
 fn luaCameraAxes(L: ?*lc.lua_State) callconv(.c) c_int {
@@ -380,6 +490,10 @@ fn luaSetAmbient(L: ?*lc.lua_State) callconv(.c) c_int {
     self.ambient_color = rgb ++ .{0.0};
     return 0;
 }
+
+// ============================================================
+// Asset creation callbacks (unchanged)
+// ============================================================
 
 fn luaCreateCubeMesh(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
@@ -465,240 +579,6 @@ fn luaCreateMaterial(L: ?*lc.lua_State) callconv(.c) c_int {
     };
     lc.lua_pushinteger(L, @intCast(id));
     return 1;
-}
-
-fn luaSpawn(L: ?*lc.lua_State) callconv(.c) c_int {
-    const self = getEngine(L);
-    const entity = self.registry.create();
-    self.query_generation +%= 1; // invalidate query cache
-    const entity_int: u32 = @bitCast(entity);
-    lc.lua_pushinteger(L, @intCast(entity_int));
-    return 1;
-}
-
-fn luaDestroy(L: ?*lc.lua_State) callconv(.c) c_int {
-    const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
-    self.registry.destroy(entity);
-    self.query_generation +%= 1; // invalidate query cache
-    return 0;
-}
-
-fn luaAdd(L: ?*lc.lua_State) callconv(.c) c_int {
-    const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
-    const name = componentName(L, 2);
-
-    inline for (components.all) |T| {
-        if (std.mem.eql(u8, name, lua.nameOf(T))) {
-            // MeshHandle/MaterialHandle: support string name resolution (e.g. "cube", "default")
-            if (comptime T == MeshHandle) {
-                const mesh_id = resolveHandle(self, L, 3, .mesh);
-                self.registry.addOrReplace(entity, MeshHandle{ .id = mesh_id });
-                return 0;
-            } else if (comptime T == MaterialHandle) {
-                const mat_id = resolveHandle(self, L, 3, .material);
-                self.registry.addOrReplace(entity, MaterialHandle{ .id = mat_id });
-                return 0;
-            } else if (comptime lua.isTag(T)) {
-                self.registry.addOrReplace(entity, T{});
-                return 0;
-            } else if (comptime @hasDecl(T, "Lua")) {
-                self.registry.addOrReplace(entity, T.Lua.fromLua(L, 3));
-                return 0;
-            }
-        }
-    }
-
-    _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, 2, null));
-    return 0;
-}
-
-fn luaGet(L: ?*lc.lua_State) callconv(.c) c_int {
-    const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
-    const name = componentName(L, 2);
-
-    inline for (components.all) |T| {
-        if (std.mem.eql(u8, name, lua.nameOf(T))) {
-            if (comptime lua.isTag(T)) {
-                lc.lua_pushboolean(L, if (self.registry.has(T, entity)) 1 else 0);
-                return 1;
-            } else if (comptime @hasDecl(T, "Lua")) {
-                if (self.registry.tryGet(T, entity)) |val| {
-                    return T.Lua.toLua(val.*, L);
-                }
-                return 0;
-            }
-        }
-    }
-
-    _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, 2, null));
-    return 0;
-}
-
-fn luaRemove(L: ?*lc.lua_State) callconv(.c) c_int {
-    const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
-    const name = componentName(L, 2);
-
-    inline for (components.all) |T| {
-        if (std.mem.eql(u8, name, lua.nameOf(T))) {
-            self.registry.remove(T, entity);
-            return 0;
-        }
-    }
-
-    _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, 2, null));
-    return 0;
-}
-
-fn luaQuery(L: ?*lc.lua_State) callconv(.c) c_int {
-    const self = getEngine(L);
-    const nargs = lc.lua_gettop(L);
-    if (nargs == 0) {
-        _ = lc.luaL_error(L, "query requires at least one component name");
-        return 0;
-    }
-
-    var entries: [16]QueryEntry = undefined;
-    const count: usize = @intCast(nargs);
-    if (count > 16) {
-        _ = lc.luaL_error(L, "query supports at most 16 components");
-        return 0;
-    }
-
-    for (0..count) |i| {
-        const name = std.mem.span(lc.luaL_checklstring(L, @intCast(i + 1), null));
-        entries[i] = findQueryEntry(name) orelse {
-            _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, @intCast(i + 1), null));
-            return 0;
-        };
-    }
-
-    std.mem.sort(QueryEntry, entries[0..count], {}, struct {
-        fn lessThan(_: void, a: QueryEntry, b: QueryEntry) bool {
-            return std.mem.order(u8, a.name, b.name) == .lt;
-        }
-    }.lessThan);
-
-    const hash = queryHash(&entries, count);
-
-    if (findCachedQuery(self, hash)) |idx| {
-        lc.lua_rawgeti(L, lc.LUA_REGISTRYINDEX, self.query_cache[idx].lua_ref);
-        return 1;
-    }
-
-    buildQueryTable(self, L, &entries, count);
-
-    lc.lua_pushvalue(L, -1);
-    const slot = findCacheSlot(self, hash);
-    if (self.query_cache[slot].lua_ref != lc.LUA_NOREF) {
-        lc.luaL_unref(L, lc.LUA_REGISTRYINDEX, self.query_cache[slot].lua_ref);
-    }
-    self.query_cache[slot] = .{
-        .lua_ref = lc.luaL_ref(L, lc.LUA_REGISTRYINDEX),
-        .frame = self.query_generation,
-        .hash = hash,
-    };
-
-    return 1;
-}
-
-fn luaRef(L: ?*lc.lua_State) callconv(.c) c_int {
-    const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
-    const entity_id: u32 = @bitCast(entity);
-    const name = componentName(L, 2);
-
-    inline for (components.all, 0..) |T, i| {
-        if (std.mem.eql(u8, name, lua.nameOf(T))) {
-            if (!self.registry.has(T, entity)) {
-                _ = lc.luaL_error(L, "entity %d has no component '%s'", @as(c_int, @intCast(entity_id)), lc.luaL_checklstring(L, 2, null));
-                return 0;
-            }
-
-            const ptr: *ComponentRef = @ptrCast(@alignCast(lc.lua_newuserdata(L, @sizeOf(ComponentRef))));
-            ptr.* = .{ .entity_id = entity_id, .type_tag = @intCast(i) };
-            lc.luaL_getmetatable(L, ref_metatable_name);
-            _ = lc.lua_setmetatable(L, -2);
-            return 1;
-        }
-    }
-
-    _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, 2, null));
-    return 0;
-}
-
-fn refIndex(L: ?*lc.lua_State) callconv(.c) c_int {
-    const self = getEngine(L);
-    const ptr: *const ComponentRef = @ptrCast(@alignCast(lc.lua_touserdata(L, 1) orelse return 0));
-    const field_name = std.mem.span(lc.luaL_checklstring(L, 2, null));
-    const entity: ecs.Entity = @bitCast(ptr.entity_id);
-
-    if (!self.registry.valid(entity)) {
-        _ = lc.luaL_error(L, "stale ref: entity %d has been destroyed", @as(c_int, @intCast(ptr.entity_id)));
-        return 0;
-    }
-
-    inline for (components.all, 0..) |T, i| {
-        if (ptr.type_tag == i) {
-            if (comptime lua.isTag(T)) {
-                lc.lua_pushboolean(L, if (self.registry.has(T, entity)) 1 else 0);
-                return 1;
-            } else if (self.registry.tryGet(T, entity)) |val| {
-                inline for (std.meta.fields(T)) |field| {
-                    if (std.mem.eql(u8, field_name, field.name)) {
-                        const fval = @field(val.*, field.name);
-                        if (comptime field.type == f32) {
-                            lc.lua_pushnumber(L, fval);
-                        } else if (comptime field.type == u32) {
-                            lc.lua_pushinteger(L, @intCast(fval));
-                        }
-                        return 1;
-                    }
-                }
-                _ = lc.luaL_error(L, "no field '%s' on component", lc.luaL_checklstring(L, 2, null));
-                return 0;
-            }
-            return 0;
-        }
-    }
-    return 0;
-}
-
-fn refNewIndex(L: ?*lc.lua_State) callconv(.c) c_int {
-    const self = getEngine(L);
-    const ptr: *const ComponentRef = @ptrCast(@alignCast(lc.lua_touserdata(L, 1) orelse return 0));
-    const field_name = std.mem.span(lc.luaL_checklstring(L, 2, null));
-    const entity: ecs.Entity = @bitCast(ptr.entity_id);
-
-    if (!self.registry.valid(entity)) {
-        _ = lc.luaL_error(L, "stale ref: entity %d has been destroyed", @as(c_int, @intCast(ptr.entity_id)));
-        return 0;
-    }
-
-    inline for (components.all, 0..) |T, i| {
-        if (ptr.type_tag == i) {
-            if (comptime !lua.isTag(T)) {
-                if (self.registry.tryGet(T, entity)) |comp| {
-                    inline for (std.meta.fields(T)) |field| {
-                        if (std.mem.eql(u8, field_name, field.name)) {
-                            if (comptime field.type == f32) {
-                                @field(comp, field.name) = @floatCast(lc.luaL_checknumber(L, 3));
-                            } else if (comptime field.type == u32) {
-                                @field(comp, field.name) = @intCast(lc.luaL_checkinteger(L, 3));
-                            }
-                            return 0;
-                        }
-                    }
-                    _ = lc.luaL_error(L, "no field '%s' on component", lc.luaL_checklstring(L, 2, null));
-                }
-            }
-            return 0;
-        }
-    }
-    return 0;
 }
 
 fn luaLoadGltf(L: ?*lc.lua_State) callconv(.c) c_int {

@@ -1,30 +1,35 @@
 // core_components.zig — Engine-provided component types.
 // These are always available regardless of which example is running.
 
-const lua = @import("lua");
-
 pub const Position = struct {
     x: f32 = 0,
     y: f32 = 0,
     z: f32 = 0,
-    pub const Lua = lua.Component("position", @This());
+    pub const lua = .{ .name = "position" };
 };
 
 pub const Rotation = struct {
     x: f32 = 0,
     y: f32 = 0,
     z: f32 = 0,
-    pub const Lua = lua.Component("rotation", @This());
+    pub const lua = .{ .name = "rotation" };
+};
+
+pub const Scale = struct {
+    x: f32 = 1,
+    y: f32 = 1,
+    z: f32 = 1,
+    pub const lua = .{ .name = "scale" };
 };
 
 pub const MeshHandle = struct {
     id: u32 = 0,
-    pub const Lua = lua.Component("mesh", @This());
+    pub const lua = .{ .name = "mesh", .resolve = .mesh };
 };
 
 pub const MaterialHandle = struct {
     id: u32 = 0,
-    pub const Lua = lua.Component("material", @This());
+    pub const lua = .{ .name = "material", .resolve = .material };
 };
 
 pub const Camera = struct {
@@ -35,7 +40,7 @@ pub const Camera = struct {
     viewport_y: f32 = 0.0,
     viewport_w: f32 = 1.0,
     viewport_h: f32 = 1.0,
-    pub const Lua = lua.Component("camera", @This());
+    pub const lua = .{ .name = "camera" };
 };
 
 pub const DirectionalLight = struct {
@@ -45,19 +50,12 @@ pub const DirectionalLight = struct {
     r: f32 = 1.0,
     g: f32 = 1.0,
     b: f32 = 1.0,
-    pub const Lua = lua.Component("directional_light", @This());
-};
-
-pub const Scale = struct {
-    x: f32 = 1,
-    y: f32 = 1,
-    z: f32 = 1,
-    pub const Lua = lua.Component("scale", @This());
+    pub const lua = .{ .name = "directional_light" };
 };
 
 pub const LookAt = struct {
     target: u32 = 0,
-    pub const Lua = lua.Component("look_at", @This());
+    pub const lua = .{ .name = "look_at" };
 };
 
 /// Core component tuple — engine modules reference these directly.

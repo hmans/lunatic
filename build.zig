@@ -87,9 +87,6 @@ fn addExample(
         .root_source_file = b.path("src/core_components.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "lua", .module = lua_mod },
-        },
     });
 
     const components_mod = if (components_file) |cf|
@@ -99,7 +96,6 @@ fn addExample(
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "core_components", .module = core_components_mod },
-                .{ .name = "lua", .module = lua_mod },
             },
         })
     else
@@ -131,7 +127,7 @@ fn addExample(
     });
     addCIncludes(engine_mod, vendor_path);
 
-    // Renderer and lua_api need the same imports
+    // Renderer, component_ops, and lua_api modules
     const renderer_mod = b.createModule(.{
         .root_source_file = b.path("src/renderer.zig"),
         .target = target,
@@ -146,6 +142,19 @@ fn addExample(
         },
     });
 
+    const component_ops_mod = b.createModule(.{
+        .root_source_file = b.path("src/component_ops.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zig-ecs", .module = ecs_mod },
+            .{ .name = "engine", .module = engine_mod },
+            .{ .name = "lua", .module = lua_mod },
+        },
+    });
+    addCIncludes(component_ops_mod, vendor_path);
+
     const lua_api_mod = b.createModule(.{
         .root_source_file = b.path("src/lua_api.zig"),
         .target = target,
@@ -153,11 +162,10 @@ fn addExample(
         .link_libc = true,
         .imports = &.{
             .{ .name = "zig-ecs", .module = ecs_mod },
-            .{ .name = "core_components", .module = core_components_mod },
             .{ .name = "components", .module = components_mod },
+            .{ .name = "component_ops", .module = component_ops_mod },
             .{ .name = "engine", .module = engine_mod },
             .{ .name = "lua", .module = lua_mod },
-            .{ .name = "math3d", .module = math3d_mod },
         },
     });
 
@@ -289,9 +297,6 @@ fn addIntegrationTests(
         .root_source_file = b.path("src/core_components.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "lua", .module = lua_mod },
-        },
     });
 
     // Integration tests use primitives components (includes Spin, Player for tag tests)
@@ -301,7 +306,6 @@ fn addIntegrationTests(
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_components", .module = core_components_mod },
-            .{ .name = "lua", .module = lua_mod },
         },
     });
 
@@ -345,6 +349,19 @@ fn addIntegrationTests(
         },
     });
 
+    const component_ops_mod = b.createModule(.{
+        .root_source_file = b.path("src/component_ops.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zig-ecs", .module = ecs_mod },
+            .{ .name = "engine", .module = engine_mod },
+            .{ .name = "lua", .module = lua_mod },
+        },
+    });
+    addCIncludes(component_ops_mod, vendor_path);
+
     const lua_api_mod = b.createModule(.{
         .root_source_file = b.path("src/lua_api.zig"),
         .target = target,
@@ -352,11 +369,10 @@ fn addIntegrationTests(
         .link_libc = true,
         .imports = &.{
             .{ .name = "zig-ecs", .module = ecs_mod },
-            .{ .name = "core_components", .module = core_components_mod },
             .{ .name = "components", .module = components_mod },
+            .{ .name = "component_ops", .module = component_ops_mod },
             .{ .name = "engine", .module = engine_mod },
             .{ .name = "lua", .module = lua_mod },
-            .{ .name = "math3d", .module = math3d_mod },
         },
     });
 
