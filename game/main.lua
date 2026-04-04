@@ -16,25 +16,26 @@ local blue   = lunatic.create_material({ albedo = { 0.2, 0.3, 0.9 } })
 local yellow = lunatic.create_material({ albedo = { 0.9, 0.8, 0.2 } })
 
 local materials = { lunatic.material.default, red, green, blue, yellow }
+local meshes = { lunatic.mesh.cube, lunatic.mesh.sphere }
 
--- Spawn a grid of cubes
+-- Spawn a grid of shapes
 for x = -4, 4 do
   for z = -4, 4 do
     local e = lunatic.spawn()
     lunatic.add(e, "position", x * 2, 0, z * 2)
     lunatic.add(e, "rotation", 0, math.random() * 360, 0)
     lunatic.add(e, "spin", 30 + math.random() * 60)
-    lunatic.add(e, "mesh", lunatic.mesh.cube)
+    lunatic.add(e, "mesh", meshes[math.random(#meshes)])
     lunatic.add(e, "material", materials[math.random(#materials)])
   end
 end
 
--- Player cube
+-- Player sphere
 local e = lunatic.spawn()
 lunatic.add(e, "position", 0, 0.5, 0)
 lunatic.add(e, "rotation", 0, 0, 0)
 lunatic.add(e, "spin", 120)
-lunatic.add(e, "mesh", lunatic.mesh.cube)
+lunatic.add(e, "mesh", lunatic.mesh.sphere)
 lunatic.add(e, "material", yellow)
 lunatic.add(e, "player")
 

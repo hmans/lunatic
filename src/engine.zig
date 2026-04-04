@@ -8,6 +8,7 @@ const ecs = @import("zig-ecs");
 const Mat4 = math3d.Mat4;
 const Vec3 = math3d.Vec3;
 
+const geometry = @import("geometry.zig");
 const lua = @import("lua.zig");
 const lc = lua.c;
 const c = @cImport({
@@ -21,41 +22,7 @@ const MeshHandle = components.MeshHandle;
 const MaterialHandle = components.MaterialHandle;
 const Spin = components.Spin;
 
-// ============================================================
-// Vertex format
-// ============================================================
-
-const Vertex = extern struct {
-    px: f32,
-    py: f32,
-    pz: f32,
-    nx: f32,
-    ny: f32,
-    nz: f32,
-};
-
-// ============================================================
-// Built-in cube mesh
-// ============================================================
-
-fn vtx(px: f32, py: f32, pz: f32, nx: f32, ny: f32, nz: f32) Vertex {
-    return .{ .px = px, .py = py, .pz = pz, .nx = nx, .ny = ny, .nz = nz };
-}
-
-const cube_vertices = [36]Vertex{
-    vtx(-0.5, -0.5, 0.5, 0, 0, 1), vtx(0.5, -0.5, 0.5, 0, 0, 1), vtx(0.5, 0.5, 0.5, 0, 0, 1),
-    vtx(-0.5, -0.5, 0.5, 0, 0, 1), vtx(0.5, 0.5, 0.5, 0, 0, 1),  vtx(-0.5, 0.5, 0.5, 0, 0, 1),
-    vtx(0.5, -0.5, -0.5, 0, 0, -1),  vtx(-0.5, -0.5, -0.5, 0, 0, -1), vtx(-0.5, 0.5, -0.5, 0, 0, -1),
-    vtx(0.5, -0.5, -0.5, 0, 0, -1),  vtx(-0.5, 0.5, -0.5, 0, 0, -1),  vtx(0.5, 0.5, -0.5, 0, 0, -1),
-    vtx(-0.5, 0.5, 0.5, 0, 1, 0),  vtx(0.5, 0.5, 0.5, 0, 1, 0),  vtx(0.5, 0.5, -0.5, 0, 1, 0),
-    vtx(-0.5, 0.5, 0.5, 0, 1, 0),  vtx(0.5, 0.5, -0.5, 0, 1, 0), vtx(-0.5, 0.5, -0.5, 0, 1, 0),
-    vtx(-0.5, -0.5, -0.5, 0, -1, 0), vtx(0.5, -0.5, -0.5, 0, -1, 0), vtx(0.5, -0.5, 0.5, 0, -1, 0),
-    vtx(-0.5, -0.5, -0.5, 0, -1, 0), vtx(0.5, -0.5, 0.5, 0, -1, 0),  vtx(-0.5, -0.5, 0.5, 0, -1, 0),
-    vtx(0.5, -0.5, 0.5, 1, 0, 0),  vtx(0.5, -0.5, -0.5, 1, 0, 0), vtx(0.5, 0.5, -0.5, 1, 0, 0),
-    vtx(0.5, -0.5, 0.5, 1, 0, 0),  vtx(0.5, 0.5, -0.5, 1, 0, 0),  vtx(0.5, 0.5, 0.5, 1, 0, 0),
-    vtx(-0.5, -0.5, -0.5, -1, 0, 0), vtx(-0.5, -0.5, 0.5, -1, 0, 0),  vtx(-0.5, 0.5, 0.5, -1, 0, 0),
-    vtx(-0.5, -0.5, -0.5, -1, 0, 0), vtx(-0.5, 0.5, 0.5, -1, 0, 0),   vtx(-0.5, 0.5, -0.5, -1, 0, 0),
-};
+const Vertex = geometry.Vertex;
 
 // ============================================================
 // Compiled shaders (built from GLSL sources in shaders/)
@@ -544,7 +511,15 @@ pub const Engine = struct {
         };
 
         // Built-in meshes
-        _ = try self.createMesh("cube", &cube_vertices);
+        const allocator = std.heap.c_allocator;
+
+        const cube_verts = try geometry.cube(allocator);
+        defer allocator.free(cube_verts);
+        _ = try self.createMesh("cube", cube_verts);
+
+        const sphere_verts = try geometry.sphere(allocator, 32, 16);
+        defer allocator.free(sphere_verts);
+        _ = try self.createMesh("sphere", sphere_verts);
 
         // Built-in materials
         _ = self.createNamedMaterial("default", .{});

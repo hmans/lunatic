@@ -123,10 +123,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const geometry_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/geometry.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
     const run_tests = b.addRunArtifact(tests);
     const run_math_tests = b.addRunArtifact(math_tests);
+    const run_geometry_tests = b.addRunArtifact(geometry_tests);
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_math_tests.step);
+    test_step.dependOn(&run_geometry_tests.step);
 }
