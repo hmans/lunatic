@@ -1,5 +1,50 @@
 const std = @import("std");
 
+const ShaderStage = enum { vertex, fragment };
+
+/// Add a build step that compiles a GLSL shader to SPIR-V and MSL.
+fn addShader(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    comptime name: []const u8,
+    comptime ext: []const u8,
+    stage: ShaderStage,
+) void {
+    const stage_flag = switch (stage) {
+        .vertex => "-fshader-stage=vertex",
+        .fragment => "-fshader-stage=fragment",
+    };
+
+    // GLSL → SPIR-V (via glslc)
+    const glslc = b.addSystemCommand(&.{
+        "glslc", stage_flag,
+        "shaders/" ++ name ++ "." ++ ext,
+        "-o",
+    });
+    const spv = glslc.addOutputFileArg(name ++ "." ++ ext ++ ".spv");
+
+    // SPIR-V → MSL (via spirv-cross)
+    const spirv_cross = b.addSystemCommand(&.{
+        "spirv-cross", "--msl",
+    });
+    spirv_cross.addFileArg(spv);
+    spirv_cross.addArg("--output");
+    const msl = spirv_cross.addOutputFileArg(name ++ "." ++ ext ++ ".msl");
+
+    // Make compiled shaders available to @embedFile in engine.zig
+    exe.root_module.addAnonymousImport("shader_" ++ name ++ "_" ++ ext ++ "_spv", .{
+        .root_source_file = spv,
+    });
+    exe.root_module.addAnonymousImport("shader_" ++ name ++ "_" ++ ext ++ "_msl", .{
+        .root_source_file = msl,
+    });
+}
+
+fn addShaders(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    addShader(b, exe, "default", "vert", .vertex);
+    addShader(b, exe, "default", "frag", .fragment);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -30,6 +75,9 @@ pub fn build(b: *std.Build) void {
     // LuaJIT (installs as libluajit-5.1)
     exe.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/luajit-2.1" });
     exe.linkSystemLibrary("luajit-5.1");
+
+    // Compile shaders (GLSL → SPIR-V + MSL)
+    addShaders(b, exe);
 
     b.installArtifact(exe);
 
@@ -62,6 +110,9 @@ pub fn build(b: *std.Build) void {
     tests.linkSystemLibrary("SDL3");
     tests.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/luajit-2.1" });
     tests.linkSystemLibrary("luajit-5.1");
+
+    // Tests also need the compiled shaders
+    addShaders(b, tests);
 
     // Also run math3d unit tests
     const math_tests = b.addTest(.{

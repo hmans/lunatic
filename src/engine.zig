@@ -57,83 +57,13 @@ const cube_vertices = [36]Vertex{
 };
 
 // ============================================================
-// Metal shaders (MSL)
+// Compiled shaders (built from GLSL sources in shaders/)
 // ============================================================
 
-const vertex_shader_msl =
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\struct Vertex {
-    \\    float3 position [[attribute(0)]];
-    \\    float3 normal   [[attribute(1)]];
-    \\};
-    \\
-    \\struct VertexUniforms {
-    \\    float4x4 mvp;
-    \\    float4x4 model;
-    \\};
-    \\
-    \\struct VertexOut {
-    \\    float4 position [[position]];
-    \\    float3 world_pos;
-    \\    float3 world_normal;
-    \\};
-    \\
-    \\vertex VertexOut vertex_main(
-    \\    Vertex in [[stage_in]],
-    \\    constant VertexUniforms &u [[buffer(0)]]
-    \\) {
-    \\    VertexOut out;
-    \\    out.position = u.mvp * float4(in.position, 1.0);
-    \\    out.world_pos = (u.model * float4(in.position, 1.0)).xyz;
-    \\    out.world_normal = normalize((u.model * float4(in.normal, 0.0)).xyz);
-    \\    return out;
-    \\}
-;
-
-const fragment_shader_msl =
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\struct VertexOut {
-    \\    float4 position [[position]];
-    \\    float3 world_pos;
-    \\    float3 world_normal;
-    \\};
-    \\
-    \\struct FragUniforms {
-    \\    float4 light_dir;
-    \\    float4 camera_pos;
-    \\    float4 fog_color;
-    \\    float4 fog_params;
-    \\    float4 albedo;
-    \\    float4 ambient;
-    \\};
-    \\
-    \\fragment float4 fragment_main(
-    \\    VertexOut in [[stage_in]],
-    \\    constant FragUniforms &u [[buffer(0)]]
-    \\) {
-    \\    float3 N = normalize(in.world_normal);
-    \\    float3 L = normalize(u.light_dir.xyz);
-    \\    float ndotl = dot(N, L);
-    \\    float diffuse = ndotl * 0.5 + 0.5;
-    \\    diffuse = diffuse * diffuse;
-    \\
-    \\    float3 color = u.albedo.xyz * (u.ambient.xyz + diffuse);
-    \\
-    \\    if (u.fog_color.w > 0.5) {
-    \\        float dist = length(in.world_pos - u.camera_pos.xyz);
-    \\        float fog_start = u.fog_params.x;
-    \\        float fog_end = u.fog_params.y;
-    \\        float fog_factor = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
-    \\        color = mix(color, u.fog_color.xyz, fog_factor);
-    \\    }
-    \\
-    \\    return float4(color, 1.0);
-    \\}
-;
+const vert_spv = @embedFile("shader_default_vert_spv");
+const vert_msl = @embedFile("shader_default_vert_msl");
+const frag_spv = @embedFile("shader_default_frag_spv");
+const frag_msl = @embedFile("shader_default_frag_msl");
 
 // ============================================================
 // Uniform structs
@@ -245,12 +175,34 @@ fn queryHash(entries: []const QueryEntry, count: usize) u64 {
 // GPU helpers (stateless)
 // ============================================================
 
-fn createShader(device: *c.SDL_GPUDevice, code: [*:0]const u8, stage: c.SDL_GPUShaderStage, num_uniform_buffers: u32) ?*c.SDL_GPUShader {
+fn createShader(device: *c.SDL_GPUDevice, spv: []const u8, msl: []const u8, stage: c.SDL_GPUShaderStage, num_uniform_buffers: u32) ?*c.SDL_GPUShader {
+    const formats = c.SDL_GetGPUShaderFormats(device);
+
+    var code: [*]const u8 = undefined;
+    var code_size: usize = undefined;
+    var format: c.SDL_GPUShaderFormat = undefined;
+    var entrypoint: [*:0]const u8 = undefined;
+
+    if (formats & c.SDL_GPU_SHADERFORMAT_SPIRV != 0) {
+        code = spv.ptr;
+        code_size = spv.len;
+        format = c.SDL_GPU_SHADERFORMAT_SPIRV;
+        entrypoint = "main";
+    } else if (formats & c.SDL_GPU_SHADERFORMAT_MSL != 0) {
+        code = msl.ptr;
+        code_size = msl.len;
+        format = c.SDL_GPU_SHADERFORMAT_MSL;
+        entrypoint = "main0";
+    } else {
+        std.debug.print("No supported shader format found\n", .{});
+        return null;
+    }
+
     return c.SDL_CreateGPUShader(device, &c.SDL_GPUShaderCreateInfo{
-        .code_size = std.mem.len(code),
+        .code_size = code_size,
         .code = code,
-        .entrypoint = if (stage == c.SDL_GPU_SHADERSTAGE_VERTEX) "vertex_main" else "fragment_main",
-        .format = c.SDL_GPU_SHADERFORMAT_MSL,
+        .entrypoint = entrypoint,
+        .format = format,
         .stage = stage,
         .num_samplers = 0,
         .num_storage_textures = 0,
@@ -471,7 +423,7 @@ pub const Engine = struct {
             return error.SDLInitFailed;
         }
 
-        self.gpu_device = c.SDL_CreateGPUDevice(c.SDL_GPU_SHADERFORMAT_MSL, true, null);
+        self.gpu_device = c.SDL_CreateGPUDevice(c.SDL_GPU_SHADERFORMAT_SPIRV | c.SDL_GPU_SHADERFORMAT_MSL, true, null);
         if (self.gpu_device == null) {
             std.debug.print("SDL_CreateGPUDevice failed: {s}\n", .{c.SDL_GetError()});
             return error.GPUDeviceFailed;
@@ -490,13 +442,13 @@ pub const Engine = struct {
         }
 
         // Shaders (released after pipeline creation)
-        const vert_shader = createShader(device, vertex_shader_msl, c.SDL_GPU_SHADERSTAGE_VERTEX, 1) orelse {
+        const vert_shader = createShader(device, vert_spv, vert_msl, c.SDL_GPU_SHADERSTAGE_VERTEX, 1) orelse {
             std.debug.print("Failed to create vertex shader: {s}\n", .{c.SDL_GetError()});
             return error.ShaderFailed;
         };
         defer c.SDL_ReleaseGPUShader(device, vert_shader);
 
-        const frag_shader = createShader(device, fragment_shader_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 1) orelse {
+        const frag_shader = createShader(device, frag_spv, frag_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 1) orelse {
             std.debug.print("Failed to create fragment shader: {s}\n", .{c.SDL_GetError()});
             return error.ShaderFailed;
         };
