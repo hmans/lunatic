@@ -18,6 +18,7 @@ const c = @cImport({
 const Position = components.Position;
 const Rotation = components.Rotation;
 const MeshHandle = components.MeshHandle;
+const MaterialHandle = components.MaterialHandle;
 const Spin = components.Spin;
 
 // ============================================================
@@ -74,13 +75,16 @@ const VertexUniforms = extern struct {
     model: [4][4]f32,
 };
 
-const FragUniforms = extern struct {
+const SceneUniforms = extern struct {
     light_dir: [4]f32,
     camera_pos: [4]f32,
     fog_color: [4]f32, // .xyz = color, .w = fog_enabled (1.0 or 0.0)
     fog_params: [4]f32, // .x = fog_start, .y = fog_end
-    albedo: [4]f32,
     ambient: [4]f32,
+};
+
+const MaterialUniforms = extern struct {
+    albedo: [4]f32,
 };
 
 // ============================================================
@@ -92,7 +96,12 @@ const MeshData = struct {
     vertex_count: u32,
 };
 
+const MaterialData = struct {
+    albedo: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 },
+};
+
 const max_meshes = 64;
+const max_materials = 64;
 const max_cached_queries = 64;
 const max_lua_systems = 64;
 
@@ -323,6 +332,11 @@ pub const Engine = struct {
     mesh_names: [max_meshes]?[*:0]const u8 = .{null} ** max_meshes,
     mesh_count: u32 = 0,
 
+    // Material registry
+    material_registry: [max_materials]?MaterialData = .{null} ** max_materials,
+    material_names: [max_materials]?[*:0]const u8 = .{null} ** max_materials,
+    material_count: u32 = 0,
+
     // Query cache
     current_frame: u64 = 0,
     query_cache: [max_cached_queries]QueryCacheEntry = .{QueryCacheEntry{}} ** max_cached_queries,
@@ -359,6 +373,7 @@ pub const Engine = struct {
 
         if (!config.headless) {
             try self.initGpu(config);
+            self.publishHandlesToLua();
         }
     }
 
@@ -448,7 +463,7 @@ pub const Engine = struct {
         };
         defer c.SDL_ReleaseGPUShader(device, vert_shader);
 
-        const frag_shader = createShader(device, frag_spv, frag_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 1) orelse {
+        const frag_shader = createShader(device, frag_spv, frag_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 2) orelse {
             std.debug.print("Failed to create fragment shader: {s}\n", .{c.SDL_GetError()});
             return error.ShaderFailed;
         };
@@ -529,11 +544,10 @@ pub const Engine = struct {
         };
 
         // Built-in meshes
-        const cube_buf = uploadVertexData(device, std.mem.asBytes(&cube_vertices)) orelse {
-            std.debug.print("Failed to upload cube mesh: {s}\n", .{c.SDL_GetError()});
-            return error.BufferFailed;
-        };
-        _ = self.registerMesh("cube", cube_buf, cube_vertices.len);
+        _ = try self.createMesh("cube", &cube_vertices);
+
+        // Built-in materials
+        _ = self.createNamedMaterial("default", .{});
 
         // Depth texture
         self.depth_texture = createDepthTexture(device, config.width, config.height) orelse {
@@ -544,11 +558,13 @@ pub const Engine = struct {
         self.depth_h = config.height;
     }
 
-    // ---- Mesh registry ----
+    // ---- Mesh API ----
 
-    fn registerMesh(self: *Engine, name: [*:0]const u8, buffer: *c.SDL_GPUBuffer, vertex_count: u32) u32 {
+    pub fn createMesh(self: *Engine, name: ?[*:0]const u8, vertices: []const Vertex) !u32 {
+        const device = self.gpu_device orelse return error.NotInitialized;
+        const buf = uploadVertexData(device, std.mem.sliceAsBytes(vertices)) orelse return error.BufferFailed;
         const id = self.mesh_count;
-        self.mesh_registry[id] = .{ .buffer = buffer, .vertex_count = vertex_count };
+        self.mesh_registry[id] = .{ .buffer = buf, .vertex_count = @intCast(vertices.len) };
         self.mesh_names[id] = name;
         self.mesh_count += 1;
         return id;
@@ -558,6 +574,30 @@ pub const Engine = struct {
         const needle = std.mem.span(name);
         for (0..self.mesh_count) |i| {
             if (self.mesh_names[i]) |n| {
+                if (std.mem.eql(u8, std.mem.span(n), needle)) return @intCast(i);
+            }
+        }
+        return null;
+    }
+
+    // ---- Material API ----
+
+    pub fn createMaterial(self: *Engine, data: MaterialData) u32 {
+        return self.createNamedMaterial(null, data);
+    }
+
+    pub fn createNamedMaterial(self: *Engine, name: ?[*:0]const u8, data: MaterialData) u32 {
+        const id = self.material_count;
+        self.material_registry[id] = data;
+        self.material_names[id] = name;
+        self.material_count += 1;
+        return id;
+    }
+
+    fn findMaterial(self: *Engine, name: [*:0]const u8) ?u32 {
+        const needle = std.mem.span(name);
+        for (0..self.material_count) |i| {
+            if (self.material_names[i]) |n| {
                 if (std.mem.eql(u8, std.mem.span(n), needle)) return @intCast(i);
             }
         }
@@ -688,14 +728,15 @@ pub const Engine = struct {
         const view = Mat4.lookAt(self.camera_eye, self.camera_target, Vec3.new(0, 1, 0));
         const vp = Mat4.mul(proj, view);
 
-        const frag_uniforms = FragUniforms{
+        const scene_uniforms = SceneUniforms{
             .light_dir = self.light_dir,
             .camera_pos = .{ self.camera_eye.x, self.camera_eye.y, self.camera_eye.z, 0.0 },
             .fog_color = .{ self.fog_color[0], self.fog_color[1], self.fog_color[2], if (self.fog_enabled) 1.0 else 0.0 },
             .fog_params = .{ self.fog_start, self.fog_end, 0.0, 0.0 },
-            .albedo = .{ 1.0, 1.0, 1.0, 0.0 },
             .ambient = self.ambient_color,
         };
+
+        const default_material = MaterialUniforms{ .albedo = .{ 1.0, 1.0, 1.0, 1.0 } };
 
         const color_target = c.SDL_GPUColorTargetInfo{
             .texture = swapchain_tex,
@@ -732,7 +773,7 @@ pub const Engine = struct {
         };
 
         c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
-        c.SDL_PushGPUFragmentUniformData(cmd, 0, &frag_uniforms, @sizeOf(FragUniforms));
+        c.SDL_PushGPUFragmentUniformData(cmd, 0, &scene_uniforms, @sizeOf(SceneUniforms));
 
         var ecs_view = self.registry.view(.{ Position, Rotation, MeshHandle }, .{});
         var iter = ecs_view.entityIterator();
@@ -750,12 +791,22 @@ pub const Engine = struct {
                 bound_mesh = mesh_handle.id;
             }
 
+            // Per-entity material: look up MaterialHandle if present, else use default
+            const mat_uniforms = if (self.registry.tryGet(MaterialHandle, entity)) |mat_handle|
+                if (self.material_registry[mat_handle.id]) |mat|
+                    MaterialUniforms{ .albedo = mat.albedo }
+                else
+                    default_material
+            else
+                default_material;
+
             const rotation = Mat4.mul(Mat4.mul(Mat4.rotateZ(rot.z), Mat4.rotateY(rot.y)), Mat4.rotateX(rot.x));
             const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), rotation);
             const mvp = Mat4.mul(vp, model);
 
             const vert_uniforms = VertexUniforms{ .mvp = mvp.m, .model = model.m };
             c.SDL_PushGPUVertexUniformData(cmd, 0, &vert_uniforms, @sizeOf(VertexUniforms));
+            c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
             c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, 1, 0, 0);
         }
 
@@ -786,6 +837,7 @@ pub const Engine = struct {
             .{ "remove", &luaRemove },
             .{ "query", &luaQuery },
             .{ "ref", &luaRef },
+            .{ "create_material", &luaCreateMaterial },
             .{ "system", &luaSystemRegister },
         };
 
@@ -810,6 +862,35 @@ pub const Engine = struct {
 
         lc.lua_pop(L, 1);
     }
+
+    /// Populate lunatic.mesh.* and lunatic.material.* tables with numeric handles.
+    fn publishHandlesToLua(self: *Engine) void {
+        const L = self.lua_state orelse return;
+
+        lc.lua_getglobal(L, "lunatic");
+
+        // lunatic.mesh = { cube = 0, ... }
+        lc.lua_newtable(L);
+        for (0..self.mesh_count) |i| {
+            if (self.mesh_names[i]) |name| {
+                lc.lua_pushinteger(L, @intCast(i));
+                lc.lua_setfield(L, -2, name);
+            }
+        }
+        lc.lua_setfield(L, -2, "mesh");
+
+        // lunatic.material = { default = 0, ... }
+        lc.lua_newtable(L);
+        for (0..self.material_count) |i| {
+            if (self.material_names[i]) |name| {
+                lc.lua_pushinteger(L, @intCast(i));
+                lc.lua_setfield(L, -2, name);
+            }
+        }
+        lc.lua_setfield(L, -2, "material");
+
+        lc.lua_pop(L, 1); // pop lunatic table
+    }
 };
 
 // ============================================================
@@ -832,6 +913,27 @@ fn entityFromLua(self: *Engine, L: ?*lc.lua_State, idx: c_int) ecs.Entity {
 
 fn componentName(L: ?*lc.lua_State, idx: c_int) []const u8 {
     return std.mem.span(lc.luaL_checklstring(L, idx, null));
+}
+
+const HandleKind = enum { mesh, material };
+
+/// Accept either a numeric handle (fast path) or a string name (legacy/convenience).
+fn resolveHandle(self: *Engine, L: ?*lc.lua_State, idx: c_int, kind: HandleKind) u32 {
+    if (lc.lua_type(L, idx) == lc.LUA_TNUMBER) {
+        return @intCast(lc.lua_tointeger(L, idx));
+    }
+    const name = lc.luaL_checklstring(L, idx, null);
+    const id = switch (kind) {
+        .mesh => self.findMesh(name),
+        .material => self.findMaterial(name),
+    };
+    if (id) |found| return found;
+    const label = switch (kind) {
+        .mesh => "unknown mesh: %s",
+        .material => "unknown material: %s",
+    };
+    _ = lc.luaL_error(L, label, name);
+    unreachable;
 }
 
 fn luaKeyDown(L: ?*lc.lua_State) callconv(.c) c_int {
@@ -893,6 +995,32 @@ fn luaSetAmbient(L: ?*lc.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+fn luaCreateMaterial(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    lc.luaL_checktype(L, 1, lc.LUA_TTABLE);
+
+    var data = MaterialData{};
+
+    // Read "albedo" field: { r, g, b }
+    lc.lua_getfield(L, 1, "albedo");
+    if (lc.lua_type(L, -1) == lc.LUA_TTABLE) {
+        lc.lua_rawgeti(L, -1, 1);
+        data.albedo[0] = @floatCast(lc.luaL_optnumber(L, -1, 1.0));
+        lc.lua_pop(L, 1);
+        lc.lua_rawgeti(L, -1, 2);
+        data.albedo[1] = @floatCast(lc.luaL_optnumber(L, -1, 1.0));
+        lc.lua_pop(L, 1);
+        lc.lua_rawgeti(L, -1, 3);
+        data.albedo[2] = @floatCast(lc.luaL_optnumber(L, -1, 1.0));
+        lc.lua_pop(L, 1);
+    }
+    lc.lua_pop(L, 1); // pop albedo field
+
+    const id = self.createMaterial(data);
+    lc.lua_pushinteger(L, @intCast(id));
+    return 1;
+}
+
 fn luaSpawn(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const entity = self.registry.create();
@@ -927,12 +1055,14 @@ fn luaAdd(L: ?*lc.lua_State) callconv(.c) c_int {
 
     // Components without auto-bindings (special cases)
     if (std.mem.eql(u8, name, lua.nameOf(MeshHandle))) {
-        const mesh_name = lc.luaL_checklstring(L, 3, null);
-        const mesh_id = self.findMesh(mesh_name) orelse {
-            _ = lc.luaL_error(L, "unknown mesh: %s", mesh_name);
-            return 0;
-        };
+        const mesh_id = resolveHandle(self, L, 3, .mesh);
         self.registry.addOrReplace(entity, MeshHandle{ .id = mesh_id });
+        return 0;
+    }
+
+    if (std.mem.eql(u8, name, lua.nameOf(MaterialHandle))) {
+        const mat_id = resolveHandle(self, L, 3, .material);
+        self.registry.addOrReplace(entity, MaterialHandle{ .id = mat_id });
         return 0;
     }
 

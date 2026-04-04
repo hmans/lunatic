@@ -30,5 +30,10 @@ pub const MeshHandle = struct {
     pub const lua_name = "mesh";
 };
 
+pub const MaterialHandle = struct {
+    id: u32 = 0,
+    pub const lua_name = "material";
+};
+
 /// Single source of truth: all component types exposed to Lua.
-pub const all = .{ Position, Rotation, Spin, Player, MeshHandle };
+pub const all = .{ Position, Rotation, Spin, Player, MeshHandle, MaterialHandle };

@@ -17,3 +17,4 @@ A 3D game engine: Zig core + SDL3 GPU + LuaJIT scripting + zig-ecs.
 - Use Conventional Commit formatting for commit messages
 - `lc` = Lua C namespace, `c` = SDL C namespace (separate `@cImport`s to avoid type conflicts)
 - Query results are cached per frame via FNV-1a hash of component names
+- Any new APIs must be made available to Zig first, and then (optionally, where it makes sense) to Lua.
