@@ -20,7 +20,7 @@ pub const Vertex = extern struct {
 
 pub const Mesh = struct {
     vertices: []Vertex,
-    indices: []u16,
+    indices: []u32,
 };
 
 // ============================================================
@@ -41,7 +41,7 @@ pub fn cube(allocator: std.mem.Allocator) !Mesh {
     };
 
     var verts = try allocator.alloc(Vertex, 24); // 4 per face
-    var indices = try allocator.alloc(u16, 36); // 6 per face
+    var indices = try allocator.alloc(u32, 36); // 6 per face
 
     for (faces, 0..) |face, fi| {
         const nx = face[0];
@@ -71,14 +71,14 @@ pub fn cube(allocator: std.mem.Allocator) !Mesh {
         const cz = nz * s;
 
         const vbase = fi * 4;
-        verts[vbase + 0] = .{ .px = cx - s * tx - s * bx, .py = cy - s * ty - s * by, .pz = cz - s * tz - s * bz, .nx = nx, .ny = ny, .nz = nz, .u = 0, .v = 1 };
-        verts[vbase + 1] = .{ .px = cx + s * tx - s * bx, .py = cy + s * ty - s * by, .pz = cz + s * tz - s * bz, .nx = nx, .ny = ny, .nz = nz, .u = 1, .v = 1 };
-        verts[vbase + 2] = .{ .px = cx + s * tx + s * bx, .py = cy + s * ty + s * by, .pz = cz + s * tz + s * bz, .nx = nx, .ny = ny, .nz = nz, .u = 1, .v = 0 };
-        verts[vbase + 3] = .{ .px = cx - s * tx + s * bx, .py = cy - s * ty + s * by, .pz = cz - s * tz + s * bz, .nx = nx, .ny = ny, .nz = nz, .u = 0, .v = 0 };
+        verts[vbase + 0] = .{ .px = cx - s * tx - s * bx, .py = cy - s * ty - s * by, .pz = cz - s * tz - s * bz, .nx = nx, .ny = ny, .nz = nz, .u = 0, .v = 1, .tx = tx, .ty = ty, .tz = tz, .tw = 1 };
+        verts[vbase + 1] = .{ .px = cx + s * tx - s * bx, .py = cy + s * ty - s * by, .pz = cz + s * tz - s * bz, .nx = nx, .ny = ny, .nz = nz, .u = 1, .v = 1, .tx = tx, .ty = ty, .tz = tz, .tw = 1 };
+        verts[vbase + 2] = .{ .px = cx + s * tx + s * bx, .py = cy + s * ty + s * by, .pz = cz + s * tz + s * bz, .nx = nx, .ny = ny, .nz = nz, .u = 1, .v = 0, .tx = tx, .ty = ty, .tz = tz, .tw = 1 };
+        verts[vbase + 3] = .{ .px = cx - s * tx + s * bx, .py = cy - s * ty + s * by, .pz = cz - s * tz + s * bz, .nx = nx, .ny = ny, .nz = nz, .u = 0, .v = 0, .tx = tx, .ty = ty, .tz = tz, .tw = 1 };
 
         // CCW winding (matching the old verified order: 1,0,3 + 1,3,2)
         const ibase = fi * 6;
-        const b: u16 = @intCast(vbase);
+        const b: u32 = @intCast(vbase);
         indices[ibase + 0] = b + 1;
         indices[ibase + 1] = b + 0;
         indices[ibase + 2] = b + 3;
@@ -102,7 +102,7 @@ pub fn sphere(allocator: std.mem.Allocator, segments: u32, rings: u32) !Mesh {
     const index_count = segments * rows * 6;
 
     var verts = try allocator.alloc(Vertex, vert_count);
-    var indices = try allocator.alloc(u16, index_count);
+    var indices = try allocator.alloc(u32, index_count);
 
     const segs_f: f32 = @floatFromInt(segments);
     const rows_f: f32 = @floatFromInt(rows);
@@ -124,6 +124,10 @@ pub fn sphere(allocator: std.mem.Allocator, segments: u32, rings: u32) !Mesh {
             const ny = cp;
             const nz = sp * st;
 
+            // Tangent = partial derivative of position w.r.t. theta (U direction)
+            const tan_x = -st;
+            const tan_z = ct;
+
             verts[vi] = .{
                 .px = r * nx,
                 .py = r * ny,
@@ -133,18 +137,22 @@ pub fn sphere(allocator: std.mem.Allocator, segments: u32, rings: u32) !Mesh {
                 .nz = nz,
                 .u = @as(f32, @floatFromInt(si)) / segs_f,
                 .v = @as(f32, @floatFromInt(ri)) / rows_f,
+                .tx = tan_x,
+                .ty = 0,
+                .tz = tan_z,
+                .tw = 1,
             };
             vi += 1;
         }
     }
 
     // Generate indices
-    const cols: u16 = @intCast(segments + 1);
+    const cols: u32 = @intCast(segments + 1);
     var ii: usize = 0;
     for (0..rows) |ri| {
         for (0..segments) |si| {
-            const row: u16 = @intCast(ri);
-            const col: u16 = @intCast(si);
+            const row: u32 = @intCast(ri);
+            const col: u32 = @intCast(si);
             const tl = row * cols + col;
             const tr = tl + 1;
             const bl = tl + cols;

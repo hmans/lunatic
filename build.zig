@@ -42,6 +42,7 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module) void {
 }
 
 /// Add C include paths for @cImport to a module.
+// TODO: Replace hardcoded /opt/homebrew paths with pkg-config or env vars for cross-platform builds.
 fn addCIncludes(mod: *std.Build.Module, vendor_path: std.Build.LazyPath) void {
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/luajit-2.1" });
@@ -212,6 +213,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "primitives", .components = "examples/primitives/components.zig" },
     };
 
+    const default_run_step = b.step("run", "Run the default example (pbr_test)");
+
     inline for (examples) |ex| {
         const exe = addExample(b, ex.name, ex.components, target, optimize, entt);
         b.installArtifact(exe);
@@ -225,48 +228,14 @@ pub fn build(b: *std.Build) void {
 
         const run_step = b.step("run-" ++ ex.name, "Run the " ++ ex.name ++ " example");
         run_step.dependOn(&run_cmd.step);
-    }
 
-    // Default run step runs pbr_test
-    const default_exe = addExample(b, "pbr_test", null, target, optimize, entt);
-    const default_run = b.addRunArtifact(default_exe);
-    default_run.setCwd(b.path("."));
-    default_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        default_run.addArgs(args);
+        // Default "run" step aliases pbr_test (no double build)
+        if (comptime std.mem.eql(u8, ex.name, "pbr_test")) {
+            default_run_step.dependOn(&run_cmd.step);
+        }
     }
-    const run_step = b.step("run", "Run the default example (pbr_test)");
-    run_step.dependOn(&default_run.step);
 
     // Tests
-    const test_components_mod = b.createModule(.{
-        .root_source_file = b.path("examples/primitives/components.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_components", .module = b.createModule(.{
-                .root_source_file = b.path("src/core_components.zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "lua", .module = b.createModule(.{
-                        .root_source_file = b.path("src/lua.zig"),
-                        .target = target,
-                        .optimize = optimize,
-                        .link_libc = true,
-                    }) },
-                },
-            }) },
-            .{ .name = "lua", .module = b.createModule(.{
-                .root_source_file = b.path("src/lua.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-            }) },
-        },
-    });
-
-    _ = test_components_mod;
 
     // Unit tests for math3d and geometry (standalone, no engine deps)
     const math_tests = b.addTest(.{
@@ -285,10 +254,146 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Integration tests (headless engine + Lua API)
+    const integration_tests = addIntegrationTests(b, target, optimize, entt);
+
     const run_math_tests = b.addRunArtifact(math_tests);
     const run_geometry_tests = b.addRunArtifact(geometry_tests);
+    const run_integration_tests = b.addRunArtifact(integration_tests);
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_math_tests.step);
     test_step.dependOn(&run_geometry_tests.step);
+    test_step.dependOn(&run_integration_tests.step);
+}
+
+/// Build the integration test suite (tests.zig) with the full engine module graph.
+fn addIntegrationTests(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    entt: *std.Build.Dependency,
+) *std.Build.Step.Compile {
+    const ecs_mod = entt.module("zig-ecs");
+    const vendor_path = b.path("vendor");
+
+    const lua_mod = b.createModule(.{
+        .root_source_file = b.path("src/lua.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addCIncludes(lua_mod, vendor_path);
+
+    const core_components_mod = b.createModule(.{
+        .root_source_file = b.path("src/core_components.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "lua", .module = lua_mod },
+        },
+    });
+
+    // Integration tests use primitives components (includes Spin, Player for tag tests)
+    const components_mod = b.createModule(.{
+        .root_source_file = b.path("examples/primitives/components.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_components", .module = core_components_mod },
+            .{ .name = "lua", .module = lua_mod },
+        },
+    });
+
+    const geometry_mod = b.createModule(.{
+        .root_source_file = b.path("src/geometry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const math3d_mod = b.createModule(.{
+        .root_source_file = b.path("src/math3d.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const engine_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zig-ecs", .module = ecs_mod },
+            .{ .name = "lua", .module = lua_mod },
+            .{ .name = "geometry", .module = geometry_mod },
+            .{ .name = "math3d", .module = math3d_mod },
+        },
+    });
+    addCIncludes(engine_mod, vendor_path);
+
+    const renderer_mod = b.createModule(.{
+        .root_source_file = b.path("src/renderer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zig-ecs", .module = ecs_mod },
+            .{ .name = "core_components", .module = core_components_mod },
+            .{ .name = "engine", .module = engine_mod },
+            .{ .name = "geometry", .module = geometry_mod },
+            .{ .name = "math3d", .module = math3d_mod },
+        },
+    });
+
+    const lua_api_mod = b.createModule(.{
+        .root_source_file = b.path("src/lua_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zig-ecs", .module = ecs_mod },
+            .{ .name = "core_components", .module = core_components_mod },
+            .{ .name = "components", .module = components_mod },
+            .{ .name = "engine", .module = engine_mod },
+            .{ .name = "lua", .module = lua_mod },
+            .{ .name = "math3d", .module = math3d_mod },
+        },
+    });
+
+    const gltf_mod = b.createModule(.{
+        .root_source_file = b.path("src/gltf.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = engine_mod },
+            .{ .name = "geometry", .module = geometry_mod },
+        },
+    });
+    addCIncludes(gltf_mod, vendor_path);
+
+    // Wire cross-module deps (same as addExample)
+    engine_mod.addImport("renderer", renderer_mod);
+    engine_mod.addImport("lua_api", lua_api_mod);
+    engine_mod.addImport("gltf", gltf_mod);
+
+    // Renderer needs shader embeds even for tests (module is compiled but not executed in headless)
+    addShaders(b, renderer_mod);
+
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "engine", .module = engine_mod },
+                .{ .name = "lua", .module = lua_mod },
+            },
+        }),
+    });
+
+    addLinkDeps(b, tests);
+
+    return tests;
 }

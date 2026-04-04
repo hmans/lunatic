@@ -128,6 +128,14 @@ pub const Mat4 = struct {
         return result;
     }
 
+    pub fn scale(sx: f32, sy: f32, sz: f32) Mat4 {
+        var result = Mat4.identity();
+        result.m[0][0] = sx;
+        result.m[1][1] = sy;
+        result.m[2][2] = sz;
+        return result;
+    }
+
     pub fn translate(tx: f32, ty: f32, tz: f32) Mat4 {
         var result = Mat4.identity();
         result.m[3][0] = tx;

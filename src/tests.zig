@@ -3,8 +3,8 @@
 
 const std = @import("std");
 const testing = std.testing;
-const Engine = @import("engine.zig").Engine;
-const lua = @import("lua.zig");
+const Engine = @import("engine").Engine;
+const lua = @import("lua");
 const lc = lua.c;
 
 /// Module-level engine instance — pointer-stable across setup/teardown.

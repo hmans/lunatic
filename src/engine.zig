@@ -57,6 +57,61 @@ pub const max_textures = 64;
 pub const max_lua_systems = 64;
 
 // ============================================================
+// Asset store — groups mesh, material, and texture registries
+// ============================================================
+
+pub const AssetStore = struct {
+    mesh_registry: [max_meshes]?MeshData = .{null} ** max_meshes,
+    mesh_names: [max_meshes]?[*:0]const u8 = .{null} ** max_meshes,
+    mesh_count: u32 = 0,
+
+    material_registry: [max_materials]?MaterialData = .{null} ** max_materials,
+    material_names: [max_materials]?[*:0]const u8 = .{null} ** max_materials,
+    material_count: u32 = 0,
+
+    texture_registry: [max_textures]?TextureData = .{null} ** max_textures,
+    texture_count: u32 = 0,
+    default_sampler: ?*c.SDL_GPUSampler = null,
+    dummy_texture: ?*c.SDL_GPUTexture = null,
+
+    /// Look up a named mesh by string. Returns the handle or null.
+    pub fn findMesh(self: *const AssetStore, name: [*:0]const u8) ?u32 {
+        const needle = std.mem.span(name);
+        for (0..self.mesh_count) |i| {
+            if (self.mesh_names[i]) |n| {
+                if (std.mem.eql(u8, std.mem.span(n), needle)) return @intCast(i);
+            }
+        }
+        return null;
+    }
+
+    /// Look up a named material by string. Returns the handle or null.
+    pub fn findMaterial(self: *const AssetStore, name: [*:0]const u8) ?u32 {
+        const needle = std.mem.span(name);
+        for (0..self.material_count) |i| {
+            if (self.material_names[i]) |n| {
+                if (std.mem.eql(u8, std.mem.span(n), needle)) return @intCast(i);
+            }
+        }
+        return null;
+    }
+
+    /// Release all GPU resources held by the asset store.
+    pub fn deinit(self: *AssetStore, device: *c.SDL_GPUDevice) void {
+        for (0..self.texture_count) |i| {
+            if (self.texture_registry[i]) |tex| c.SDL_ReleaseGPUTexture(device, tex.texture);
+        }
+        if (self.default_sampler) |s| c.SDL_ReleaseGPUSampler(device, s);
+        for (0..self.mesh_count) |i| {
+            if (self.mesh_registry[i]) |mesh| {
+                c.SDL_ReleaseGPUBuffer(device, mesh.vertex_buffer);
+                if (mesh.index_buffer) |ib| c.SDL_ReleaseGPUBuffer(device, ib);
+            }
+        }
+    }
+};
+
+// ============================================================
 // Config
 // ============================================================
 
@@ -112,28 +167,18 @@ pub const Engine = struct {
     fog_end: f32 = 30.0,
     fog_color: [3]f32 = .{ 0.08, 0.08, 0.12 },
 
-    // Mesh registry
-    mesh_registry: [max_meshes]?MeshData = .{null} ** max_meshes,
-    mesh_names: [max_meshes]?[*:0]const u8 = .{null} ** max_meshes,
-    mesh_count: u32 = 0,
-
-    // Material registry
-    material_registry: [max_materials]?MaterialData = .{null} ** max_materials,
-    material_names: [max_materials]?[*:0]const u8 = .{null} ** max_materials,
-    material_count: u32 = 0,
-
-    // Texture registry
-    texture_registry: [max_textures]?TextureData = .{null} ** max_textures,
-    texture_count: u32 = 0,
-    default_sampler: ?*c.SDL_GPUSampler = null,
-    dummy_texture: ?*c.SDL_GPUTexture = null,
+    // Asset registries (meshes, materials, textures)
+    assets: AssetStore = .{},
 
     // Draw sorting scratch buffer
     draw_list: [renderer.max_renderables]renderer.DrawEntry = undefined,
 
     // Query cache
-    current_frame: u64 = 0,
+    query_generation: u64 = 0,
     query_cache: [lua_api.max_cached_queries]lua_api.QueryCacheEntry = .{lua_api.QueryCacheEntry{}} ** lua_api.max_cached_queries,
+
+    // Frame counter (main loop only — not used for cache invalidation)
+    current_frame: u64 = 0,
 
     // Lua
     lua_state: ?*lc.lua_State = null,
@@ -177,16 +222,7 @@ pub const Engine = struct {
         if (self.lua_state) |L| lc.lua_close(L);
 
         if (self.gpu_device) |device| {
-            for (0..self.texture_count) |i| {
-                if (self.texture_registry[i]) |tex| c.SDL_ReleaseGPUTexture(device, tex.texture);
-            }
-            if (self.default_sampler) |s| c.SDL_ReleaseGPUSampler(device, s);
-            for (0..self.mesh_count) |i| {
-                if (self.mesh_registry[i]) |mesh| {
-                    c.SDL_ReleaseGPUBuffer(device, mesh.vertex_buffer);
-                    if (mesh.index_buffer) |ib| c.SDL_ReleaseGPUBuffer(device, ib);
-                }
-            }
+            self.assets.deinit(device);
             if (self.msaa_color_texture) |mt| c.SDL_ReleaseGPUTexture(device, mt);
             if (self.depth_texture) |dt| c.SDL_ReleaseGPUTexture(device, dt);
             if (self.pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
@@ -227,6 +263,7 @@ pub const Engine = struct {
             const dt: f32 = @floatCast(smooth_dt);
 
             self.current_frame += 1;
+            self.query_generation += 1;
 
             var event: c.SDL_Event = undefined;
             while (c.SDL_PollEvent(&event)) {
@@ -235,7 +272,7 @@ pub const Engine = struct {
             }
 
             self.runLuaSystems(dt);
-            renderer.renderSystem(self, device);
+            renderer.renderSystem(self, device, dt);
         }
     }
 
@@ -265,7 +302,7 @@ pub const Engine = struct {
         }
 
         // Default sampler (linear filtering, repeat wrap)
-        self.default_sampler = c.SDL_CreateGPUSampler(self.gpu_device.?, &c.SDL_GPUSamplerCreateInfo{
+        self.assets.default_sampler = c.SDL_CreateGPUSampler(self.gpu_device.?, &c.SDL_GPUSamplerCreateInfo{
             .min_filter = c.SDL_GPU_FILTER_LINEAR,
             .mag_filter = c.SDL_GPU_FILTER_LINEAR,
             .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_LINEAR,
@@ -289,7 +326,7 @@ pub const Engine = struct {
 
         // 1x1 white dummy texture (bound when material has no texture)
         const white_pixel = [4]u8{ 255, 255, 255, 255 };
-        self.dummy_texture = try self.createDummyTexture(&white_pixel);
+        self.assets.dummy_texture = try self.createDummyTexture(&white_pixel);
 
         // Pipeline + render targets
         try renderer.initPipeline(self, config);
@@ -315,8 +352,8 @@ pub const Engine = struct {
 
     /// Upload vertex (and optional index) data to the GPU. Returns a mesh handle.
     /// Pass a name for built-in meshes (accessible via `lunatic.mesh.*` in Lua), or null.
-    pub fn createMesh(self: *Engine, name: ?[*:0]const u8, vertices: []const Vertex, indices: ?[]const u16) !u32 {
-        if (self.mesh_count >= max_meshes) return error.TooManyMeshes;
+    pub fn createMesh(self: *Engine, name: ?[*:0]const u8, vertices: []const Vertex, indices: ?[]const u32) !u32 {
+        if (self.assets.mesh_count >= max_meshes) return error.TooManyMeshes;
         const device = self.gpu_device orelse return error.NotInitialized;
         const vbuf = uploadGPUBuffer(device, std.mem.sliceAsBytes(vertices), c.SDL_GPU_BUFFERUSAGE_VERTEX) orelse return error.BufferFailed;
 
@@ -330,15 +367,15 @@ pub const Engine = struct {
             icount = @intCast(idx.len);
         }
 
-        const id = self.mesh_count;
-        self.mesh_registry[id] = .{
+        const id = self.assets.mesh_count;
+        self.assets.mesh_registry[id] = .{
             .vertex_buffer = vbuf,
             .vertex_count = @intCast(vertices.len),
             .index_buffer = ibuf,
             .index_count = icount,
         };
-        self.mesh_names[id] = name;
-        self.mesh_count += 1;
+        self.assets.mesh_names[id] = name;
+        self.assets.mesh_count += 1;
         return id;
     }
 
@@ -362,13 +399,7 @@ pub const Engine = struct {
 
     /// Look up a named mesh by string. Returns the handle or null.
     pub fn findMesh(self: *Engine, name: [*:0]const u8) ?u32 {
-        const needle = std.mem.span(name);
-        for (0..self.mesh_count) |i| {
-            if (self.mesh_names[i]) |n| {
-                if (std.mem.eql(u8, std.mem.span(n), needle)) return @intCast(i);
-            }
-        }
-        return null;
+        return self.assets.findMesh(name);
     }
 
     // ---- Material API ----
@@ -380,37 +411,31 @@ pub const Engine = struct {
 
     /// Create a material with an optional name (accessible via `lunatic.material.*` in Lua).
     pub fn createNamedMaterial(self: *Engine, name: ?[*:0]const u8, data: MaterialData) !u32 {
-        if (self.material_count >= max_materials) return error.TooManyMaterials;
-        const id = self.material_count;
-        self.material_registry[id] = data;
-        self.material_names[id] = name;
-        self.material_count += 1;
+        if (self.assets.material_count >= max_materials) return error.TooManyMaterials;
+        const id = self.assets.material_count;
+        self.assets.material_registry[id] = data;
+        self.assets.material_names[id] = name;
+        self.assets.material_count += 1;
         return id;
     }
 
     /// Look up a named material by string. Returns the handle or null.
     pub fn findMaterial(self: *Engine, name: [*:0]const u8) ?u32 {
-        const needle = std.mem.span(name);
-        for (0..self.material_count) |i| {
-            if (self.material_names[i]) |n| {
-                if (std.mem.eql(u8, std.mem.span(n), needle)) return @intCast(i);
-            }
-        }
-        return null;
+        return self.assets.findMaterial(name);
     }
 
     fn createDummyTexture(self: *Engine, pixel: *const [4]u8) !*c.SDL_GPUTexture {
         const id = try self.createTextureFromMemory(pixel, 1, 1);
-        return self.texture_registry[id].?.texture;
+        return self.assets.texture_registry[id].?.texture;
     }
 
     // ---- Texture API ----
 
     /// Create a texture from raw RGBA pixel data. Returns a texture handle.
     pub fn createTextureFromMemory(self: *Engine, pixels: [*]const u8, width: u32, height: u32) !u32 {
-        if (self.texture_count >= max_textures) return error.TooManyTextures;
+        if (self.assets.texture_count >= max_textures) return error.TooManyTextures;
         const device = self.gpu_device orelse return error.NotInitialized;
-        const sampler = self.default_sampler orelse return error.NotInitialized;
+        const sampler = self.assets.default_sampler orelse return error.NotInitialized;
 
         const tex = c.SDL_CreateGPUTexture(device, &c.SDL_GPUTextureCreateInfo{
             .type = c.SDL_GPU_TEXTURETYPE_2D,
@@ -474,14 +499,14 @@ pub const Engine = struct {
         _ = c.SDL_SubmitGPUCommandBuffer(cmd);
         c.SDL_ReleaseGPUTransferBuffer(device, transfer);
 
-        const id = self.texture_count;
-        self.texture_registry[id] = .{
+        const id = self.assets.texture_count;
+        self.assets.texture_registry[id] = .{
             .texture = tex,
             .sampler = sampler,
             .width = width,
             .height = height,
         };
-        self.texture_count += 1;
+        self.assets.texture_count += 1;
         return id;
     }
 

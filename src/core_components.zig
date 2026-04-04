@@ -19,12 +19,12 @@ pub const Rotation = struct {
 
 pub const MeshHandle = struct {
     id: u32 = 0,
-    pub const lua_name = "mesh";
+    pub const Lua = lua.Component("mesh", @This());
 };
 
 pub const MaterialHandle = struct {
     id: u32 = 0,
-    pub const lua_name = "material";
+    pub const Lua = lua.Component("material", @This());
 };
 
 pub const Camera = struct {
@@ -48,13 +48,20 @@ pub const DirectionalLight = struct {
     pub const Lua = lua.Component("directional_light", @This());
 };
 
+pub const Scale = struct {
+    x: f32 = 1,
+    y: f32 = 1,
+    z: f32 = 1,
+    pub const Lua = lua.Component("scale", @This());
+};
+
 pub const LookAt = struct {
     target: u32 = 0,
-    pub const lua_name = "look_at";
+    pub const Lua = lua.Component("look_at", @This());
 };
 
 /// Core component tuple — engine modules reference these directly.
-pub const all = .{ Position, Rotation, MeshHandle, MaterialHandle, Camera, DirectionalLight, LookAt };
+pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, LookAt };
 
 /// Concatenate core components with example-specific ones.
 /// Usage: `pub const all = core.withExtra(.{ Spin, Player });`

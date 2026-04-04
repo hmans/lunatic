@@ -17,6 +17,7 @@ const Rotation = components.Rotation;
 const Camera = components.Camera;
 const DirectionalLight = components.DirectionalLight;
 const LookAt = components.LookAt;
+const Scale = components.Scale;
 const MeshHandle = components.MeshHandle;
 const MaterialHandle = components.MaterialHandle;
 
@@ -250,12 +251,13 @@ pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
 
 fn resolveTexture(self: *Engine, tex_id: ?u32, dummy: *c.SDL_GPUTexture) *c.SDL_GPUTexture {
     if (tex_id) |id| {
-        if (self.texture_registry[id]) |tex| return tex.texture;
+        if (self.assets.texture_registry[id]) |tex| return tex.texture;
     }
     return dummy;
 }
 
-pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
+pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice, dt: f32) void {
+    _ = dt; // Available for future use (GPU-side animation, particle systems, etc.)
     const cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse return;
 
     var swapchain_tex: ?*c.SDL_GPUTexture = null;
@@ -272,7 +274,7 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
 
     // Recreate render targets if swapchain dimensions changed
     if (sw_w != self.rt_w or sw_h != self.rt_h) {
-        if (self.depth_texture) |dt| c.SDL_ReleaseGPUTexture(device, dt);
+        if (self.depth_texture) |old_dt| c.SDL_ReleaseGPUTexture(device, old_dt);
         self.depth_texture = createDepthTexture(device, sw_w, sw_h, self.sample_count);
         if (self.sample_count.isMultisample()) {
             if (self.msaa_color_texture) |mt| c.SDL_ReleaseGPUTexture(device, mt);
@@ -444,22 +446,22 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
             const rot = self.registry.getConst(Rotation, entry.entity);
             const mesh_id: u32 = @truncate(entry.sort_key >> 32);
             const mat_id: u32 = @truncate(entry.sort_key);
-            const mesh = self.mesh_registry[mesh_id] orelse continue;
+            const mesh = self.assets.mesh_registry[mesh_id] orelse continue;
 
             if (bound_mesh == null or bound_mesh.? != mesh_id) {
                 const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.vertex_buffer, .offset = 0 };
                 c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
                 if (mesh.index_buffer) |ib| {
-                    c.SDL_BindGPUIndexBuffer(render_pass, &c.SDL_GPUBufferBinding{ .buffer = ib, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_16BIT);
+                    c.SDL_BindGPUIndexBuffer(render_pass, &c.SDL_GPUBufferBinding{ .buffer = ib, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
                 }
                 bound_mesh = mesh_id;
             }
 
             if (bound_mat == null or bound_mat.? != mat_id) {
-                const sampler = self.default_sampler.?;
-                const dummy = self.dummy_texture.?;
+                const sampler = self.assets.default_sampler.?;
+                const dummy = self.assets.dummy_texture.?;
 
-                if (self.material_registry[mat_id]) |mat| {
+                if (self.assets.material_registry[mat_id]) |mat| {
                     const has_bc: f32 = if (mat.base_color_texture != null) 1.0 else 0.0;
                     const has_mr: f32 = if (mat.metallic_roughness_texture != null) 1.0 else 0.0;
                     const has_nm: f32 = if (mat.normal_texture != null) 1.0 else 0.0;
@@ -497,7 +499,11 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
             }
 
             const rotation = Mat4.mul(Mat4.mul(Mat4.rotateZ(rot.z), Mat4.rotateY(rot.y)), Mat4.rotateX(rot.x));
-            const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), rotation);
+            const scl = if (self.registry.tryGet(Scale, entry.entity)) |s|
+                Mat4.scale(s.x, s.y, s.z)
+            else
+                Mat4.identity();
+            const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), Mat4.mul(rotation, scl));
             const mvp = Mat4.mul(vp, model);
 
             const vert_uniforms = VertexUniforms{ .mvp = mvp.m, .model = model.m };

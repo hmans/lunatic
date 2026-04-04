@@ -102,7 +102,7 @@ fn queryHash(entries: []const QueryEntry, count: usize) u64 {
 
 fn findCachedQuery(self: *Engine, hash: u64) ?usize {
     for (0..max_cached_queries) |i| {
-        if (self.query_cache[i].hash == hash and self.query_cache[i].frame == self.current_frame) {
+        if (self.query_cache[i].hash == hash and self.query_cache[i].frame == self.query_generation) {
             return i;
         }
     }
@@ -223,8 +223,8 @@ pub fn publishHandlesToLua(self: *Engine) void {
     lc.lua_getglobal(L, "lunatic");
 
     lc.lua_newtable(L);
-    for (0..self.mesh_count) |i| {
-        if (self.mesh_names[i]) |name| {
+    for (0..self.assets.mesh_count) |i| {
+        if (self.assets.mesh_names[i]) |name| {
             lc.lua_pushinteger(L, @intCast(i));
             lc.lua_setfield(L, -2, name);
         }
@@ -232,8 +232,8 @@ pub fn publishHandlesToLua(self: *Engine) void {
     lc.lua_setfield(L, -2, "mesh");
 
     lc.lua_newtable(L);
-    for (0..self.material_count) |i| {
-        if (self.material_names[i]) |name| {
+    for (0..self.assets.material_count) |i| {
+        if (self.assets.material_names[i]) |name| {
             lc.lua_pushinteger(L, @intCast(i));
             lc.lua_setfield(L, -2, name);
         }
@@ -433,6 +433,32 @@ fn luaCreateMaterial(L: ?*lc.lua_State) callconv(.c) c_int {
     }
     lc.lua_pop(L, 1);
 
+    lc.lua_getfield(L, 1, "metallic");
+    if (lc.lua_type(L, -1) == lc.LUA_TNUMBER) {
+        data.metallic = @floatCast(lc.lua_tonumber(L, -1));
+    }
+    lc.lua_pop(L, 1);
+
+    lc.lua_getfield(L, 1, "roughness");
+    if (lc.lua_type(L, -1) == lc.LUA_TNUMBER) {
+        data.roughness = @floatCast(lc.lua_tonumber(L, -1));
+    }
+    lc.lua_pop(L, 1);
+
+    lc.lua_getfield(L, 1, "emissive");
+    if (lc.lua_type(L, -1) == lc.LUA_TTABLE) {
+        lc.lua_rawgeti(L, -1, 1);
+        data.emissive[0] = @floatCast(lc.luaL_optnumber(L, -1, 0.0));
+        lc.lua_pop(L, 1);
+        lc.lua_rawgeti(L, -1, 2);
+        data.emissive[1] = @floatCast(lc.luaL_optnumber(L, -1, 0.0));
+        lc.lua_pop(L, 1);
+        lc.lua_rawgeti(L, -1, 3);
+        data.emissive[2] = @floatCast(lc.luaL_optnumber(L, -1, 0.0));
+        lc.lua_pop(L, 1);
+    }
+    lc.lua_pop(L, 1);
+
     const id = self.createMaterial(data) catch {
         _ = lc.luaL_error(L, "too many materials");
         unreachable;
@@ -444,7 +470,7 @@ fn luaCreateMaterial(L: ?*lc.lua_State) callconv(.c) c_int {
 fn luaSpawn(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const entity = self.registry.create();
-    self.current_frame +%= 1; // invalidate query cache
+    self.query_generation +%= 1; // invalidate query cache
     const entity_int: u32 = @bitCast(entity);
     lc.lua_pushinteger(L, @intCast(entity_int));
     return 1;
@@ -454,7 +480,7 @@ fn luaDestroy(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const entity = entityFromLua(self, L, 1);
     self.registry.destroy(entity);
-    self.current_frame +%= 1; // invalidate query cache
+    self.query_generation +%= 1; // invalidate query cache
     return 0;
 }
 
@@ -465,7 +491,16 @@ fn luaAdd(L: ?*lc.lua_State) callconv(.c) c_int {
 
     inline for (components.all) |T| {
         if (std.mem.eql(u8, name, lua.nameOf(T))) {
-            if (comptime lua.isTag(T)) {
+            // MeshHandle/MaterialHandle: support string name resolution (e.g. "cube", "default")
+            if (comptime T == MeshHandle) {
+                const mesh_id = resolveHandle(self, L, 3, .mesh);
+                self.registry.addOrReplace(entity, MeshHandle{ .id = mesh_id });
+                return 0;
+            } else if (comptime T == MaterialHandle) {
+                const mat_id = resolveHandle(self, L, 3, .material);
+                self.registry.addOrReplace(entity, MaterialHandle{ .id = mat_id });
+                return 0;
+            } else if (comptime lua.isTag(T)) {
                 self.registry.addOrReplace(entity, T{});
                 return 0;
             } else if (comptime @hasDecl(T, "Lua")) {
@@ -473,24 +508,6 @@ fn luaAdd(L: ?*lc.lua_State) callconv(.c) c_int {
                 return 0;
             }
         }
-    }
-
-    if (std.mem.eql(u8, name, lua.nameOf(MeshHandle))) {
-        const mesh_id = resolveHandle(self, L, 3, .mesh);
-        self.registry.addOrReplace(entity, MeshHandle{ .id = mesh_id });
-        return 0;
-    }
-
-    if (std.mem.eql(u8, name, lua.nameOf(MaterialHandle))) {
-        const mat_id = resolveHandle(self, L, 3, .material);
-        self.registry.addOrReplace(entity, MaterialHandle{ .id = mat_id });
-        return 0;
-    }
-
-    if (std.mem.eql(u8, name, lua.nameOf(LookAt))) {
-        const target_id: u32 = @intCast(lc.luaL_checkinteger(L, 3));
-        self.registry.addOrReplace(entity, LookAt{ .target = target_id });
-        return 0;
     }
 
     _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, 2, null));
@@ -514,29 +531,6 @@ fn luaGet(L: ?*lc.lua_State) callconv(.c) c_int {
                 return 0;
             }
         }
-    }
-
-    // Handle types without auto-bindings
-    if (std.mem.eql(u8, name, lua.nameOf(core.MeshHandle))) {
-        if (self.registry.tryGet(core.MeshHandle, entity)) |mh| {
-            lc.lua_pushinteger(L, @intCast(mh.id));
-            return 1;
-        }
-        return 0;
-    }
-    if (std.mem.eql(u8, name, lua.nameOf(core.MaterialHandle))) {
-        if (self.registry.tryGet(core.MaterialHandle, entity)) |mh| {
-            lc.lua_pushinteger(L, @intCast(mh.id));
-            return 1;
-        }
-        return 0;
-    }
-    if (std.mem.eql(u8, name, lua.nameOf(core.LookAt))) {
-        if (self.registry.tryGet(core.LookAt, entity)) |la| {
-            lc.lua_pushinteger(L, @intCast(la.target));
-            return 1;
-        }
-        return 0;
     }
 
     _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, 2, null));
@@ -604,7 +598,7 @@ fn luaQuery(L: ?*lc.lua_State) callconv(.c) c_int {
     }
     self.query_cache[slot] = .{
         .lua_ref = lc.luaL_ref(L, lc.LUA_REGISTRYINDEX),
-        .frame = self.current_frame,
+        .frame = self.query_generation,
         .hash = hash,
     };
 

@@ -182,12 +182,12 @@ fn loadPrimitive(engine: *Engine, allocator: std.mem.Allocator, prim: *const cgl
     }
 
     // Read indices
-    var indices: ?[]u16 = null;
+    var indices: ?[]u32 = null;
     defer if (indices) |idx| allocator.free(idx);
 
     if (prim.indices) |idx_acc_ptr| {
         const idx_count = idx_acc_ptr.*.count;
-        var idx = try allocator.alloc(u16, idx_count);
+        var idx = try allocator.alloc(u32, idx_count);
         for (0..idx_count) |ii| {
             idx[ii] = @intCast(cgltf.cgltf_accessor_read_index(idx_acc_ptr, ii));
         }
