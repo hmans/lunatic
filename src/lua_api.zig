@@ -242,7 +242,10 @@ pub fn publishHandlesToLua(self: *Engine) void {
 // ============================================================
 
 fn getEngine(L: ?*lc.lua_State) *Engine {
-    return @ptrCast(@alignCast(lc.lua_touserdata(L, lc.LUA_GLOBALSINDEX - 1)));
+    const ptr = lc.lua_touserdata(L, lc.LUA_GLOBALSINDEX - 1) orelse {
+        @panic("getEngine: missing engine upvalue");
+    };
+    return @ptrCast(@alignCast(ptr));
 }
 
 fn entityFromLua(self: *Engine, L: ?*lc.lua_State, idx: c_int) ecs.Entity {
@@ -370,7 +373,10 @@ fn luaCreateMaterial(L: ?*lc.lua_State) callconv(.c) c_int {
     }
     lc.lua_pop(L, 1);
 
-    const id = self.createMaterial(data);
+    const id = self.createMaterial(data) catch {
+        _ = lc.luaL_error(L, "too many materials");
+        unreachable;
+    };
     lc.lua_pushinteger(L, @intCast(id));
     return 1;
 }
@@ -378,6 +384,7 @@ fn luaCreateMaterial(L: ?*lc.lua_State) callconv(.c) c_int {
 fn luaSpawn(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const entity = self.registry.create();
+    self.current_frame +%= 1; // invalidate query cache
     const entity_int: u32 = @bitCast(entity);
     lc.lua_pushinteger(L, @intCast(entity_int));
     return 1;
@@ -387,6 +394,7 @@ fn luaDestroy(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const entity = entityFromLua(self, L, 1);
     self.registry.destroy(entity);
+    self.current_frame +%= 1; // invalidate query cache
     return 0;
 }
 
@@ -446,6 +454,29 @@ fn luaGet(L: ?*lc.lua_State) callconv(.c) c_int {
                 return 0;
             }
         }
+    }
+
+    // Handle types without auto-bindings
+    if (std.mem.eql(u8, name, lua.nameOf(components.MeshHandle))) {
+        if (self.registry.tryGet(components.MeshHandle, entity)) |mh| {
+            lc.lua_pushinteger(L, @intCast(mh.id));
+            return 1;
+        }
+        return 0;
+    }
+    if (std.mem.eql(u8, name, lua.nameOf(components.MaterialHandle))) {
+        if (self.registry.tryGet(components.MaterialHandle, entity)) |mh| {
+            lc.lua_pushinteger(L, @intCast(mh.id));
+            return 1;
+        }
+        return 0;
+    }
+    if (std.mem.eql(u8, name, lua.nameOf(components.LookAt))) {
+        if (self.registry.tryGet(components.LookAt, entity)) |la| {
+            lc.lua_pushinteger(L, @intCast(la.target));
+            return 1;
+        }
+        return 0;
     }
 
     _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, 2, null));

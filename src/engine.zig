@@ -146,6 +146,9 @@ pub const Engine = struct {
         if (self.lua_state) |L| lc.lua_close(L);
 
         if (self.gpu_device) |device| {
+            for (0..self.mesh_count) |i| {
+                if (self.mesh_registry[i]) |mesh| c.SDL_ReleaseGPUBuffer(device, mesh.buffer);
+            }
             if (self.msaa_color_texture) |mt| c.SDL_ReleaseGPUTexture(device, mt);
             if (self.depth_texture) |dt| c.SDL_ReleaseGPUTexture(device, dt);
             if (self.pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
@@ -236,12 +239,13 @@ pub const Engine = struct {
         _ = try self.createMesh("sphere", sphere_verts);
 
         // Built-in materials
-        _ = self.createNamedMaterial("default", .{});
+        _ = try self.createNamedMaterial("default", .{});
     }
 
     // ---- Mesh API ----
 
     pub fn createMesh(self: *Engine, name: ?[*:0]const u8, vertices: []const Vertex) !u32 {
+        if (self.mesh_count >= max_meshes) return error.TooManyMeshes;
         const device = self.gpu_device orelse return error.NotInitialized;
         const buf = uploadVertexData(device, std.mem.sliceAsBytes(vertices)) orelse return error.BufferFailed;
         const id = self.mesh_count;
@@ -277,11 +281,12 @@ pub const Engine = struct {
 
     // ---- Material API ----
 
-    pub fn createMaterial(self: *Engine, data: MaterialData) u32 {
+    pub fn createMaterial(self: *Engine, data: MaterialData) !u32 {
         return self.createNamedMaterial(null, data);
     }
 
-    pub fn createNamedMaterial(self: *Engine, name: ?[*:0]const u8, data: MaterialData) u32 {
+    pub fn createNamedMaterial(self: *Engine, name: ?[*:0]const u8, data: MaterialData) !u32 {
+        if (self.material_count >= max_materials) return error.TooManyMaterials;
         const id = self.material_count;
         self.material_registry[id] = data;
         self.material_names[id] = name;
@@ -319,7 +324,13 @@ pub const Engine = struct {
     }
 
     pub fn resetSystems(self: *Engine) void {
+        if (self.lua_state) |L| {
+            for (0..self.lua_system_count) |i| {
+                lc.luaL_unref(L, lc.LUA_REGISTRYINDEX, self.lua_system_refs[i]);
+            }
+        }
         self.lua_system_count = 0;
+        self.lua_system_refs = .{0} ** max_lua_systems;
         self.lua_system_disabled = .{false} ** max_lua_systems;
     }
 };

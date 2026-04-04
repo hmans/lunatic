@@ -281,7 +281,10 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
         var light_iter = light_view.entityIterator();
         if (light_iter.next()) |light_entity| {
             const dl = light_view.getConst(light_entity);
-            light_dir = .{ dl.dir_x, dl.dir_y, dl.dir_z, 0.0 };
+            const len_sq = dl.dir_x * dl.dir_x + dl.dir_y * dl.dir_y + dl.dir_z * dl.dir_z;
+            if (len_sq > 1e-8) {
+                light_dir = .{ dl.dir_x, dl.dir_y, dl.dir_z, 0.0 };
+            }
         }
     }
 
@@ -376,8 +379,10 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
         const eye = Vec3.new(cam_pos.x, cam_pos.y, cam_pos.z);
         const view = if (self.registry.tryGet(LookAt, cam_entity)) |look_at| blk: {
             const target_entity: ecs.Entity = @bitCast(look_at.target);
-            if (self.registry.tryGet(Position, target_entity)) |target_pos| {
-                break :blk Mat4.lookAt(eye, Vec3.new(target_pos.x, target_pos.y, target_pos.z), Vec3.new(0, 1, 0));
+            if (self.registry.valid(target_entity)) {
+                if (self.registry.tryGet(Position, target_entity)) |target_pos| {
+                    break :blk Mat4.lookAt(eye, Vec3.new(target_pos.x, target_pos.y, target_pos.z), Vec3.new(0, 1, 0));
+                }
             }
             break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
         } else if (self.registry.tryGet(Rotation, cam_entity)) |cam_rot| blk: {

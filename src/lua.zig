@@ -41,6 +41,8 @@ pub fn Component(comptime name: []const u8, comptime Self: type) type {
                     @field(result, field.name) = @floatCast(c.luaL_checknumber(L, idx));
                 } else if (comptime field.type == u32) {
                     @field(result, field.name) = @intCast(c.luaL_checkinteger(L, idx));
+                } else {
+                    @compileError("lua.Component: unsupported field type '" ++ @typeName(field.type) ++ "' on field '" ++ field.name ++ "'");
                 }
             }
             return result;
@@ -52,6 +54,8 @@ pub fn Component(comptime name: []const u8, comptime Self: type) type {
                     c.lua_pushnumber(L, @field(self, field.name));
                 } else if (comptime field.type == u32) {
                     c.lua_pushinteger(L, @intCast(@field(self, field.name)));
+                } else {
+                    @compileError("lua.Component: unsupported field type '" ++ @typeName(field.type) ++ "' on field '" ++ field.name ++ "'");
                 }
             }
             return @intCast(fields.len);
