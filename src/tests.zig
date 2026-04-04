@@ -334,6 +334,98 @@ test "each with single component" {
 }
 
 // ============================================================
+// Persistent queries (create_query / each_query)
+// ============================================================
+
+test "create_query and each_query iterate matching entities" {
+    const L = try setup();
+    defer teardown();
+    try run(L,
+        \\local a = lunatic.spawn()
+        \\lunatic.add(a, "position", 1, 2, 3)
+        \\lunatic.add(a, "rotation", 0, 0, 0)
+        \\
+        \\local b = lunatic.spawn()
+        \\lunatic.add(b, "position", 4, 5, 6)
+        \\-- b has no rotation
+        \\
+        \\local q = lunatic.create_query("position", "rotation")
+        \\local count = 0
+        \\lunatic.each_query(q, function(e)
+        \\  count = count + 1
+        \\end)
+        \\assert(count == 1, "expected 1, got " .. count)
+    );
+}
+
+test "live query updates when components are added" {
+    const L = try setup();
+    defer teardown();
+    try run(L,
+        \\local q = lunatic.create_query("position", "rotation")
+        \\
+        \\local e = lunatic.spawn()
+        \\lunatic.add(e, "position", 0, 0, 0)
+        \\-- not yet in query (missing rotation)
+        \\
+        \\local count = 0
+        \\lunatic.each_query(q, function(ent) count = count + 1 end)
+        \\assert(count == 0, "expected 0 before adding rotation, got " .. count)
+        \\
+        \\lunatic.add(e, "rotation", 0, 0, 0)
+        \\-- now matches
+        \\
+        \\count = 0
+        \\lunatic.each_query(q, function(ent) count = count + 1 end)
+        \\assert(count == 1, "expected 1 after adding rotation, got " .. count)
+    );
+}
+
+test "live query updates when components are removed" {
+    const L = try setup();
+    defer teardown();
+    try run(L,
+        \\local e = lunatic.spawn()
+        \\lunatic.add(e, "position", 0, 0, 0)
+        \\lunatic.add(e, "rotation", 0, 0, 0)
+        \\
+        \\local q = lunatic.create_query("position", "rotation")
+        \\
+        \\local count = 0
+        \\lunatic.each_query(q, function(ent) count = count + 1 end)
+        \\assert(count == 1, "expected 1 before remove, got " .. count)
+        \\
+        \\lunatic.remove(e, "rotation")
+        \\
+        \\count = 0
+        \\lunatic.each_query(q, function(ent) count = count + 1 end)
+        \\assert(count == 0, "expected 0 after remove, got " .. count)
+    );
+}
+
+test "live query updates when entity is destroyed" {
+    const L = try setup();
+    defer teardown();
+    try run(L,
+        \\local e = lunatic.spawn()
+        \\lunatic.add(e, "position", 0, 0, 0)
+        \\lunatic.add(e, "rotation", 0, 0, 0)
+        \\
+        \\local q = lunatic.create_query("position", "rotation")
+        \\
+        \\local count = 0
+        \\lunatic.each_query(q, function(ent) count = count + 1 end)
+        \\assert(count == 1)
+        \\
+        \\lunatic.destroy(e)
+        \\
+        \\count = 0
+        \\lunatic.each_query(q, function(ent) count = count + 1 end)
+        \\assert(count == 0)
+    );
+}
+
+// ============================================================
 // Systems
 // ============================================================
 

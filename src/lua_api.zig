@@ -68,6 +68,8 @@ pub fn registerLuaApi(self: *Engine) void {
         .{ "remove", &luaRemove },
         .{ "query", &luaQuery },
         .{ "each", &luaEach },
+        .{ "create_query", &luaCreateQuery },
+        .{ "each_query", &luaEachQuery },
         .{ "ref", &luaRef },
         .{ "create_material", &luaCreateMaterial },
         .{ "create_cube_mesh", &luaCreateCubeMesh },
@@ -192,6 +194,7 @@ fn luaSpawn(L: ?*lc.lua_State) callconv(.c) c_int {
 fn luaDestroy(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const entity = entityFromLua(self, L, 1);
+    removeFromAllLiveQueries(self, @bitCast(entity));
     self.registry.destroy(entity);
     return 0;
 }
@@ -202,6 +205,7 @@ fn luaAdd(L: ?*lc.lua_State) callconv(.c) c_int {
     const name = componentName(L, 2);
     if (findOps(name)) |found| {
         found.ops.addFn(self, entity, L, 3);
+        updateLiveQueries(self, entity);
         return 0;
     }
     _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, 2, null));
@@ -225,6 +229,7 @@ fn luaRemove(L: ?*lc.lua_State) callconv(.c) c_int {
     const name = componentName(L, 2);
     if (findOps(name)) |found| {
         found.ops.removeFn(&self.registry, entity);
+        updateLiveQueries(self, entity);
         return 0;
     }
     _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, 2, null));
@@ -232,35 +237,102 @@ fn luaRemove(L: ?*lc.lua_State) callconv(.c) c_int {
 }
 
 // ============================================================
-// Query — cacheless table builder
+// Live queries — persistent, self-updating entity sets
 // ============================================================
 
-fn luaQuery(L: ?*lc.lua_State) callconv(.c) c_int {
-    const self = getEngine(L);
-    const nargs = lc.lua_gettop(L);
-    if (nargs == 0) {
-        _ = lc.luaL_error(L, "query requires at least one component name");
-        return 0;
+pub const max_live_queries = 32;
+const allocator = std.heap.c_allocator;
+
+/// A persistent query that maintains a set of matching entities.
+/// Updated incrementally when components are added/removed/destroyed.
+pub const LiveQuery = struct {
+    mask: u32 = 0, // bitmask over ops_table indices
+    entities: std.ArrayListUnmanaged(u32) = .{},
+    index_of: std.AutoHashMapUnmanaged(u32, u32) = .{}, // entity_id → dense index
+
+    pub fn deinit(self: *LiveQuery) void {
+        self.entities.deinit(allocator);
+        self.index_of.deinit(allocator);
     }
 
-    var ops: [16]ComponentOps = undefined;
-    const count: usize = @intCast(nargs);
-    if (count > 16) {
-        _ = lc.luaL_error(L, "query supports at most 16 components");
-        return 0;
+    pub fn contains(self: *const LiveQuery, entity_id: u32) bool {
+        return self.index_of.contains(entity_id);
     }
 
+    pub fn add(self: *LiveQuery, entity_id: u32) void {
+        if (self.index_of.contains(entity_id)) return;
+        const idx: u32 = @intCast(self.entities.items.len);
+        self.entities.append(allocator, entity_id) catch return;
+        self.index_of.put(allocator, entity_id, idx) catch return;
+    }
+
+    pub fn remove(self: *LiveQuery, entity_id: u32) void {
+        const idx = self.index_of.get(entity_id) orelse return;
+        const last: u32 = @intCast(self.entities.items.len - 1);
+        if (idx != last) {
+            const moved = self.entities.items[last];
+            self.entities.items[idx] = moved;
+            self.index_of.putAssumeCapacity(moved, idx);
+        }
+        self.entities.items.len -= 1;
+        _ = self.index_of.remove(entity_id);
+    }
+
+    pub fn data(self: *const LiveQuery) []const u32 {
+        return self.entities.items;
+    }
+};
+
+/// Check whether an entity has all components indicated by the mask.
+fn entityMatchesMask(registry: *ecs.Registry, entity: ecs.Entity, mask: u32) bool {
+    var m = mask;
+    while (m != 0) {
+        const bit: u5 = @intCast(@ctz(m));
+        if (!ops_table[bit].hasFn(registry, entity)) return false;
+        m &= m - 1;
+    }
+    return true;
+}
+
+/// After a component is added or removed, update all live queries for this entity.
+fn updateLiveQueries(self: *Engine, entity: ecs.Entity) void {
+    const entity_id: u32 = @bitCast(entity);
+    for (self.live_queries[0..self.live_query_count]) |*lq| {
+        const matches = entityMatchesMask(&self.registry, entity, lq.mask);
+        const present = lq.contains(entity_id);
+        if (matches and !present) {
+            lq.add(entity_id);
+        } else if (!matches and present) {
+            lq.remove(entity_id);
+        }
+    }
+}
+
+/// Remove an entity from all live queries (called before destroy).
+fn removeFromAllLiveQueries(self: *Engine, entity_id: u32) void {
+    for (self.live_queries[0..self.live_query_count]) |*lq| {
+        lq.remove(entity_id);
+    }
+}
+
+// ============================================================
+// Query — ad-hoc table builder (convenience API, not cached)
+// ============================================================
+
+fn resolveQueryOps(L: ?*lc.lua_State, ops: []ComponentOps, count: usize) bool {
     for (0..count) |i| {
         const name = std.mem.span(lc.luaL_checklstring(L, @intCast(i + 1), null));
         if (findOps(name)) |found| {
             ops[i] = found.ops;
         } else {
             _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, @intCast(i + 1), null));
-            return 0;
+            return false;
         }
     }
+    return true;
+}
 
-    // Find smallest component set to iterate
+fn findSmallestAndBuild(self: *Engine, L: ?*lc.lua_State, ops: []const ComponentOps, count: usize) void {
     var smallest_idx: usize = 0;
     var smallest_len: usize = ops[0].lenFn(&self.registry);
     for (1..count) |i| {
@@ -291,7 +363,24 @@ fn luaQuery(L: ?*lc.lua_State) callconv(.c) c_int {
             table_idx += 1;
         }
     }
+}
 
+fn luaQuery(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const nargs = lc.lua_gettop(L);
+    if (nargs == 0) {
+        _ = lc.luaL_error(L, "query requires at least one component name");
+        return 0;
+    }
+    const count: usize = @intCast(nargs);
+    if (count > 16) {
+        _ = lc.luaL_error(L, "query supports at most 16 components");
+        return 0;
+    }
+
+    var ops: [16]ComponentOps = undefined;
+    if (!resolveQueryOps(L, &ops, count)) return 0;
+    findSmallestAndBuild(self, L, ops[0..count], count);
     return 1;
 }
 
@@ -358,6 +447,87 @@ fn luaEach(L: ?*lc.lua_State) callconv(.c) c_int {
         }
     }
 
+    return 0;
+}
+
+// ============================================================
+// Persistent queries — create_query / each_query
+// ============================================================
+
+fn luaCreateQuery(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const nargs = lc.lua_gettop(L);
+    if (nargs == 0) {
+        _ = lc.luaL_error(L, "create_query requires at least one component name");
+        return 0;
+    }
+    if (self.live_query_count >= max_live_queries) {
+        _ = lc.luaL_error(L, "too many live queries (max %d)", @as(c_int, max_live_queries));
+        return 0;
+    }
+
+    // Build mask and resolve ops for initial population
+    var mask: u32 = 0;
+    var ops: [16]ComponentOps = undefined;
+    const count: usize = @intCast(nargs);
+    if (count > 16) {
+        _ = lc.luaL_error(L, "create_query supports at most 16 components");
+        return 0;
+    }
+    for (0..count) |i| {
+        const name = std.mem.span(lc.luaL_checklstring(L, @intCast(i + 1), null));
+        if (findOps(name)) |found| {
+            mask |= @as(u32, 1) << @as(u5, @intCast(found.index));
+            ops[i] = found.ops;
+        } else {
+            _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, @intCast(i + 1), null));
+            return 0;
+        }
+    }
+
+    // Initialize
+    const idx = self.live_query_count;
+    self.live_queries[idx] = .{ .mask = mask };
+    self.live_query_count += 1;
+
+    // Populate with existing matching entities (iterate smallest set, filter)
+    var smallest_idx: usize = 0;
+    var smallest_len: usize = ops[0].lenFn(&self.registry);
+    for (1..count) |i| {
+        const l = ops[i].lenFn(&self.registry);
+        if (l < smallest_len) {
+            smallest_len = l;
+            smallest_idx = i;
+        }
+    }
+    const entity_list = ops[smallest_idx].dataFn(&self.registry);
+    for (entity_list) |entity| {
+        if (entityMatchesMask(&self.registry, entity, mask)) {
+            self.live_queries[idx].add(@bitCast(entity));
+        }
+    }
+
+    // Return 1-based handle
+    lc.lua_pushinteger(L, @intCast(idx + 1));
+    return 1;
+}
+
+fn luaEachQuery(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const handle: u32 = @intCast(lc.luaL_checkinteger(L, 1));
+    lc.luaL_checktype(L, 2, lc.LUA_TFUNCTION);
+
+    if (handle == 0 or handle > self.live_query_count) {
+        _ = lc.luaL_error(L, "invalid query handle %d", @as(c_int, @intCast(handle)));
+        return 0;
+    }
+
+    const entities = self.live_queries[handle - 1].data();
+    for (entities) |entity_id| {
+        lc.lua_pushvalue(L, 2);
+        lc.lua_pushinteger(L, @intCast(entity_id));
+        lc.lua_call(L, 1, 0);
+    }
     return 0;
 }
 

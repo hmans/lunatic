@@ -35,9 +35,11 @@ for x = -4, 4 do
   end
 end
 
--- Spin system
+-- Spin system (uses a persistent query — entity set maintained automatically)
+local spinners = lunatic.create_query("rotation", "spin")
+
 lunatic.system("spin", function(dt)
-  lunatic.each("rotation", "spin", function(e)
+  lunatic.each_query(spinners, function(e)
     local rot = lunatic.ref(e, "rotation")
     local spin = lunatic.ref(e, "spin")
     rot.y = rot.y + spin.speed * dt

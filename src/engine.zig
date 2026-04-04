@@ -177,6 +177,10 @@ pub const Engine = struct {
     // Frame counter
     current_frame: u64 = 0,
 
+    // Live queries (persistent entity sets, managed by lua_api)
+    live_queries: [lua_api.max_live_queries]lua_api.LiveQuery = .{lua_api.LiveQuery{}} ** lua_api.max_live_queries,
+    live_query_count: u32 = 0,
+
     // Lua
     lua_state: ?*lc.lua_State = null,
     lua_system_refs: [max_lua_systems]c_int = .{0} ** max_lua_systems,
@@ -216,6 +220,7 @@ pub const Engine = struct {
 
     /// Release all GPU resources, Lua state, and ECS storage.
     pub fn deinit(self: *Engine) void {
+        for (self.live_queries[0..self.live_query_count]) |*lq| lq.deinit();
         if (self.lua_state) |L| lc.lua_close(L);
 
         if (self.gpu_device) |device| {

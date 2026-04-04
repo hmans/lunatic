@@ -272,14 +272,16 @@ fn gatherLights(registry: *ecs.Registry) [4]f32 {
 }
 
 /// Collect all renderable entities into the draw list, sorted by mesh+material
-/// to minimize GPU state changes. Returns the number of entries.
+/// to minimize GPU state changes. Uses a zig-ecs group for automatic entity
+/// set maintenance — no per-frame filtering needed. Returns the number of entries.
 fn buildDrawList(self: *Engine) u32 {
     var draw_count: u32 = 0;
-    var ecs_view = self.registry.view(.{ Position, Rotation, MeshHandle }, .{});
-    var iter = ecs_view.entityIterator();
-    while (iter.next()) |entity| {
+    // Non-owning group: zig-ecs maintains this entity set automatically via
+    // signals on component add/remove. Calling group() is a cached hash lookup.
+    var group = self.registry.group(.{}, .{ Position, Rotation, MeshHandle }, .{});
+    for (group.data()) |entity| {
         if (draw_count >= max_renderables) break;
-        const mesh_id: u64 = ecs_view.getConst(MeshHandle, entity).id;
+        const mesh_id: u64 = self.registry.getConst(MeshHandle, entity).id;
         const mat_id: u64 = if (self.registry.tryGet(MaterialHandle, entity)) |mh| mh.id else 0;
         self.draw_list[draw_count] = .{
             .sort_key = (mesh_id << 32) | mat_id,
