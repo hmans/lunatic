@@ -434,8 +434,11 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
             const mesh = self.mesh_registry[mesh_id] orelse continue;
 
             if (bound_mesh == null or bound_mesh.? != mesh_id) {
-                const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.buffer, .offset = 0 };
+                const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.vertex_buffer, .offset = 0 };
                 c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
+                if (mesh.index_buffer) |ib| {
+                    c.SDL_BindGPUIndexBuffer(render_pass, &c.SDL_GPUBufferBinding{ .buffer = ib, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_16BIT);
+                }
                 bound_mesh = mesh_id;
             }
 
@@ -454,7 +457,11 @@ pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice) void {
 
             const vert_uniforms = VertexUniforms{ .mvp = mvp.m, .model = model.m };
             c.SDL_PushGPUVertexUniformData(cmd, 0, &vert_uniforms, @sizeOf(VertexUniforms));
-            c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, 1, 0, 0);
+            if (mesh.index_buffer != null) {
+                c.SDL_DrawGPUIndexedPrimitives(render_pass, mesh.index_count, 1, 0, 0, 0);
+            } else {
+                c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, 1, 0, 0);
+            }
         }
 
         c.SDL_EndGPURenderPass(render_pass);

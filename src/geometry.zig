@@ -1,4 +1,4 @@
-// geometry.zig — Mesh generators. Pure functions that return vertex arrays.
+// geometry.zig — Mesh generators. Return indexed vertex + index arrays.
 
 const std = @import("std");
 const math = std.math;
@@ -12,15 +12,19 @@ pub const Vertex = extern struct {
     nz: f32,
 };
 
+pub const Mesh = struct {
+    vertices: []Vertex,
+    indices: []u16,
+};
+
 // ============================================================
 // Cube
 // ============================================================
 
-/// Unit cube centered at the origin (side length 1).
-pub fn cube(allocator: std.mem.Allocator) ![]Vertex {
+/// Unit cube centered at the origin (side length 1). 24 vertices (4 per face), 36 indices.
+pub fn cube(allocator: std.mem.Allocator) !Mesh {
     const s = 0.5;
 
-    // Each face: 2 triangles, 6 vertices, shared normal.
     const faces = [6][4]f32{
         .{ 0, 0, 1, s },  // +Z
         .{ 0, 0, -1, s },  // -Z
@@ -30,15 +34,14 @@ pub fn cube(allocator: std.mem.Allocator) ![]Vertex {
         .{ -1, 0, 0, s }, // -X
     };
 
-    var verts = try allocator.alloc(Vertex, 36);
+    var verts = try allocator.alloc(Vertex, 24); // 4 per face
+    var indices = try allocator.alloc(u16, 36); // 6 per face
 
     for (faces, 0..) |face, fi| {
         const nx = face[0];
         const ny = face[1];
         const nz = face[2];
 
-        // Build a local coordinate frame from the normal.
-        // tangent and bitangent span the face plane.
         var tx: f32 = 0;
         const ty: f32 = 0;
         var tz: f32 = 0;
@@ -47,41 +50,38 @@ pub fn cube(allocator: std.mem.Allocator) ![]Vertex {
         var bz: f32 = 0;
 
         if (ny != 0) {
-            // Up/down face: tangent = +X, bitangent = +Z (or -Z)
             tx = 1;
             bz = ny;
         } else if (nz != 0) {
-            // Front/back face: tangent = +X (or -X), bitangent = +Y
             tx = -nz;
             by = 1;
         } else {
-            // Left/right face: tangent = +Z (or -Z), bitangent = +Y
             tz = nx;
             by = 1;
         }
 
-        // 4 corners: center + s*(±tangent ± bitangent) + s*normal
         const cx = nx * s;
         const cy = ny * s;
         const cz = nz * s;
 
-        const corners = [4]Vertex{
-            .{ .px = cx - s * tx - s * bx, .py = cy - s * ty - s * by, .pz = cz - s * tz - s * bz, .nx = nx, .ny = ny, .nz = nz },
-            .{ .px = cx + s * tx - s * bx, .py = cy + s * ty - s * by, .pz = cz + s * tz - s * bz, .nx = nx, .ny = ny, .nz = nz },
-            .{ .px = cx + s * tx + s * bx, .py = cy + s * ty + s * by, .pz = cz + s * tz + s * bz, .nx = nx, .ny = ny, .nz = nz },
-            .{ .px = cx - s * tx + s * bx, .py = cy - s * ty + s * by, .pz = cz - s * tz + s * bz, .nx = nx, .ny = ny, .nz = nz },
-        };
+        const vbase = fi * 4;
+        verts[vbase + 0] = .{ .px = cx - s * tx - s * bx, .py = cy - s * ty - s * by, .pz = cz - s * tz - s * bz, .nx = nx, .ny = ny, .nz = nz };
+        verts[vbase + 1] = .{ .px = cx + s * tx - s * bx, .py = cy + s * ty - s * by, .pz = cz + s * tz - s * bz, .nx = nx, .ny = ny, .nz = nz };
+        verts[vbase + 2] = .{ .px = cx + s * tx + s * bx, .py = cy + s * ty + s * by, .pz = cz + s * tz + s * bz, .nx = nx, .ny = ny, .nz = nz };
+        verts[vbase + 3] = .{ .px = cx - s * tx + s * bx, .py = cy - s * ty + s * by, .pz = cz - s * tz + s * bz, .nx = nx, .ny = ny, .nz = nz };
 
-        const base = fi * 6;
-        verts[base + 0] = corners[1];
-        verts[base + 1] = corners[0];
-        verts[base + 2] = corners[3];
-        verts[base + 3] = corners[1];
-        verts[base + 4] = corners[3];
-        verts[base + 5] = corners[2];
+        // CCW winding (matching the old verified order: 1,0,3 + 1,3,2)
+        const ibase = fi * 6;
+        const b: u16 = @intCast(vbase);
+        indices[ibase + 0] = b + 1;
+        indices[ibase + 1] = b + 0;
+        indices[ibase + 2] = b + 3;
+        indices[ibase + 3] = b + 1;
+        indices[ibase + 4] = b + 3;
+        indices[ibase + 5] = b + 2;
     }
 
-    return verts;
+    return .{ .vertices = verts, .indices = indices };
 }
 
 // ============================================================
@@ -90,99 +90,128 @@ pub fn cube(allocator: std.mem.Allocator) ![]Vertex {
 
 /// UV sphere centered at origin with radius 0.5.
 /// `segments` = longitude slices, `rings` = latitude rings (excluding poles).
-pub fn sphere(allocator: std.mem.Allocator, segments: u32, rings: u32) ![]Vertex {
-    const tri_count = segments * rings * 2;
-    var verts = try allocator.alloc(Vertex, tri_count * 3);
-    var vi: usize = 0;
+pub fn sphere(allocator: std.mem.Allocator, segments: u32, rings: u32) !Mesh {
+    const rows = rings + 1; // number of latitude divisions (rings + 1 = edges)
+    const vert_count = (segments + 1) * (rows + 1);
+    const index_count = segments * rows * 6;
+
+    var verts = try allocator.alloc(Vertex, vert_count);
+    var indices = try allocator.alloc(u16, index_count);
 
     const segs_f: f32 = @floatFromInt(segments);
-    const rings_total: f32 = @floatFromInt(rings + 1);
+    const rows_f: f32 = @floatFromInt(rows);
     const r: f32 = 0.5;
 
-    for (0..segments) |si| {
-        const s0: f32 = @floatFromInt(si);
-        const s1: f32 = s0 + 1.0;
-        const theta0 = s0 / segs_f * 2.0 * math.pi;
-        const theta1 = s1 / segs_f * 2.0 * math.pi;
+    // Generate vertices in a grid: (segments+1) columns x (rows+1) rows
+    var vi: usize = 0;
+    for (0..rows + 1) |ri| {
+        const phi = @as(f32, @floatFromInt(ri)) / rows_f * math.pi;
+        const sp = @sin(phi);
+        const cp = @cos(phi);
 
-        for (0..rings) |ri| {
-            const r0: f32 = @floatFromInt(ri);
-            const r1: f32 = r0 + 1.0;
-            const phi0 = r0 / rings_total * math.pi;
-            const phi1 = r1 / rings_total * math.pi;
+        for (0..segments + 1) |si| {
+            const theta = @as(f32, @floatFromInt(si)) / segs_f * 2.0 * math.pi;
+            const st = @sin(theta);
+            const ct = @cos(theta);
 
-            // 4 corners of this quad
-            const p00 = spherePoint(r, theta0, phi0);
-            const p10 = spherePoint(r, theta1, phi0);
-            const p01 = spherePoint(r, theta0, phi1);
-            const p11 = spherePoint(r, theta1, phi1);
+            const nx = sp * ct;
+            const ny = cp;
+            const nz = sp * st;
 
-            // Triangle 1 (CCW when viewed from outside)
-            verts[vi] = p00;
-            verts[vi + 1] = p10;
-            verts[vi + 2] = p11;
-            // Triangle 2
-            verts[vi + 3] = p00;
-            verts[vi + 4] = p11;
-            verts[vi + 5] = p01;
-            vi += 6;
+            verts[vi] = .{
+                .px = r * nx,
+                .py = r * ny,
+                .pz = r * nz,
+                .nx = nx,
+                .ny = ny,
+                .nz = nz,
+            };
+            vi += 1;
         }
     }
 
-    return verts;
-}
+    // Generate indices
+    const cols: u16 = @intCast(segments + 1);
+    var ii: usize = 0;
+    for (0..rows) |ri| {
+        for (0..segments) |si| {
+            const row: u16 = @intCast(ri);
+            const col: u16 = @intCast(si);
+            const tl = row * cols + col;
+            const tr = tl + 1;
+            const bl = tl + cols;
+            const br = bl + 1;
 
-fn spherePoint(r: f32, theta: f32, phi: f32) Vertex {
-    const sp = @sin(phi);
-    const cp = @cos(phi);
-    const st = @sin(theta);
-    const ct = @cos(theta);
+            // CCW winding (viewed from outside)
+            indices[ii + 0] = tl;
+            indices[ii + 1] = tr;
+            indices[ii + 2] = bl;
+            indices[ii + 3] = tr;
+            indices[ii + 4] = br;
+            indices[ii + 5] = bl;
+            ii += 6;
+        }
+    }
 
-    const nx = sp * ct;
-    const ny = cp;
-    const nz = sp * st;
-
-    return .{
-        .px = r * nx,
-        .py = r * ny,
-        .pz = r * nz,
-        .nx = nx,
-        .ny = ny,
-        .nz = nz,
-    };
+    return .{ .vertices = verts, .indices = indices };
 }
 
 // ============================================================
 // Tests
 // ============================================================
 
-test "cube generates 36 vertices" {
-    const verts = try cube(std.testing.allocator);
-    defer std.testing.allocator.free(verts);
-    try std.testing.expectEqual(@as(usize, 36), verts.len);
+test "cube generates 24 vertices and 36 indices" {
+    const mesh = try cube(std.testing.allocator);
+    defer std.testing.allocator.free(mesh.vertices);
+    defer std.testing.allocator.free(mesh.indices);
+    try std.testing.expectEqual(@as(usize, 24), mesh.vertices.len);
+    try std.testing.expectEqual(@as(usize, 36), mesh.indices.len);
 }
 
 test "cube normals are unit length" {
-    const verts = try cube(std.testing.allocator);
-    defer std.testing.allocator.free(verts);
-    for (verts) |v| {
+    const mesh = try cube(std.testing.allocator);
+    defer std.testing.allocator.free(mesh.vertices);
+    defer std.testing.allocator.free(mesh.indices);
+    for (mesh.vertices) |v| {
         const len = @sqrt(v.nx * v.nx + v.ny * v.ny + v.nz * v.nz);
         try std.testing.expectApproxEqAbs(@as(f32, 1.0), len, 0.001);
     }
 }
 
-test "sphere generates expected vertex count" {
-    const verts = try sphere(std.testing.allocator, 16, 8);
-    defer std.testing.allocator.free(verts);
-    // 16 segments * 8 rings * 2 triangles * 3 verts = 768
-    try std.testing.expectEqual(@as(usize, 768), verts.len);
+test "cube indices are in range" {
+    const mesh = try cube(std.testing.allocator);
+    defer std.testing.allocator.free(mesh.vertices);
+    defer std.testing.allocator.free(mesh.indices);
+    for (mesh.indices) |idx| {
+        try std.testing.expect(idx < mesh.vertices.len);
+    }
+}
+
+test "sphere generates expected counts" {
+    const mesh = try sphere(std.testing.allocator, 16, 8);
+    defer std.testing.allocator.free(mesh.vertices);
+    defer std.testing.allocator.free(mesh.indices);
+    // (16+1) * (8+1+1) = 17 * 10 = 170 vertices
+    try std.testing.expectEqual(@as(usize, 170), mesh.vertices.len);
+    // 16 * 9 * 6 = 864 indices
+    try std.testing.expectEqual(@as(usize, 864), mesh.indices.len);
 }
 
 test "sphere normals are unit length" {
-    const verts = try sphere(std.testing.allocator, 16, 8);
-    defer std.testing.allocator.free(verts);
-    for (verts) |v| {
+    const mesh = try sphere(std.testing.allocator, 16, 8);
+    defer std.testing.allocator.free(mesh.vertices);
+    defer std.testing.allocator.free(mesh.indices);
+    for (mesh.vertices) |v| {
         const len = @sqrt(v.nx * v.nx + v.ny * v.ny + v.nz * v.nz);
         try std.testing.expectApproxEqAbs(@as(f32, 1.0), len, 0.001);
+    }
+}
+
+test "sphere indices are in range" {
+    const mesh = try sphere(std.testing.allocator, 16, 8);
+    defer std.testing.allocator.free(mesh.vertices);
+    defer std.testing.allocator.free(mesh.indices);
+    for (mesh.indices) |idx| {
+        try std.testing.expect(idx < mesh.vertices.len);
     }
 }

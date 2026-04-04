@@ -22,8 +22,10 @@ const Vertex = geometry.Vertex;
 // ============================================================
 
 pub const MeshData = struct {
-    buffer: *c.SDL_GPUBuffer,
+    vertex_buffer: *c.SDL_GPUBuffer,
     vertex_count: u32,
+    index_buffer: ?*c.SDL_GPUBuffer = null,
+    index_count: u32 = 0,
 };
 
 pub const MaterialData = struct {
@@ -147,7 +149,10 @@ pub const Engine = struct {
 
         if (self.gpu_device) |device| {
             for (0..self.mesh_count) |i| {
-                if (self.mesh_registry[i]) |mesh| c.SDL_ReleaseGPUBuffer(device, mesh.buffer);
+                if (self.mesh_registry[i]) |mesh| {
+                    c.SDL_ReleaseGPUBuffer(device, mesh.vertex_buffer);
+                    if (mesh.index_buffer) |ib| c.SDL_ReleaseGPUBuffer(device, ib);
+                }
             }
             if (self.msaa_color_texture) |mt| c.SDL_ReleaseGPUTexture(device, mt);
             if (self.depth_texture) |dt| c.SDL_ReleaseGPUTexture(device, dt);
@@ -230,13 +235,15 @@ pub const Engine = struct {
         // Built-in meshes
         const allocator = std.heap.c_allocator;
 
-        const cube_verts = try geometry.cube(allocator);
-        defer allocator.free(cube_verts);
-        _ = try self.createMesh("cube", cube_verts);
+        const cube_mesh = try geometry.cube(allocator);
+        defer allocator.free(cube_mesh.vertices);
+        defer allocator.free(cube_mesh.indices);
+        _ = try self.createMesh("cube", cube_mesh.vertices, cube_mesh.indices);
 
-        const sphere_verts = try geometry.sphere(allocator, 32, 16);
-        defer allocator.free(sphere_verts);
-        _ = try self.createMesh("sphere", sphere_verts);
+        const sphere_mesh = try geometry.sphere(allocator, 32, 16);
+        defer allocator.free(sphere_mesh.vertices);
+        defer allocator.free(sphere_mesh.indices);
+        _ = try self.createMesh("sphere", sphere_mesh.vertices, sphere_mesh.indices);
 
         // Built-in materials
         _ = try self.createNamedMaterial("default", .{});
@@ -244,12 +251,28 @@ pub const Engine = struct {
 
     // ---- Mesh API ----
 
-    pub fn createMesh(self: *Engine, name: ?[*:0]const u8, vertices: []const Vertex) !u32 {
+    pub fn createMesh(self: *Engine, name: ?[*:0]const u8, vertices: []const Vertex, indices: ?[]const u16) !u32 {
         if (self.mesh_count >= max_meshes) return error.TooManyMeshes;
         const device = self.gpu_device orelse return error.NotInitialized;
-        const buf = uploadVertexData(device, std.mem.sliceAsBytes(vertices)) orelse return error.BufferFailed;
+        const vbuf = uploadGPUBuffer(device, std.mem.sliceAsBytes(vertices), c.SDL_GPU_BUFFERUSAGE_VERTEX) orelse return error.BufferFailed;
+
+        var ibuf: ?*c.SDL_GPUBuffer = null;
+        var icount: u32 = 0;
+        if (indices) |idx| {
+            ibuf = uploadGPUBuffer(device, std.mem.sliceAsBytes(idx), c.SDL_GPU_BUFFERUSAGE_INDEX) orelse {
+                c.SDL_ReleaseGPUBuffer(device, vbuf);
+                return error.BufferFailed;
+            };
+            icount = @intCast(idx.len);
+        }
+
         const id = self.mesh_count;
-        self.mesh_registry[id] = .{ .buffer = buf, .vertex_count = @intCast(vertices.len) };
+        self.mesh_registry[id] = .{
+            .vertex_buffer = vbuf,
+            .vertex_count = @intCast(vertices.len),
+            .index_buffer = ibuf,
+            .index_count = icount,
+        };
         self.mesh_names[id] = name;
         self.mesh_count += 1;
         return id;
@@ -257,16 +280,18 @@ pub const Engine = struct {
 
     pub fn createCubeMesh(self: *Engine) !u32 {
         const allocator = std.heap.c_allocator;
-        const verts = try geometry.cube(allocator);
-        defer allocator.free(verts);
-        return self.createMesh(null, verts);
+        const mesh = try geometry.cube(allocator);
+        defer allocator.free(mesh.vertices);
+        defer allocator.free(mesh.indices);
+        return self.createMesh(null, mesh.vertices, mesh.indices);
     }
 
     pub fn createSphereMesh(self: *Engine, segments: u32, rings: u32) !u32 {
         const allocator = std.heap.c_allocator;
-        const verts = try geometry.sphere(allocator, segments, rings);
-        defer allocator.free(verts);
-        return self.createMesh(null, verts);
+        const mesh = try geometry.sphere(allocator, segments, rings);
+        defer allocator.free(mesh.vertices);
+        defer allocator.free(mesh.indices);
+        return self.createMesh(null, mesh.vertices, mesh.indices);
     }
 
     pub fn findMesh(self: *Engine, name: [*:0]const u8) ?u32 {
@@ -339,10 +364,10 @@ pub const Engine = struct {
 // GPU helpers
 // ============================================================
 
-fn uploadVertexData(device: *c.SDL_GPUDevice, data: []const u8) ?*c.SDL_GPUBuffer {
+fn uploadGPUBuffer(device: *c.SDL_GPUDevice, data: []const u8, usage: c.SDL_GPUBufferUsageFlags) ?*c.SDL_GPUBuffer {
     const data_size: u32 = @intCast(data.len);
     const buf = c.SDL_CreateGPUBuffer(device, &c.SDL_GPUBufferCreateInfo{
-        .usage = c.SDL_GPU_BUFFERUSAGE_VERTEX,
+        .usage = usage,
         .size = data_size,
         .props = 0,
     }) orelse return null;
