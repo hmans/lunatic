@@ -238,7 +238,7 @@ fn uploadVertexData(device: *c.SDL_GPUDevice, data: []const u8) ?*c.SDL_GPUBuffe
     return buf;
 }
 
-fn createDepthTexture(device: *c.SDL_GPUDevice, w: u32, h: u32) ?*c.SDL_GPUTexture {
+fn createDepthTexture(device: *c.SDL_GPUDevice, w: u32, h: u32, sample_count: SampleCount) ?*c.SDL_GPUTexture {
     return c.SDL_CreateGPUTexture(device, &c.SDL_GPUTextureCreateInfo{
         .type = c.SDL_GPU_TEXTURETYPE_2D,
         .format = c.SDL_GPU_TEXTUREFORMAT_D32_FLOAT,
@@ -247,7 +247,21 @@ fn createDepthTexture(device: *c.SDL_GPUDevice, w: u32, h: u32) ?*c.SDL_GPUTextu
         .height = h,
         .layer_count_or_depth = 1,
         .num_levels = 1,
-        .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+        .sample_count = sample_count.toRaw(),
+        .props = 0,
+    });
+}
+
+fn createMsaaColorTexture(device: *c.SDL_GPUDevice, format: c.SDL_GPUTextureFormat, w: u32, h: u32, sample_count: SampleCount) ?*c.SDL_GPUTexture {
+    return c.SDL_CreateGPUTexture(device, &c.SDL_GPUTextureCreateInfo{
+        .type = c.SDL_GPU_TEXTURETYPE_2D,
+        .format = format,
+        .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+        .width = w,
+        .height = h,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+        .sample_count = sample_count.toRaw(),
         .props = 0,
     });
 }
@@ -256,11 +270,27 @@ fn createDepthTexture(device: *c.SDL_GPUDevice, w: u32, h: u32) ?*c.SDL_GPUTextu
 // Config
 // ============================================================
 
+pub const SampleCount = enum(u32) {
+    @"1" = c.SDL_GPU_SAMPLECOUNT_1,
+    @"2" = c.SDL_GPU_SAMPLECOUNT_2,
+    @"4" = c.SDL_GPU_SAMPLECOUNT_4,
+    @"8" = c.SDL_GPU_SAMPLECOUNT_8,
+
+    fn isMultisample(self: SampleCount) bool {
+        return self != .@"1";
+    }
+
+    fn toRaw(self: SampleCount) c.SDL_GPUSampleCount {
+        return @intFromEnum(self);
+    }
+};
+
 pub const Config = struct {
     title: [*:0]const u8 = "lunatic",
     width: u32 = 800,
     height: u32 = 600,
     headless: bool = false,
+    msaa: SampleCount = .@"4",
 };
 
 // ============================================================
@@ -276,8 +306,11 @@ pub const Engine = struct {
     sdl_window: ?*c.SDL_Window = null,
     pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
     depth_texture: ?*c.SDL_GPUTexture = null,
-    depth_w: u32 = 0,
-    depth_h: u32 = 0,
+    msaa_color_texture: ?*c.SDL_GPUTexture = null,
+    swapchain_format: c.SDL_GPUTextureFormat = c.SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
+    sample_count: SampleCount = .@"1",
+    rt_w: u32 = 0,
+    rt_h: u32 = 0,
 
     // Camera
     camera_eye: Vec3 = Vec3.new(0, 1.5, 4),
@@ -348,6 +381,7 @@ pub const Engine = struct {
         if (self.lua_state) |L| lc.lua_close(L);
 
         if (self.gpu_device) |device| {
+            if (self.msaa_color_texture) |mt| c.SDL_ReleaseGPUTexture(device, mt);
             if (self.depth_texture) |dt| c.SDL_ReleaseGPUTexture(device, dt);
             if (self.pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
             if (self.sdl_window) |w| c.SDL_DestroyWindow(w);
@@ -437,7 +471,9 @@ pub const Engine = struct {
         defer c.SDL_ReleaseGPUShader(device, frag_shader);
 
         // Pipeline
-        const swapchain_format = c.SDL_GetGPUSwapchainTextureFormat(device, self.sdl_window);
+        self.sample_count = config.msaa;
+        self.swapchain_format = c.SDL_GetGPUSwapchainTextureFormat(device, self.sdl_window);
+        const swapchain_format = self.swapchain_format;
 
         const vertex_attrs = [_]c.SDL_GPUVertexAttribute{
             .{ .location = 0, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = @offsetOf(Vertex, "px") },
@@ -475,7 +511,7 @@ pub const Engine = struct {
                 .padding2 = 0,
             },
             .multisample_state = .{
-                .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+                .sample_count = config.msaa.toRaw(),
                 .sample_mask = 0,
                 .enable_mask = false,
                 .enable_alpha_to_coverage = false,
@@ -524,13 +560,19 @@ pub const Engine = struct {
         // Built-in materials
         _ = self.createNamedMaterial("default", .{});
 
-        // Depth texture
-        self.depth_texture = createDepthTexture(device, config.width, config.height) orelse {
+        // Render targets (depth + optional MSAA color)
+        self.depth_texture = createDepthTexture(device, config.width, config.height, config.msaa) orelse {
             std.debug.print("Failed to create depth texture: {s}\n", .{c.SDL_GetError()});
             return error.DepthTextureFailed;
         };
-        self.depth_w = config.width;
-        self.depth_h = config.height;
+        if (config.msaa.isMultisample()) {
+            self.msaa_color_texture = createMsaaColorTexture(device, swapchain_format, config.width, config.height, config.msaa) orelse {
+                std.debug.print("Failed to create MSAA color texture: {s}\n", .{c.SDL_GetError()});
+                return error.DepthTextureFailed;
+            };
+        }
+        self.rt_w = config.width;
+        self.rt_h = config.height;
     }
 
     // ---- Mesh API ----
@@ -700,12 +742,16 @@ pub const Engine = struct {
             return;
         }
 
-        // Recreate depth texture if swapchain dimensions changed
-        if (sw_w != self.depth_w or sw_h != self.depth_h) {
+        // Recreate render targets if swapchain dimensions changed
+        if (sw_w != self.rt_w or sw_h != self.rt_h) {
             if (self.depth_texture) |dt| c.SDL_ReleaseGPUTexture(device, dt);
-            self.depth_texture = createDepthTexture(device, sw_w, sw_h);
-            self.depth_w = sw_w;
-            self.depth_h = sw_h;
+            self.depth_texture = createDepthTexture(device, sw_w, sw_h, self.sample_count);
+            if (self.sample_count.isMultisample()) {
+                if (self.msaa_color_texture) |mt| c.SDL_ReleaseGPUTexture(device, mt);
+                self.msaa_color_texture = createMsaaColorTexture(device, self.swapchain_format, sw_w, sw_h, self.sample_count);
+            }
+            self.rt_w = sw_w;
+            self.rt_h = sw_h;
             if (self.depth_texture == null) {
                 _ = c.SDL_SubmitGPUCommandBuffer(cmd);
                 return;
@@ -727,7 +773,21 @@ pub const Engine = struct {
 
         const default_material = MaterialUniforms{ .albedo = .{ 1.0, 1.0, 1.0, 1.0 } };
 
-        const color_target = c.SDL_GPUColorTargetInfo{
+        const color_target = if (self.sample_count.isMultisample()) c.SDL_GPUColorTargetInfo{
+            .texture = self.msaa_color_texture,
+            .mip_level = 0,
+            .layer_or_depth_plane = 0,
+            .clear_color = .{ .r = self.clear_color[0], .g = self.clear_color[1], .b = self.clear_color[2], .a = self.clear_color[3] },
+            .load_op = c.SDL_GPU_LOADOP_CLEAR,
+            .store_op = c.SDL_GPU_STOREOP_RESOLVE,
+            .resolve_texture = swapchain_tex,
+            .resolve_mip_level = 0,
+            .resolve_layer = 0,
+            .cycle = true,
+            .cycle_resolve_texture = false,
+            .padding1 = 0,
+            .padding2 = 0,
+        } else c.SDL_GPUColorTargetInfo{
             .texture = swapchain_tex,
             .mip_level = 0,
             .layer_or_depth_plane = 0,
