@@ -264,8 +264,9 @@ test "query order independence" {
         \\
         \\local r1 = lunatic.query("position", "rotation")
         \\local r2 = lunatic.query("rotation", "position")
-        \\-- Should return the same cached table (same frame)
-        \\assert(r1 == r2, "expected same table for reordered query")
+        \\-- Both queries should find the same entity regardless of argument order
+        \\assert(#r1 == #r2, "expected same count for reordered query")
+        \\assert(r1[1] == r2[1], "expected same entity for reordered query")
     );
 }
 
@@ -285,6 +286,50 @@ test "query unknown component errors" {
         \\local ok, err = pcall(lunatic.query, "nonexistent")
         \\assert(not ok)
         \\assert(err:find("unknown component"), err)
+    );
+}
+
+// ============================================================
+// Each (callback-based iteration)
+// ============================================================
+
+test "each iterates matching entities" {
+    const L = try setup();
+    defer teardown();
+    try run(L,
+        \\local a = lunatic.spawn()
+        \\lunatic.add(a, "position", 1, 2, 3)
+        \\lunatic.add(a, "rotation", 0, 0, 0)
+        \\
+        \\local b = lunatic.spawn()
+        \\lunatic.add(b, "position", 4, 5, 6)
+        \\-- b has no rotation
+        \\
+        \\local count = 0
+        \\local found_entity = nil
+        \\lunatic.each("position", "rotation", function(entity)
+        \\  count = count + 1
+        \\  found_entity = entity
+        \\end)
+        \\assert(count == 1, "expected 1 match, got " .. count)
+        \\assert(found_entity == a)
+    );
+}
+
+test "each with single component" {
+    const L = try setup();
+    defer teardown();
+    try run(L,
+        \\local a = lunatic.spawn()
+        \\lunatic.add(a, "position", 0, 0, 0)
+        \\local b = lunatic.spawn()
+        \\lunatic.add(b, "position", 1, 1, 1)
+        \\
+        \\local count = 0
+        \\lunatic.each("position", function(entity)
+        \\  count = count + 1
+        \\end)
+        \\assert(count == 2, "expected 2 matches, got " .. count)
     );
 }
 
