@@ -120,6 +120,7 @@ fn addExample(
         .link_libc = true,
         .imports = &.{
             .{ .name = "zig-ecs", .module = ecs_mod },
+            .{ .name = "core_components", .module = core_components_mod },
             .{ .name = "lua", .module = lua_mod },
             .{ .name = "geometry", .module = geometry_mod },
             .{ .name = "math3d", .module = math3d_mod },
@@ -219,6 +220,7 @@ pub fn build(b: *std.Build) void {
     const examples = [_]Example{
         .{ .name = "pbr_test" },
         .{ .name = "primitives", .components = "examples/primitives/components.zig" },
+        .{ .name = "zig_primitives" },
     };
 
     const default_run_step = b.step("run", "Run the default example (pbr_test)");
@@ -328,6 +330,7 @@ fn addIntegrationTests(
         .link_libc = true,
         .imports = &.{
             .{ .name = "zig-ecs", .module = ecs_mod },
+            .{ .name = "core_components", .module = core_components_mod },
             .{ .name = "lua", .module = lua_mod },
             .{ .name = "geometry", .module = geometry_mod },
             .{ .name = "math3d", .module = math3d_mod },

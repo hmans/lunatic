@@ -10,6 +10,7 @@ const renderer = @import("renderer");
 const lua_api = @import("lua_api");
 pub const gltf = @import("gltf");
 
+pub const core_components = @import("core_components");
 const lua = @import("lua");
 const lc = lua.c;
 pub const HandleKind = enum { mesh, material };
@@ -56,6 +57,8 @@ pub const max_meshes = 64;
 pub const max_materials = 64;
 pub const max_textures = 64;
 pub const max_lua_systems = 64;
+pub const max_zig_systems = 64;
+pub const ZigSystemFn = *const fn (*Engine, f32) void;
 
 // ============================================================
 // Asset store — groups mesh, material, and texture registries
@@ -181,6 +184,10 @@ pub const Engine = struct {
     live_queries: [lua_api.max_live_queries]lua_api.LiveQuery = .{lua_api.LiveQuery{}} ** lua_api.max_live_queries,
     live_query_count: u32 = 0,
 
+    // Zig systems (function pointers, called before Lua systems each frame)
+    zig_systems: [max_zig_systems]ZigSystemFn = undefined,
+    zig_system_count: u32 = 0,
+
     // Lua
     lua_state: ?*lc.lua_State = null,
     lua_system_refs: [max_lua_systems]c_int = .{0} ** max_lua_systems,
@@ -272,6 +279,7 @@ pub const Engine = struct {
                 if (event.type == c.SDL_EVENT_KEY_DOWN and event.key.scancode == c.SDL_SCANCODE_ESCAPE) running = false;
             }
 
+            self.runZigSystems(dt);
             self.runLuaSystems(dt);
             renderer.renderSystem(self, device, dt);
         }
@@ -576,6 +584,21 @@ pub const Engine = struct {
             .forward = .{ -rot.m[2][0], -rot.m[2][1], -rot.m[2][2] },
             .right = .{ rot.m[0][0], rot.m[0][1], rot.m[0][2] },
         };
+    }
+
+    // ---- Zig systems ----
+
+    /// Register a Zig system function to be called each frame with delta time.
+    pub fn addSystem(self: *Engine, func: ZigSystemFn) void {
+        if (self.zig_system_count >= max_zig_systems) return;
+        self.zig_systems[self.zig_system_count] = func;
+        self.zig_system_count += 1;
+    }
+
+    fn runZigSystems(self: *Engine, dt: f32) void {
+        for (self.zig_systems[0..self.zig_system_count]) |sys| {
+            sys(self, dt);
+        }
     }
 
     // ---- Lua systems ----

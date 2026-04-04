@@ -13,6 +13,7 @@ A 3D game engine: Zig core + SDL3 GPU + LuaJIT scripting + zig-ecs.
 - Components declare Lua semantics via a `pub const lua` struct literal: `.{ .name = "position" }` for data components, `.{ .name = "mesh", .resolve = .mesh }` for asset handles. Tag components (zero-sized structs) are auto-detected. Data component fields must be `f32` or `u32`. All Lua bridge dispatch goes through the `ComponentOps` vtable generated in `component_ops.zig`.
 - Engine code is split by responsibility: `engine.zig` (lifecycle, registries), `renderer.zig` (GPU pipeline, render system), `lua_api.zig` (Lua bindings), `component_ops.zig` (comptime vtable generator). Both renderer and lua_api import the Engine type from engine.zig.
 - Adding a new asset handle type (e.g. `TextureHandle` with string name resolution): define struct with `.resolve = .texture` in its `.lua` metadata, add to the `.all` tuple, add a `.texture` variant to `HandleKind` in `engine.zig`, and add a case to `Engine.resolveHandle()`'s switch.
+- Zig systems are registered with `engine.addSystem(fn)` and run before Lua systems each frame. Pure Zig examples/games can skip Lua entirely. Core component types are accessible via `engine_mod.core_components`.
 
 ## Scale Target
 
@@ -24,6 +25,11 @@ The engine must handle tens of thousands to hundreds of thousands of entities ef
 - `lc` = Lua C namespace (from `lua.zig`), `c` = SDL C namespace (from `engine.zig`). Both are `pub const` exports — other files must import these rather than doing their own `@cImport`.
 - Any new APIs must be made available to Zig first, and then (optionally, where it makes sense) to Lua.
 - Mesh winding order is CCW (counter-clockwise) when viewed from outside. Pipeline uses `CULLMODE_BACK` + `FRONTFACE_COUNTER_CLOCKWISE`. New geometry generators should verify winding with the cross-product dot normal test.
+
+### zig-ecs patterns
+- `registry.view()` for multi-component queries: iterate with `.entityIterator()` + `.get()`/`.getConst()`. Typed `.iterator()` and `.each()` are **group-only** — not available on views.
+- `registry.group()` for persistent, signal-maintained entity sets. Use non-owning groups (`group(.{}, .{includes...}, .{})`) unless you need cache-friendly owned storage.
+- Use `registry.add()` when you know the component isn't present. Use `addOrReplace()` only when it might already exist.
 
 ## Gotchas
 
