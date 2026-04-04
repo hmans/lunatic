@@ -286,18 +286,46 @@ fn resolveHandle(self: *Engine, L: ?*lc.lua_State, idx: c_int, kind: HandleKind)
     unreachable;
 }
 
+// ============================================================
+// Lua ↔ Zig vector/number helpers
+// ============================================================
+
+fn pushVec3(L: ?*lc.lua_State, v: [3]f32) void {
+    lc.lua_pushnumber(L, v[0]);
+    lc.lua_pushnumber(L, v[1]);
+    lc.lua_pushnumber(L, v[2]);
+}
+
+fn checkVec3(L: ?*lc.lua_State, base: c_int) [3]f32 {
+    return .{
+        @floatCast(lc.luaL_checknumber(L, base)),
+        @floatCast(lc.luaL_checknumber(L, base + 1)),
+        @floatCast(lc.luaL_checknumber(L, base + 2)),
+    };
+}
+
+fn optVec3(L: ?*lc.lua_State, base: c_int, defaults: [3]f32) [3]f32 {
+    return .{
+        @floatCast(lc.luaL_optnumber(L, base, defaults[0])),
+        @floatCast(lc.luaL_optnumber(L, base + 1, defaults[1])),
+        @floatCast(lc.luaL_optnumber(L, base + 2, defaults[2])),
+    };
+}
+
+fn checkFloat(L: ?*lc.lua_State, idx: c_int) f32 {
+    return @floatCast(lc.luaL_checknumber(L, idx));
+}
+
+// ============================================================
+// Lua C callbacks
+// ============================================================
+
 fn luaCameraAxes(L: ?*lc.lua_State) callconv(.c) c_int {
     _ = getEngine(L);
-    const rx: f32 = @floatCast(lc.luaL_checknumber(L, 1));
-    const ry: f32 = @floatCast(lc.luaL_checknumber(L, 2));
-    const rz: f32 = @floatCast(lc.luaL_checknumber(L, 3));
-    const axes = Engine.getCameraAxes(rx, ry, rz);
-    lc.lua_pushnumber(L, axes.forward[0]);
-    lc.lua_pushnumber(L, axes.forward[1]);
-    lc.lua_pushnumber(L, axes.forward[2]);
-    lc.lua_pushnumber(L, axes.right[0]);
-    lc.lua_pushnumber(L, axes.right[1]);
-    lc.lua_pushnumber(L, axes.right[2]);
+    const v = checkVec3(L, 1);
+    const axes = Engine.getCameraAxes(v[0], v[1], v[2]);
+    pushVec3(L, axes.forward);
+    pushVec3(L, axes.right);
     return 6;
 }
 
@@ -327,9 +355,8 @@ fn luaKeyDown(L: ?*lc.lua_State) callconv(.c) c_int {
 
 fn luaSetClearColor(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    self.clear_color[0] = @floatCast(lc.luaL_checknumber(L, 1));
-    self.clear_color[1] = @floatCast(lc.luaL_checknumber(L, 2));
-    self.clear_color[2] = @floatCast(lc.luaL_checknumber(L, 3));
+    const rgb = checkVec3(L, 1);
+    self.clear_color = rgb ++ .{1.0};
     return 0;
 }
 
@@ -340,19 +367,16 @@ fn luaSetFog(L: ?*lc.lua_State) callconv(.c) c_int {
         return 0;
     }
     self.fog_enabled = true;
-    self.fog_start = @floatCast(lc.luaL_checknumber(L, 1));
-    self.fog_end = @floatCast(lc.luaL_checknumber(L, 2));
-    self.fog_color[0] = @floatCast(lc.luaL_optnumber(L, 3, self.clear_color[0]));
-    self.fog_color[1] = @floatCast(lc.luaL_optnumber(L, 4, self.clear_color[1]));
-    self.fog_color[2] = @floatCast(lc.luaL_optnumber(L, 5, self.clear_color[2]));
+    self.fog_start = checkFloat(L, 1);
+    self.fog_end = checkFloat(L, 2);
+    self.fog_color = optVec3(L, 3, .{ self.clear_color[0], self.clear_color[1], self.clear_color[2] });
     return 0;
 }
 
 fn luaSetAmbient(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    self.ambient_color[0] = @floatCast(lc.luaL_checknumber(L, 1));
-    self.ambient_color[1] = @floatCast(lc.luaL_checknumber(L, 2));
-    self.ambient_color[2] = @floatCast(lc.luaL_checknumber(L, 3));
+    const rgb = checkVec3(L, 1);
+    self.ambient_color = rgb ++ .{0.0};
     return 0;
 }
 
