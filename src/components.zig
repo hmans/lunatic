@@ -56,5 +56,10 @@ pub const DirectionalLight = struct {
     pub const Lua = lua.Component("directional_light", @This());
 };
 
+pub const LookAt = struct {
+    target: u32 = 0, // entity ID
+    pub const lua_name = "look_at";
+};
+
 /// Single source of truth: all component types exposed to Lua.
-pub const all = .{ Position, Rotation, Spin, Player, MeshHandle, MaterialHandle, Camera, DirectionalLight };
+pub const all = .{ Position, Rotation, Spin, Player, MeshHandle, MaterialHandle, Camera, DirectionalLight, LookAt };

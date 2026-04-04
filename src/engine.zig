@@ -22,6 +22,7 @@ const MeshHandle = components.MeshHandle;
 const MaterialHandle = components.MaterialHandle;
 const Camera = components.Camera;
 const DirectionalLight = components.DirectionalLight;
+const LookAt = components.LookAt;
 const Spin = components.Spin;
 
 const Vertex = geometry.Vertex;
@@ -783,12 +784,11 @@ pub const Engine = struct {
         const is_msaa = self.sample_count.isMultisample();
 
         // One render pass per camera — each clears depth, first clears color
-        var cam_view = self.registry.view(.{ Position, Rotation, Camera }, .{});
+        var cam_view = self.registry.view(.{ Position, Camera }, .{});
         var cam_iter = cam_view.entityIterator();
         var first_camera = true;
         while (cam_iter.next()) |cam_entity| {
             const cam_pos = cam_view.getConst(Position, cam_entity);
-            const cam_rot = cam_view.getConst(Rotation, cam_entity);
             const cam = cam_view.getConst(Camera, cam_entity);
 
             const color_load_op: c_uint = if (first_camera) c.SDL_GPU_LOADOP_CLEAR else c.SDL_GPU_LOADOP_LOAD;
@@ -863,7 +863,18 @@ pub const Engine = struct {
 
             const aspect: f32 = vp_w / vp_h;
             const proj = Mat4.perspective(cam.fov, aspect, cam.near, cam.far);
-            const view = Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, cam_rot.x, cam_rot.y, cam_rot.z);
+
+            const eye = Vec3.new(cam_pos.x, cam_pos.y, cam_pos.z);
+            const view = if (self.registry.tryGet(LookAt, cam_entity)) |look_at| blk: {
+                const target_entity: ecs.Entity = @bitCast(look_at.target);
+                if (self.registry.tryGet(Position, target_entity)) |target_pos| {
+                    break :blk Mat4.lookAt(eye, Vec3.new(target_pos.x, target_pos.y, target_pos.z), Vec3.new(0, 1, 0));
+                }
+                break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
+            } else if (self.registry.tryGet(Rotation, cam_entity)) |cam_rot| blk: {
+                break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, cam_rot.x, cam_rot.y, cam_rot.z);
+            } else Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
+
             const vp = Mat4.mul(proj, view);
 
             const scene_uniforms = SceneUniforms{
@@ -1200,6 +1211,12 @@ fn luaAdd(L: ?*lc.lua_State) callconv(.c) c_int {
     if (std.mem.eql(u8, name, lua.nameOf(MaterialHandle))) {
         const mat_id = resolveHandle(self, L, 3, .material);
         self.registry.addOrReplace(entity, MaterialHandle{ .id = mat_id });
+        return 0;
+    }
+
+    if (std.mem.eql(u8, name, lua.nameOf(LookAt))) {
+        const target_id: u32 = @intCast(lc.luaL_checkinteger(L, 3));
+        self.registry.addOrReplace(entity, LookAt{ .target = target_id });
         return 0;
     }
 
