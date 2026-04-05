@@ -49,7 +49,7 @@ jobs:
           install-linux-dependencies: true
           version: 3-latest
           build-type: Release
-          cmake-arguments: "-DSDL_UNIX_CONSOLE_BUILD=ON"
+          cmake-arguments: "-DSDL_UNIX_CONSOLE_BUILD=ON -DSDL_STATIC=OFF"
           add-to-environment: true
 
       # Other dependencies

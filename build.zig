@@ -103,6 +103,7 @@ fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
     compile.linkSystemLibrary("luajit-5.1");
     compile.addCSourceFile(.{ .file = b.path("engine/vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
     compile.addCSourceFile(.{ .file = b.path("engine/vendor/cgltf_impl.c"), .flags = &.{"-std=c99"} });
+    compile.addCSourceFile(.{ .file = b.path("engine/vendor/lua_error_helper.c"), .flags = &.{"-std=c99"} });
 
     // Dear ImGui (C++ core + C wrapper + SDL3/GPU backends)
     const imgui_flags: []const []const u8 = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-DIMGUI_IMPL_API=extern \"C\"" };
