@@ -53,7 +53,20 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) 
 
 /// Add all system include/lib paths from known prefixes where dependencies are found.
 fn addSystemPaths(mod: *std.Build.Module, allocator: std.mem.Allocator) void {
-    const prefixes = [_][]const u8{ "/opt/homebrew", "/usr/local", "/usr" };
+    // Check SDL3_PREFIX env var (set by setup-sdl in CI)
+    const env_prefix: ?[]const u8 = std.process.getEnvVarOwned(allocator, "SDL3_PREFIX") catch null;
+
+    var prefix_list: [4][]const u8 = undefined;
+    var prefix_count: usize = 0;
+    if (env_prefix) |p| {
+        prefix_list[prefix_count] = p;
+        prefix_count += 1;
+    }
+    for ([_][]const u8{ "/opt/homebrew", "/usr/local", "/usr" }) |p| {
+        prefix_list[prefix_count] = p;
+        prefix_count += 1;
+    }
+    const prefixes = prefix_list[0..prefix_count];
 
     for (prefixes) |prefix| {
         const inc = std.fmt.allocPrint(allocator, "{s}/include", .{prefix}) catch continue;

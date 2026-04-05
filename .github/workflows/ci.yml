@@ -36,25 +36,21 @@ jobs:
         with:
           version: "0.15.2"
 
-      # SDL3 — Homebrew on macOS, build from source on Linux
+      # SDL3 — Homebrew on macOS, build from source on Linux via setup-sdl
       - name: Install SDL3 (macOS)
         if: runner.os == 'macOS'
         run: brew install sdl3
 
-      - name: Install SDL3 build deps (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libwayland-dev libxkbcommon-dev libegl-dev libgles-dev
-
       - name: Install SDL3 (Linux)
         if: runner.os == 'Linux'
-        run: |
-          git clone --depth 1 --branch release-3.2.14 https://github.com/libsdl-org/SDL.git /tmp/SDL3-src
-          cmake -S /tmp/SDL3-src -B /tmp/SDL3-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
-          cmake --build /tmp/SDL3-build -j$(nproc)
-          sudo cmake --install /tmp/SDL3-build
-          sudo ldconfig
+        id: sdl
+        uses: libsdl-org/setup-sdl@main
+        with:
+          install-linux-dependencies: true
+          version: 3-latest
+          build-type: Release
+          cmake-arguments: "-DSDL_UNIX_CONSOLE_BUILD=ON"
+          add-to-environment: true
 
       # Other dependencies
       - name: Install dependencies (macOS)
@@ -71,9 +67,12 @@ jobs:
         run: zig build test
         env:
           SDL_VIDEODRIVER: dummy
+          SDL3_PREFIX: ${{ steps.sdl.outputs.prefix }}
 
       - name: Build
         run: zig build
+        env:
+          SDL3_PREFIX: ${{ steps.sdl.outputs.prefix }}
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
