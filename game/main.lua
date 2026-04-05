@@ -31,18 +31,12 @@ lunatic.add(light, "directional_light", 0.3, 0.8, 0.5)
 -- Materials
 --------------------------------------------------------------------------------
 
--- Basic colored materials (PBR with default metallic=0, roughness=0.5)
-local red    = lunatic.create_material({ albedo = { 0.9, 0.2, 0.2 } })
-local green  = lunatic.create_material({ albedo = { 0.2, 0.8, 0.3 } })
-local blue   = lunatic.create_material({ albedo = { 0.2, 0.3, 0.9 } })
-local yellow = lunatic.create_material({ albedo = { 0.9, 0.8, 0.2 } })
+local white  = lunatic.create_material({ albedo = { 0.85, 0.85, 0.85 } })
+local ember  = lunatic.create_material({ albedo = { 1, 0.4, 0.05 }, emissive = { 40, 12, 1 } })
+local matte  = lunatic.create_material({ albedo = { 0.05, 0.05, 0.05 }, roughness = 1.0 })
+local silver = lunatic.create_material({ albedo = { 0.9, 0.9, 0.92 }, metallic = 1.0, roughness = 0.15 })
 
--- Emissive materials glow beyond 1.0 in the HDR buffer, which triggers bloom.
--- The emissive values (3, 1.5, 0.3) etc. are in linear HDR — values > 1 bloom.
-local hot    = lunatic.create_material({ albedo = { 1, 1, 1 }, emissive = { 3, 1.5, 0.3 } })
-local cool   = lunatic.create_material({ albedo = { 1, 1, 1 }, emissive = { 0.3, 0.8, 3 } })
-
-local materials = { lunatic.material.default, red, green, blue, yellow, hot, cool }
+local materials = { white, ember, matte, silver }
 local meshes = { lunatic.mesh.cube, lunatic.mesh.sphere }
 
 --------------------------------------------------------------------------------
@@ -55,13 +49,13 @@ lunatic.add(cam, "position", 0, 8, 12)
 lunatic.add(cam, "rotation", 34, 0, 0)
 lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1,
   1.2,   -- exposure
-  0.15,  -- bloom_intensity
+  0.8,   -- bloom_intensity
   15,    -- dof_focus_dist
   8,     -- dof_focus_range
   8,     -- dof_blur_radius
   0.4,   -- vignette
   0.5,   -- vignette_smoothness
-  0.3,   -- chromatic_aberration
+  0.08,  -- chromatic_aberration
   0.03,  -- grain
   0.0    -- color_temp
 )
@@ -74,11 +68,12 @@ lunatic.add(cam, "fly_camera")
 -- Physics
 --------------------------------------------------------------------------------
 
--- Visible floor (scale and physics half-extents must match:
--- unit cube is ±0.5, so scale=S gives size S, half-extent = S/2)
+-- Visible floor
+local floor_mat = lunatic.create_material({ albedo = { 0.25, 0.25, 0.28 }, roughness = 0.9 })
 local floor = lunatic.spawn()
 lunatic.add(floor, "position", 0, -0.25, 0)
 lunatic.add(floor, "mesh", "cube")
+lunatic.add(floor, "material", floor_mat)
 lunatic.add(floor, "scale", 20, 0.5, 20)
 lunatic.add(floor, "rotation", 0, 0, 0)
 lunatic.physics_add_box(floor, 10, 0.25, 10, "static")
@@ -86,7 +81,7 @@ lunatic.physics_optimize()
 
 -- Spawner state
 local spawn_timer = 0
-local spawn_interval = 0.08 -- seconds between spawns
+local spawn_interval = 0.027 -- seconds between spawns (~37/sec)
 local max_bodies = 5000
 local body_queue = {}        -- ring buffer of entity IDs
 
@@ -97,8 +92,8 @@ local function spawn_physics_object()
   end
 
   local e = lunatic.spawn()
-  local x = (math.random() - 0.5) * 6
-  local z = (math.random() - 0.5) * 6
+  local x = (math.random() - 0.5) * 2
+  local z = (math.random() - 0.5) * 2
   local y = 12 + math.random() * 8
   lunatic.add(e, "position", x, y, z)
   lunatic.add(e, "rotation", math.random() * 360, math.random() * 360, 0)
@@ -106,7 +101,15 @@ local function spawn_physics_object()
   local scale = 0.2 + math.random() * 0.6
   lunatic.add(e, "scale", scale, scale, scale)
   lunatic.add(e, "mesh", "sphere")
-  lunatic.add(e, "material", materials[math.random(#materials)])
+  -- Ember balls are rare (10% chance), otherwise pick from white/matte/silver
+  local mat
+  if math.random() < 0.1 then
+    mat = ember
+  else
+    local common = { white, matte, silver }
+    mat = common[math.random(#common)]
+  end
+  lunatic.add(e, "material", mat)
   lunatic.physics_add_sphere(e, scale * 0.5, "dynamic", 0.1, 1.5)
 
   body_queue[#body_queue + 1] = e
@@ -144,6 +147,9 @@ lunatic.system("debug_ui", function(dt)
   ui.set_next_window_pos(16, 16, "first_use")
   ui.set_next_window_size(280, 0, "first_use")
   ui.begin_window("Debug")
+
+  local s = lunatic.get_stats()
+  ui.text(string.format("queue %d | jolt bodies %d", #body_queue, s.physics_total))
 
   if ui.collapsing_header("Post-Processing") then
     local cam_ref = lunatic.ref(cam, "camera")

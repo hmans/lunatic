@@ -34,7 +34,7 @@ const frag_msl = @embedFile("shader_default_frag_msl");
 // Uniform structs
 // ============================================================
 
-const VertexUniforms = extern struct {
+pub const InstanceData = extern struct {
     mvp: [4][4]f32,
     model: [4][4]f32,
 };
@@ -113,7 +113,7 @@ fn srgbToHdr3(color: [3]f32, exposure: f32) [3]f32 {
 // GPU helpers
 // ============================================================
 
-fn createShader(device: *c.SDL_GPUDevice, spv: []const u8, msl: []const u8, stage: c.SDL_GPUShaderStage, num_uniform_buffers: u32, num_samplers: u32) ?*c.SDL_GPUShader {
+fn createShader(device: *c.SDL_GPUDevice, spv: []const u8, msl: []const u8, stage: c.SDL_GPUShaderStage, num_uniform_buffers: u32, num_samplers: u32, num_storage_bufs: u32) ?*c.SDL_GPUShader {
     const formats = c.SDL_GetGPUShaderFormats(device);
 
     var code: [*]const u8 = undefined;
@@ -144,7 +144,7 @@ fn createShader(device: *c.SDL_GPUDevice, spv: []const u8, msl: []const u8, stag
         .stage = stage,
         .num_samplers = num_samplers,
         .num_storage_textures = 0,
-        .num_storage_buffers = 0,
+        .num_storage_buffers = num_storage_bufs,
         .num_uniform_buffers = num_uniform_buffers,
         .props = 0,
     });
@@ -185,13 +185,13 @@ fn createMsaaColorTexture(device: *c.SDL_GPUDevice, format: c.SDL_GPUTextureForm
 pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
     const device = self.gpu_device.?;
 
-    const vert_shader = createShader(device, vert_spv, vert_msl, c.SDL_GPU_SHADERSTAGE_VERTEX, 1, 0) orelse {
+    const vert_shader = createShader(device, vert_spv, vert_msl, c.SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 1) orelse {
         std.debug.print("Failed to create vertex shader: {s}\n", .{c.SDL_GetError()});
         return error.ShaderFailed;
     };
     defer c.SDL_ReleaseGPUShader(device, vert_shader);
 
-    const frag_shader = createShader(device, frag_spv, frag_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 5) orelse {
+    const frag_shader = createShader(device, frag_spv, frag_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 5, 0) orelse {
         std.debug.print("Failed to create fragment shader: {s}\n", .{c.SDL_GetError()});
         return error.ShaderFailed;
     };
@@ -345,75 +345,31 @@ fn buildDrawList(self: *Engine) u32 {
     return draw_count;
 }
 
-/// Submit draw calls for the sorted draw list within a render pass.
-fn submitDrawCalls(
-    self: *Engine,
-    cmd: *c.SDL_GPUCommandBuffer,
-    render_pass: *c.SDL_GPURenderPass,
-    vp: Mat4,
-    draw_count: u32,
-) void {
-    const default_material = MaterialUniforms{ .albedo = .{ 1, 1, 1, 1 } };
-    var bound_mesh: ?u32 = null;
-    var bound_mat: ?u32 = null;
+/// Count the number of unique batches (distinct sort keys) in the draw list.
+pub fn countBatches(self: *Engine, draw_count: u32) u32 {
+    if (draw_count == 0) return 0;
+    var batches: u32 = 1;
+    var i: u32 = 1;
+    while (i < draw_count) : (i += 1) {
+        if (self.draw_list[i].sort_key != self.draw_list[i - 1].sort_key) batches += 1;
+    }
+    return batches;
+}
 
-    for (self.draw_list[0..draw_count]) |entry| {
+/// Upload per-instance data (model + MVP matrices) to the GPU storage buffer.
+/// Must be called before the render pass within the same command buffer.
+fn uploadInstanceData(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, vp: Mat4, draw_count: u32) void {
+    if (draw_count == 0) return;
+    const transfer = self.instance_transfer orelse return;
+    const gpu_buf = self.instance_buffer orelse return;
+
+    // Map transfer buffer and fill instance data
+    const ptr = c.SDL_MapGPUTransferBuffer(self.gpu_device.?, transfer, true) orelse return;
+    const instances: [*]InstanceData = @ptrCast(@alignCast(ptr));
+
+    for (self.draw_list[0..draw_count], 0..) |entry, i| {
         const pos = self.registry.getConst(Position, entry.entity);
         const rot = self.registry.getConst(Rotation, entry.entity);
-        const mesh_id: u32 = @truncate(entry.sort_key >> 32);
-        const mat_id: u32 = @truncate(entry.sort_key);
-        const mesh = self.assets.mesh_registry[mesh_id] orelse continue;
-
-        if (bound_mesh == null or bound_mesh.? != mesh_id) {
-            const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.vertex_buffer, .offset = 0 };
-            c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
-            if (mesh.index_buffer) |ib| {
-                c.SDL_BindGPUIndexBuffer(render_pass, &c.SDL_GPUBufferBinding{ .buffer = ib, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
-            }
-            bound_mesh = mesh_id;
-        }
-
-        if (bound_mat == null or bound_mat.? != mat_id) {
-            const sampler = self.assets.default_sampler.?;
-            const dummy = self.assets.dummy_texture.?;
-
-            if (self.assets.material_registry[mat_id]) |mat| {
-                const has_bc: f32 = if (mat.base_color_texture != null) 1.0 else 0.0;
-                const has_mr: f32 = if (mat.metallic_roughness_texture != null) 1.0 else 0.0;
-                const has_nm: f32 = if (mat.normal_texture != null) 1.0 else 0.0;
-                const has_em: f32 = if (mat.emissive_texture != null) 1.0 else 0.0;
-                const has_ao: f32 = if (mat.occlusion_texture != null) 1.0 else 0.0;
-
-                const mat_uniforms = MaterialUniforms{
-                    .albedo = mat.albedo,
-                    .material_params = .{ mat.metallic, mat.roughness, 0, 0 },
-                    .texture_flags = .{ has_bc, has_mr, has_nm, has_em },
-                    .emissive = .{ mat.emissive[0], mat.emissive[1], mat.emissive[2], has_ao },
-                };
-                c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
-
-                const tex_bindings = [5]c.SDL_GPUTextureSamplerBinding{
-                    .{ .texture = resolveTexture(self, mat.base_color_texture, dummy), .sampler = sampler },
-                    .{ .texture = resolveTexture(self, mat.metallic_roughness_texture, dummy), .sampler = sampler },
-                    .{ .texture = resolveTexture(self, mat.normal_texture, dummy), .sampler = sampler },
-                    .{ .texture = resolveTexture(self, mat.emissive_texture, dummy), .sampler = sampler },
-                    .{ .texture = resolveTexture(self, mat.occlusion_texture, dummy), .sampler = sampler },
-                };
-                c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_bindings, 5);
-            } else {
-                c.SDL_PushGPUFragmentUniformData(cmd, 1, &default_material, @sizeOf(MaterialUniforms));
-                const tex_bindings = [5]c.SDL_GPUTextureSamplerBinding{
-                    .{ .texture = dummy, .sampler = sampler },
-                    .{ .texture = dummy, .sampler = sampler },
-                    .{ .texture = dummy, .sampler = sampler },
-                    .{ .texture = dummy, .sampler = sampler },
-                    .{ .texture = dummy, .sampler = sampler },
-                };
-                c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_bindings, 5);
-            }
-            bound_mat = mat_id;
-        }
-
         const rotation = Mat4.mul(Mat4.mul(Mat4.rotateZ(rot.z), Mat4.rotateY(rot.y)), Mat4.rotateX(rot.x));
         const scl = if (self.registry.tryGet(Scale, entry.entity)) |s|
             Mat4.scale(s.x, s.y, s.z)
@@ -421,14 +377,110 @@ fn submitDrawCalls(
             Mat4.identity();
         const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), Mat4.mul(rotation, scl));
         const mvp = Mat4.mul(vp, model);
+        instances[i] = .{ .mvp = mvp.m, .model = model.m };
+    }
 
-        const vert_uniforms = VertexUniforms{ .mvp = mvp.m, .model = model.m };
-        c.SDL_PushGPUVertexUniformData(cmd, 0, &vert_uniforms, @sizeOf(VertexUniforms));
-        if (mesh.index_buffer != null) {
-            c.SDL_DrawGPUIndexedPrimitives(render_pass, mesh.index_count, 1, 0, 0, 0);
-        } else {
-            c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, 1, 0, 0);
+    c.SDL_UnmapGPUTransferBuffer(self.gpu_device.?, transfer);
+
+    // Upload to GPU via copy pass
+    const data_size: u32 = draw_count * @sizeOf(InstanceData);
+    const copy_pass = c.SDL_BeginGPUCopyPass(cmd) orelse return;
+    c.SDL_UploadToGPUBuffer(copy_pass, &c.SDL_GPUTransferBufferLocation{
+        .transfer_buffer = transfer,
+        .offset = 0,
+    }, &c.SDL_GPUBufferRegion{
+        .buffer = gpu_buf,
+        .offset = 0,
+        .size = data_size,
+    }, true);
+    c.SDL_EndGPUCopyPass(copy_pass);
+}
+
+/// Submit batched instanced draw calls. The draw list is sorted by mesh+material,
+/// so consecutive entries with the same sort_key form a batch drawn in one call.
+fn submitDrawCalls(
+    self: *Engine,
+    cmd: *c.SDL_GPUCommandBuffer,
+    render_pass: *c.SDL_GPURenderPass,
+    draw_count: u32,
+) void {
+    if (draw_count == 0) return;
+    const default_material = MaterialUniforms{ .albedo = .{ 1, 1, 1, 1 } };
+
+    // Bind the instance storage buffer
+    const buf_ptr = [1]*c.SDL_GPUBuffer{self.instance_buffer.?};
+    c.SDL_BindGPUVertexStorageBuffers(render_pass, 0, &buf_ptr, 1);
+
+    var batch_start: u32 = 0;
+    while (batch_start < draw_count) {
+        const sort_key = self.draw_list[batch_start].sort_key;
+        var batch_end: u32 = batch_start + 1;
+        while (batch_end < draw_count and self.draw_list[batch_end].sort_key == sort_key) {
+            batch_end += 1;
         }
+        const instance_count = batch_end - batch_start;
+
+        const mesh_id: u32 = @truncate(sort_key >> 32);
+        const mat_id: u32 = @truncate(sort_key);
+        const mesh = self.assets.mesh_registry[mesh_id] orelse {
+            batch_start = batch_end;
+            continue;
+        };
+
+        // Bind mesh
+        const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.vertex_buffer, .offset = 0 };
+        c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
+        if (mesh.index_buffer) |ib| {
+            c.SDL_BindGPUIndexBuffer(render_pass, &c.SDL_GPUBufferBinding{ .buffer = ib, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
+        }
+
+        // Bind material
+        const sampler = self.assets.default_sampler.?;
+        const dummy = self.assets.dummy_texture.?;
+
+        if (self.assets.material_registry[mat_id]) |mat| {
+            const has_bc: f32 = if (mat.base_color_texture != null) 1.0 else 0.0;
+            const has_mr: f32 = if (mat.metallic_roughness_texture != null) 1.0 else 0.0;
+            const has_nm: f32 = if (mat.normal_texture != null) 1.0 else 0.0;
+            const has_em: f32 = if (mat.emissive_texture != null) 1.0 else 0.0;
+            const has_ao: f32 = if (mat.occlusion_texture != null) 1.0 else 0.0;
+
+            const mat_uniforms = MaterialUniforms{
+                .albedo = mat.albedo,
+                .material_params = .{ mat.metallic, mat.roughness, 0, 0 },
+                .texture_flags = .{ has_bc, has_mr, has_nm, has_em },
+                .emissive = .{ mat.emissive[0], mat.emissive[1], mat.emissive[2], has_ao },
+            };
+            c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
+
+            const tex_bindings = [5]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = resolveTexture(self, mat.base_color_texture, dummy), .sampler = sampler },
+                .{ .texture = resolveTexture(self, mat.metallic_roughness_texture, dummy), .sampler = sampler },
+                .{ .texture = resolveTexture(self, mat.normal_texture, dummy), .sampler = sampler },
+                .{ .texture = resolveTexture(self, mat.emissive_texture, dummy), .sampler = sampler },
+                .{ .texture = resolveTexture(self, mat.occlusion_texture, dummy), .sampler = sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_bindings, 5);
+        } else {
+            c.SDL_PushGPUFragmentUniformData(cmd, 1, &default_material, @sizeOf(MaterialUniforms));
+            const tex_bindings = [5]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = dummy, .sampler = sampler },
+                .{ .texture = dummy, .sampler = sampler },
+                .{ .texture = dummy, .sampler = sampler },
+                .{ .texture = dummy, .sampler = sampler },
+                .{ .texture = dummy, .sampler = sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_bindings, 5);
+        }
+
+        // Instanced draw — batch_start is the first instance index
+        if (mesh.index_buffer != null) {
+            c.SDL_DrawGPUIndexedPrimitives(render_pass, mesh.index_count, instance_count, 0, 0, batch_start);
+        } else {
+            c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, instance_count, 0, batch_start);
+        }
+
+        batch_start = batch_end;
     }
 }
 
@@ -527,32 +579,13 @@ pub fn renderCamera(
         .layer = 0,
     };
 
-    const render_pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target) orelse return;
-    c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
-
-    // Viewport and scissor
+    // Compute view-projection matrix
     const w_f: f32 = @floatFromInt(w);
     const h_f: f32 = @floatFromInt(h);
     const vp_x = cam.viewport_x * w_f;
     const vp_y = cam.viewport_y * h_f;
     const vp_w = cam.viewport_w * w_f;
     const vp_h = cam.viewport_h * h_f;
-    c.SDL_SetGPUViewport(render_pass, &c.SDL_GPUViewport{
-        .x = vp_x,
-        .y = vp_y,
-        .w = vp_w,
-        .h = vp_h,
-        .min_depth = 0.0,
-        .max_depth = 1.0,
-    });
-    c.SDL_SetGPUScissor(render_pass, &c.SDL_Rect{
-        .x = @intFromFloat(vp_x),
-        .y = @intFromFloat(vp_y),
-        .w = @intFromFloat(vp_w),
-        .h = @intFromFloat(vp_h),
-    });
-
-    // View-projection matrix
     const aspect: f32 = vp_w / vp_h;
     const proj = Mat4.perspective(cam.fov, aspect, cam.near, cam.far);
 
@@ -571,7 +604,29 @@ pub fn renderCamera(
 
     const vp = Mat4.mul(proj, view);
 
-    // Scene uniforms — convert fog color to linear HDR to match scene buffer space
+    // Upload instance data (copy pass — must happen before render pass)
+    uploadInstanceData(self, cmd, vp, frame.draw_count);
+
+    // Begin render pass
+    const render_pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target) orelse return;
+    c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
+
+    c.SDL_SetGPUViewport(render_pass, &c.SDL_GPUViewport{
+        .x = vp_x,
+        .y = vp_y,
+        .w = vp_w,
+        .h = vp_h,
+        .min_depth = 0.0,
+        .max_depth = 1.0,
+    });
+    c.SDL_SetGPUScissor(render_pass, &c.SDL_Rect{
+        .x = @intFromFloat(vp_x),
+        .y = @intFromFloat(vp_y),
+        .w = @intFromFloat(vp_w),
+        .h = @intFromFloat(vp_h),
+    });
+
+    // Scene uniforms
     const hdr_fog = srgbToHdr3(self.fog_color, exposure);
     const scene_uniforms = SceneUniforms{
         .light_dir = frame.light_dir,
@@ -582,6 +637,6 @@ pub fn renderCamera(
     };
     c.SDL_PushGPUFragmentUniformData(cmd, 0, &scene_uniforms, @sizeOf(SceneUniforms));
 
-    submitDrawCalls(self, cmd, render_pass, vp, frame.draw_count);
+    submitDrawCalls(self, cmd, render_pass, frame.draw_count);
     c.SDL_EndGPURenderPass(render_pass);
 }

@@ -190,6 +190,9 @@ pub const Engine = struct {
     gpu_device: ?*c.SDL_GPUDevice = null,
     sdl_window: ?*c.SDL_Window = null,
     pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    instance_buffer: ?*c.SDL_GPUBuffer = null,
+    instance_transfer: ?*c.SDL_GPUTransferBuffer = null,
+    instance_capacity: u32 = 0,
     depth_texture: ?*c.SDL_GPUTexture = null,
     msaa_color_texture: ?*c.SDL_GPUTexture = null,
     swapchain_format: c.SDL_GPUTextureFormat = c.SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
@@ -278,6 +281,8 @@ pub const Engine = struct {
             self.assets.deinit(device);
             if (self.msaa_color_texture) |mt| c.SDL_ReleaseGPUTexture(device, mt);
             if (self.depth_texture) |dt| c.SDL_ReleaseGPUTexture(device, dt);
+            if (self.instance_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
+            if (self.instance_transfer) |t| c.SDL_ReleaseGPUTransferBuffer(device, t);
             if (self.pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
             if (self.sdl_window) |w| c.SDL_DestroyWindow(w);
             c.SDL_DestroyGPUDevice(device);
@@ -364,7 +369,8 @@ pub const Engine = struct {
             const t2 = c.SDL_GetPerformanceCounter();
             const frame = renderer.prepareFrame(self, sw_w, sw_h);
             self.stats.entities_rendered = frame.draw_count;
-            self.stats.draw_calls = frame.draw_count;
+            // draw_calls will be updated by countBatches
+            self.stats.draw_calls = renderer.countBatches(self, frame.draw_count);
             const hdr_tex = self.postprocess.hdr_texture.?;
 
             // Per-camera: render scene → HDR, then postprocess → swapchain
@@ -481,6 +487,20 @@ pub const Engine = struct {
 
         // Pipeline + render targets
         try renderer.initPipeline(self, config);
+
+        // Instance buffer for batched rendering
+        const instance_buf_size: u32 = renderer.max_renderables * @sizeOf(renderer.InstanceData);
+        self.instance_buffer = c.SDL_CreateGPUBuffer(self.gpu_device.?, &c.SDL_GPUBufferCreateInfo{
+            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+            .size = instance_buf_size,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        self.instance_transfer = c.SDL_CreateGPUTransferBuffer(self.gpu_device.?, &c.SDL_GPUTransferBufferCreateInfo{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = instance_buf_size,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        self.instance_capacity = renderer.max_renderables;
 
         // Post-processing (bloom)
         try postprocess.initPostProcess(self);
@@ -842,13 +862,14 @@ pub const Engine = struct {
         _ = c.igBegin("##stats", null, c.ImGuiWindowFlags_NoTitleBar | c.ImGuiWindowFlags_NoResize | c.ImGuiWindowFlags_NoMove | c.ImGuiWindowFlags_AlwaysAutoResize | c.ImGuiWindowFlags_NoSavedSettings | c.ImGuiWindowFlags_NoFocusOnAppearing | c.ImGuiWindowFlags_NoNav);
 
         var buf: [128]u8 = undefined;
-        const line1 = std.fmt.bufPrintZ(&buf, "{d:.0} fps | {d} draw calls", .{ if (io) |i| i.*.Framerate else 0, s.draw_calls }) catch "???";
+        const line1 = std.fmt.bufPrintZ(&buf, "{d:.0} fps | {d} draws ({d} entities)", .{ if (io) |i| i.*.Framerate else 0, s.draw_calls, s.entities_rendered }) catch "???";
         c.igTextUnformatted(line1);
 
         var buf2: [128]u8 = undefined;
-        const line2 = std.fmt.bufPrintZ(&buf2, "physics {d}/{d} active", .{
+        const line2 = std.fmt.bufPrintZ(&buf2, "physics {d}/{d} active | rendered {d}", .{
             s.physics_active,
             s.physics_total,
+            s.entities_rendered,
         }) catch "???";
         c.igTextUnformatted(line2);
 

@@ -74,7 +74,7 @@ const hdr_format: c.SDL_GPUTextureFormat = c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_
 pub const max_mip_levels = 6;
 
 // Default per-level tints (UE4-inspired, sum ≈ 1.0)
-const default_tints = [max_mip_levels]f32{ 0.5, 0.3, 0.2, 0.15, 0.1, 0.08 };
+const default_tints = [max_mip_levels]f32{ 0.8, 0.6, 0.5, 0.4, 0.3, 0.2 };
 
 // ============================================================
 // PostProcess state — GPU handles only, no settings
