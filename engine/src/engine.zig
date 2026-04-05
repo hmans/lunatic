@@ -24,6 +24,9 @@ pub const c = @cImport({
 const stbi = @cImport({
     @cInclude("stb_image.h");
 });
+const stbiw = @cImport({
+    @cInclude("stb_image_write.h");
+});
 
 const Vertex = geometry.Vertex;
 
@@ -244,6 +247,12 @@ pub const Engine = struct {
     // State
     headless: bool = false,
     debug_stats: bool = false,
+    screenshot_requested: bool = false,
+    screenshot_path_buf: [256]u8 = undefined,
+    screenshot_path_len: u8 = 0,
+    screenshot_texture: ?*c.SDL_GPUTexture = null,
+    screenshot_tex_w: u32 = 0,
+    screenshot_tex_h: u32 = 0,
 
     // ---- Lifecycle ----
 
@@ -287,6 +296,7 @@ pub const Engine = struct {
             postprocess.deinitPostProcess(self);
             const device = self.gpu_device.?;
             self.assets.deinit(device);
+            if (self.screenshot_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
             if (self.msaa_color_texture) |mt| c.SDL_ReleaseGPUTexture(device, mt);
             if (self.depth_texture) |dt| c.SDL_ReleaseGPUTexture(device, dt);
             if (self.instance_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
@@ -336,6 +346,9 @@ pub const Engine = struct {
                 if (event.type == c.SDL_EVENT_QUIT) running = false;
                 if (event.type == c.SDL_EVENT_KEY_DOWN and event.key.scancode == c.SDL_SCANCODE_ESCAPE) running = false;
             }
+
+            // Check for screenshot request (file-based trigger)
+            self.checkScreenshotRequest();
 
             // ImGui new frame (before systems so user code can draw UI)
             c.cImGui_ImplSDLGPU3_NewFrame();
@@ -424,7 +437,14 @@ pub const Engine = struct {
                     .flare_dirt_intensity = cam.flare_dirt_intensity,
                     .camera_angle_z = self.registry.getConst(core_components.Rotation, cam_entity).z * (std.math.pi / 180.0),
                 };
-                postprocess.executePostProcess(self, cmd, swapchain_tex.?, sw_w, sw_h, settings);
+                // When capturing a screenshot, render to an intermediate texture
+                // instead of the swapchain (Metal swapchain is framebufferOnly).
+                const render_target = if (self.screenshot_requested)
+                    self.ensureScreenshotTexture(device, sw_w, sw_h) orelse swapchain_tex.?
+                else
+                    swapchain_tex.?;
+
+                postprocess.executePostProcess(self, cmd, render_target, sw_w, sw_h, settings);
                 const tpp1 = c.SDL_GetPerformanceCounter();
                 self.stats.time_postprocess_us = (tpp1 - tpp0) * 1_000_000 / pf;
             }
@@ -436,8 +456,13 @@ pub const Engine = struct {
             if (draw_data != null) {
                 c.cImGui_ImplSDLGPU3_PrepareDrawData(draw_data, cmd);
 
+                const imgui_target = if (self.screenshot_requested and self.screenshot_texture != null)
+                    self.screenshot_texture.?
+                else
+                    swapchain_tex.?;
+
                 const imgui_color_target = c.SDL_GPUColorTargetInfo{
-                    .texture = swapchain_tex,
+                    .texture = imgui_target,
                     .mip_level = 0,
                     .layer_or_depth_plane = 0,
                     .clear_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
@@ -460,7 +485,44 @@ pub const Engine = struct {
             const tui1 = c.SDL_GetPerformanceCounter();
             self.stats.time_imgui_us = (tui1 - tui0) * 1_000_000 / pf;
 
-            _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+            // Screenshot: blit to swapchain + download from intermediate texture
+            if (self.screenshot_requested and self.screenshot_texture != null) {
+                // Blit intermediate → swapchain so the frame is still displayed
+                const blit_info = c.SDL_GPUBlitInfo{
+                    .source = .{
+                        .texture = self.screenshot_texture.?,
+                        .mip_level = 0,
+                        .layer_or_depth_plane = 0,
+                        .x = 0,
+                        .y = 0,
+                        .w = sw_w,
+                        .h = sw_h,
+                    },
+                    .destination = .{
+                        .texture = swapchain_tex.?,
+                        .mip_level = 0,
+                        .layer_or_depth_plane = 0,
+                        .x = 0,
+                        .y = 0,
+                        .w = sw_w,
+                        .h = sw_h,
+                    },
+                    .load_op = c.SDL_GPU_LOADOP_DONT_CARE,
+                    .clear_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+                    .flip_mode = c.SDL_FLIP_NONE,
+                    .filter = c.SDL_GPU_FILTER_NEAREST,
+                    .cycle = false,
+                    .padding1 = 0,
+                    .padding2 = 0,
+                    .padding3 = 0,
+                };
+                c.SDL_BlitGPUTexture(cmd, &blit_info);
+
+                self.downloadScreenshot(device, cmd, sw_w, sw_h);
+                self.screenshot_requested = false;
+            } else {
+                _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+            }
 
             // Debug stats to console (once per second)
             if (self.debug_stats and self.current_frame % 60 == 0) {
@@ -824,6 +886,159 @@ pub const Engine = struct {
         const pixels = stbi.stbi_load(path, &w, &h, &channels, 4) orelse return error.ImageLoadFailed;
         defer stbi.stbi_image_free(pixels);
         return self.createTextureFromMemory(@ptrCast(pixels), @intCast(w), @intCast(h));
+    }
+
+    // ---- Screenshot ----
+
+    /// Scan `tmp/` for any `*.request` file. If found, derive the output path by
+    /// replacing `.request` with `.png`, delete the trigger, and set the screenshot flag.
+    /// Example: `tmp/shot1.request` → `tmp/shot1.png`.
+    fn checkScreenshotRequest(self: *Engine) void {
+        const cwd = std.fs.cwd();
+        var dir = cwd.openDir("tmp", .{ .iterate = true }) catch return;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        const entry = (iter.next() catch return) orelse return;
+        // Keep iterating until we find a .request file
+        var name = entry.name;
+        var found = std.mem.endsWith(u8, name, ".request");
+        while (!found) {
+            const next = (iter.next() catch return) orelse return;
+            name = next.name;
+            found = std.mem.endsWith(u8, name, ".request");
+        }
+        if (!found) return;
+
+        // Build output path: tmp/<basename>.png
+        const stem_len = name.len - ".request".len;
+        const prefix = "tmp/";
+        const suffix = ".png";
+        const total = prefix.len + stem_len + suffix.len;
+        if (total > self.screenshot_path_buf.len) return;
+
+        @memcpy(self.screenshot_path_buf[0..prefix.len], prefix);
+        @memcpy(self.screenshot_path_buf[prefix.len..][0..stem_len], name[0..stem_len]);
+        @memcpy(self.screenshot_path_buf[prefix.len + stem_len ..][0..suffix.len], suffix);
+        self.screenshot_path_len = @intCast(total);
+
+        // Delete the trigger file
+        dir.deleteFile(name) catch {};
+        self.screenshot_requested = true;
+    }
+
+    /// Ensure the screenshot intermediate texture exists at the right size.
+    fn ensureScreenshotTexture(self: *Engine, device: *c.SDL_GPUDevice, w: u32, h: u32) ?*c.SDL_GPUTexture {
+        if (self.screenshot_texture != null and self.screenshot_tex_w == w and self.screenshot_tex_h == h) {
+            return self.screenshot_texture;
+        }
+        if (self.screenshot_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
+
+        self.screenshot_texture = c.SDL_CreateGPUTexture(device, &c.SDL_GPUTextureCreateInfo{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = self.swapchain_format,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = w,
+            .height = h,
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .props = 0,
+        });
+        self.screenshot_tex_w = w;
+        self.screenshot_tex_h = h;
+        return self.screenshot_texture;
+    }
+
+    /// Download the screenshot texture to a PNG file.
+    fn downloadScreenshot(self: *Engine, device: *c.SDL_GPUDevice, cmd: *c.SDL_GPUCommandBuffer, w: u32, h: u32) void {
+        const screenshot_tex = self.screenshot_texture orelse {
+            _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+            return;
+        };
+        const data_size = w * h * 4;
+
+        const transfer = c.SDL_CreateGPUTransferBuffer(device, &c.SDL_GPUTransferBufferCreateInfo{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD,
+            .size = data_size,
+            .props = 0,
+        }) orelse {
+            std.debug.print("[screenshot] failed to create transfer buffer\n", .{});
+            _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+            return;
+        };
+
+        const copy_pass = c.SDL_BeginGPUCopyPass(cmd) orelse {
+            std.debug.print("[screenshot] failed to begin copy pass\n", .{});
+            c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+            _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+            return;
+        };
+
+        c.SDL_DownloadFromGPUTexture(copy_pass, &c.SDL_GPUTextureRegion{
+            .texture = screenshot_tex,
+            .mip_level = 0,
+            .layer = 0,
+            .x = 0,
+            .y = 0,
+            .z = 0,
+            .w = w,
+            .h = h,
+            .d = 1,
+        }, &c.SDL_GPUTextureTransferInfo{
+            .transfer_buffer = transfer,
+            .offset = 0,
+            .pixels_per_row = w,
+            .rows_per_layer = h,
+        });
+        c.SDL_EndGPUCopyPass(copy_pass);
+
+        const fence = c.SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+        if (fence == null) {
+            std.debug.print("[screenshot] failed to acquire fence\n", .{});
+            c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+            return;
+        }
+        _ = c.SDL_WaitForGPUFences(device, true, @ptrCast(&fence), 1);
+        c.SDL_ReleaseGPUFence(device, fence);
+
+        const ptr = c.SDL_MapGPUTransferBuffer(device, transfer, false) orelse {
+            std.debug.print("[screenshot] failed to map transfer buffer\n", .{});
+            c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+            return;
+        };
+        const pixels: [*]u8 = @ptrCast(ptr);
+
+        // Swizzle BGRA → RGBA in-place
+        var i: u32 = 0;
+        while (i < data_size) : (i += 4) {
+            const tmp = pixels[i];
+            pixels[i] = pixels[i + 2];
+            pixels[i + 2] = tmp;
+        }
+
+        // Null-terminate the path for C
+        const path_len = self.screenshot_path_len;
+        self.screenshot_path_buf[path_len] = 0;
+        const path: [*:0]const u8 = @ptrCast(self.screenshot_path_buf[0..path_len :0]);
+
+        const result = stbiw.stbi_write_png(
+            path,
+            @intCast(w),
+            @intCast(h),
+            4,
+            pixels,
+            @intCast(w * 4),
+        );
+
+        c.SDL_UnmapGPUTransferBuffer(device, transfer);
+        c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+
+        if (result != 0) {
+            std.debug.print("[screenshot] saved {s} ({}x{})\n", .{ path, w, h });
+        } else {
+            std.debug.print("[screenshot] failed to write {s}\n", .{path});
+        }
     }
 
     // ---- Lua systems ----

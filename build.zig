@@ -67,6 +67,7 @@ fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
     compile.linkSystemLibrary("SDL3");
     compile.linkSystemLibrary("luajit-5.1");
     compile.addCSourceFile(.{ .file = b.path("engine/vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
+    compile.addCSourceFile(.{ .file = b.path("engine/vendor/stb_image_write_impl.c"), .flags = &.{"-std=c99"} });
     compile.addCSourceFile(.{ .file = b.path("engine/vendor/cgltf_impl.c"), .flags = &.{"-std=c99"} });
 
     // Dear ImGui (C++ core + C wrapper + SDL3/GPU backends)
