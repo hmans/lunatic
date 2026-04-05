@@ -83,12 +83,20 @@ lunatic.physics_optimize()
 local spawn_timer = 0
 local spawn_interval = 0.027 -- seconds between spawns (~37/sec)
 local max_bodies = 5000
-local body_queue = {}        -- ring buffer of entity IDs
+local body_ring = {}         -- circular buffer of entity IDs
+local ring_head = 1          -- next slot to write
+local ring_count = 0         -- current number of live entities
 
 local function spawn_physics_object()
   -- Kill oldest if at capacity
-  if #body_queue >= max_bodies then
-    lunatic.destroy(table.remove(body_queue, 1))
+  if ring_count >= max_bodies then
+    local oldest_idx = ((ring_head - ring_count - 1) % max_bodies) + 1
+    local oldest = body_ring[oldest_idx]
+    if oldest then
+      lunatic.destroy(oldest)
+      body_ring[oldest_idx] = nil
+    end
+    ring_count = ring_count - 1
   end
 
   local e = lunatic.spawn()
@@ -112,7 +120,9 @@ local function spawn_physics_object()
   lunatic.add(e, "material", mat)
   lunatic.physics_add_sphere(e, scale * 0.5, "dynamic", 0.1, 1.5)
 
-  body_queue[#body_queue + 1] = e
+  body_ring[ring_head] = e
+  ring_head = (ring_head % max_bodies) + 1
+  ring_count = ring_count + 1
 end
 
 --------------------------------------------------------------------------------
@@ -128,14 +138,15 @@ lunatic.system("spawner", function(dt)
   end
 
   -- Kill bodies that fell off the world
-  local i = 1
-  while i <= #body_queue do
-    local pos = lunatic.ref(body_queue[i], "position")
-    if pos.y < -20 then
-      lunatic.destroy(body_queue[i])
-      table.remove(body_queue, i)
-    else
-      i = i + 1
+  for i = 1, max_bodies do
+    local e = body_ring[i]
+    if e then
+      local ok, pos = pcall(lunatic.ref, e, "position")
+      if ok and pos.y < -20 then
+        lunatic.destroy(e)
+        body_ring[i] = nil
+        ring_count = ring_count - 1
+      end
     end
   end
 end)
@@ -149,7 +160,7 @@ lunatic.system("debug_ui", function(dt)
   ui.begin_window("Debug")
 
   local s = lunatic.get_stats()
-  ui.text(string.format("queue %d | jolt bodies %d", #body_queue, s.physics_total))
+  ui.text(string.format("queue %d | jolt bodies %d", ring_count, s.physics_total))
 
   if ui.collapsing_header("Post-Processing") then
     local cam_ref = lunatic.ref(cam, "camera")
