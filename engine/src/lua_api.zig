@@ -807,6 +807,8 @@ fn luaPhysicsAddBox(L: ?*lc.lua_State) callconv(.c) c_int {
         .object_layer = if (motion == .static) phys.object_layers.non_moving else phys.object_layers.moving,
         .restitution = restitution,
         .friction = friction,
+        .linear_damping = 0.2,
+        .angular_damping = 0.4,
     }, .activate) catch return 0;
 
     self.registry.addOrReplace(entity, core_comp.RigidBody{ .body_id = @intFromEnum(body_id) });
@@ -836,6 +838,8 @@ fn luaPhysicsAddSphere(L: ?*lc.lua_State) callconv(.c) c_int {
         .object_layer = if (motion == .static) phys.object_layers.non_moving else phys.object_layers.moving,
         .restitution = restitution,
         .friction = friction,
+        .linear_damping = 0.2,
+        .angular_damping = 0.4,
     }, .activate) catch return 0;
 
     self.registry.addOrReplace(entity, core_comp.RigidBody{ .body_id = @intFromEnum(body_id) });

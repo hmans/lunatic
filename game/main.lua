@@ -118,7 +118,7 @@ local function spawn_physics_object()
     mat = common[math.random(#common)]
   end
   lunatic.add(e, "material", mat)
-  lunatic.physics_add_sphere(e, scale * 0.5, "dynamic", 0.1, 1.5)
+  lunatic.physics_add_sphere(e, scale * 0.5, "dynamic", 0.0, 0.8)
 
   body_ring[ring_head] = e
   ring_head = (ring_head % max_bodies) + 1
