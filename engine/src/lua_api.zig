@@ -17,6 +17,13 @@ const lc = lua.c;
 
 // Safe error raising — calls lua_error from C to avoid longjmp through Zig frames.
 extern fn lunatic_lua_error(L: ?*lc.lua_State) c_int;
+extern fn lunatic_luaL_error(L: ?*lc.lua_State, msg: [*:0]const u8) c_int;
+
+/// Raise a Lua error safely from Zig. Pushes the error string and calls lua_error from C.
+/// Use: `return raiseError(L, "msg")` or after `lua_pushfstring`: `return lunatic_lua_error(L)`
+fn raiseError(L: ?*lc.lua_State, msg: [*:0]const u8) c_int {
+    return lunatic_luaL_error(L, msg);
+}
 const component_ops = @import("component_ops");
 const ComponentOps = component_ops.ComponentOps;
 
@@ -182,11 +189,11 @@ fn entityFromLua(self: *Engine, L: ?*lc.lua_State, idx: c_int) EntityResult {
     return .{ .entity = entity, .valid = true };
 }
 
-/// Helper: get entity or return Lua error. Use at the start of Lua callbacks.
-/// Returns null if entity is invalid (error already pushed, caller should return lc.lua_error(L)).
+/// Helper: get entity or raise Lua error safely via C helper.
+/// Returns null if entity is invalid (Lua error raised, caller must return immediately).
 fn getEntityOrError(self: *Engine, L: ?*lc.lua_State, idx: c_int) ?ecs.Entity {
     const result = entityFromLua(self, L, idx);
-    if (!result.valid) return null;
+    if (!result.valid) return null; // error string already pushed
     return result.entity;
 }
 
@@ -720,8 +727,8 @@ fn luaSetBloom(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const entity = getEntityOrError(self, L, 1) orelse return lunatic_lua_error(L);
     const cam = self.registry.tryGet(engine_mod.core_components.Camera, entity) orelse {
-        _ = lc.luaL_error(L, "set_bloom: entity has no camera component");
-        unreachable;
+        _ = lc.lua_pushfstring(L, "set_bloom: entity has no camera component");
+        return lunatic_lua_error(L);
     };
     const nargs = lc.lua_gettop(L);
     if (nargs >= 2) cam.bloom_intensity = checkFloat(L, 2);
@@ -1006,8 +1013,8 @@ fn luaUiCond(L: ?*lc.lua_State, idx: c_int) c_int {
 fn luaCreateCubeMesh(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const id = self.createCubeMesh() catch {
-        _ = lc.luaL_error(L, "failed to create cube mesh");
-        unreachable;
+        _ = lc.lua_pushfstring(L, "failed to create cube mesh");
+        return lunatic_lua_error(L);
     };
     lc.lua_pushinteger(L, @intCast(id));
     return 1;
@@ -1028,8 +1035,8 @@ fn luaCreateSphereMesh(L: ?*lc.lua_State) callconv(.c) c_int {
         break :blk r;
     } else 16;
     const id = self.createSphereMesh(segments, rings) catch {
-        _ = lc.luaL_error(L, "failed to create sphere mesh");
-        unreachable;
+        _ = lc.lua_pushfstring(L, "failed to create sphere mesh");
+        return lunatic_lua_error(L);
     };
     lc.lua_pushinteger(L, @intCast(id));
     return 1;
@@ -1082,8 +1089,8 @@ fn luaCreateMaterial(L: ?*lc.lua_State) callconv(.c) c_int {
     lc.lua_pop(L, 1);
 
     const id = self.createMaterial(data) catch {
-        _ = lc.luaL_error(L, "too many materials");
-        unreachable;
+        _ = lc.lua_pushfstring(L, "too many materials");
+        return lunatic_lua_error(L);
     };
     lc.lua_pushinteger(L, @intCast(id));
     return 1;
@@ -1094,8 +1101,8 @@ fn luaLoadGltf(L: ?*lc.lua_State) callconv(.c) c_int {
     const path = lc.luaL_checklstring(L, 1, null);
 
     var model = gltf_mod.load(self, path) catch {
-        _ = lc.luaL_error(L, "failed to load gltf: %s", path);
-        unreachable;
+        _ = lc.lua_pushfstring(L, "failed to load gltf: %s", path);
+        return lunatic_lua_error(L);
     };
     defer model.deinit();
 
