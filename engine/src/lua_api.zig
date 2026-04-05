@@ -172,6 +172,7 @@ fn entityFromLua(self: *Engine, L: ?*lc.lua_State, idx: c_int) ecs.Entity {
     const entity: ecs.Entity = @bitCast(id);
     if (!self.registry.valid(entity)) {
         _ = lc.luaL_error(L, "invalid entity %d", @as(c_int, @intCast(id)));
+        unreachable; // luaL_error longjmps, never returns
     }
     return entity;
 }
