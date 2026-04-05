@@ -6,12 +6,26 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
-    runs-on: macos-14
-    name: macOS-arm64
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            name: macOS-arm64
+          - os: macos-13
+            name: macOS-x64
+          - os: ubuntu-24.04
+            name: Linux-x64
+          - os: ubuntu-24.04-arm
+            name: Linux-arm64
+
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
 
     steps:
       - uses: actions/checkout@v4
@@ -22,11 +36,33 @@ jobs:
         with:
           version: "0.15.2"
 
-      - name: Install dependencies
-        run: brew install sdl3 luajit shaderc spirv-cross
+      # SDL3 — Homebrew on macOS, build from source on Linux
+      - name: Install SDL3 (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sdl3
+
+      - name: Install SDL3 (Linux)
+        if: runner.os == 'Linux'
+        uses: libsdl-org/setup-sdl@v1
+        with:
+          version: 3-latest
+          build-type: Release
+
+      # Other dependencies
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install luajit shaderc spirv-cross
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libluajit-5.1-dev glslc spirv-cross
 
       - name: Build
         run: zig build
 
       - name: Test
         run: zig build test
+        env:
+          SDL_VIDEODRIVER: dummy

@@ -51,57 +51,41 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) 
     addShader(b, pp_mod, "postprocess", "dof_tent", "frag", .fragment);
 }
 
-/// Detected system library prefix (Homebrew, /usr/local, /usr, etc.)
-const SystemPrefix = struct {
-    include: []const u8,
-    lib: []const u8,
-    luajit_include: []const u8,
-};
+/// Add all system include/lib paths from known prefixes where dependencies are found.
+fn addSystemPaths(mod: *std.Build.Module, allocator: std.mem.Allocator) void {
+    const prefixes = [_][]const u8{ "/opt/homebrew", "/usr/local", "/usr" };
 
-fn detectSystemPrefix(allocator: std.mem.Allocator) ?SystemPrefix {
-    const candidates = [_][]const u8{
-        "/opt/homebrew", // Homebrew on Apple Silicon
-        "/usr/local", // Homebrew on Intel Mac, manual installs
-        "/usr", // Standard Linux
-    };
+    for (prefixes) |prefix| {
+        const inc = std.fmt.allocPrint(allocator, "{s}/include", .{prefix}) catch continue;
+        const lib = std.fmt.allocPrint(allocator, "{s}/lib", .{prefix}) catch continue;
 
-    for (candidates) |prefix| {
+        // Check if this prefix has anything useful (SDL3 or LuaJIT)
         const sdl_check = std.fmt.allocPrint(allocator, "{s}/include/SDL3/SDL.h", .{prefix}) catch continue;
-        std.fs.cwd().access(sdl_check, .{}) catch continue;
+        const has_sdl = if (std.fs.cwd().access(sdl_check, .{})) |_| true else |_| false;
 
-        // Found SDL3 — look for LuaJIT headers
-        const luajit_21 = std.fmt.allocPrint(allocator, "{s}/include/luajit-2.1", .{prefix}) catch continue;
-        const luajit_dir = blk: {
-            std.fs.cwd().access(luajit_21, .{}) catch {
-                break :blk std.fmt.allocPrint(allocator, "{s}/include/luajit-5.1", .{prefix}) catch continue;
-            };
-            break :blk luajit_21;
-        };
+        const luajit_check = std.fmt.allocPrint(allocator, "{s}/include/luajit-2.1", .{prefix}) catch continue;
+        const has_luajit = if (std.fs.cwd().access(luajit_check, .{})) |_| true else |_| false;
 
-        return .{
-            .include = std.fmt.allocPrint(allocator, "{s}/include", .{prefix}) catch continue,
-            .lib = std.fmt.allocPrint(allocator, "{s}/lib", .{prefix}) catch continue,
-            .luajit_include = luajit_dir,
-        };
+        if (has_sdl or has_luajit) {
+            mod.addIncludePath(.{ .cwd_relative = inc });
+            mod.addLibraryPath(.{ .cwd_relative = lib });
+        }
+        if (has_luajit) {
+            mod.addIncludePath(.{ .cwd_relative = std.fmt.allocPrint(allocator, "{s}/include/luajit-2.1", .{prefix}) catch continue });
+        }
     }
-    return null;
 }
 
 /// Add C include paths for @cImport to a module.
 fn addCIncludes(b: *std.Build, mod: *std.Build.Module, vendor_path: std.Build.LazyPath) void {
-    if (detectSystemPrefix(b.allocator)) |prefix| {
-        mod.addIncludePath(.{ .cwd_relative = prefix.include });
-        mod.addIncludePath(.{ .cwd_relative = prefix.luajit_include });
-    }
+    addSystemPaths(mod, b.allocator);
     mod.addIncludePath(vendor_path);
     mod.addIncludePath(b.path("engine/vendor/imgui"));
 }
 
 /// Configure shared link dependencies on a compile step.
 fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
-    if (detectSystemPrefix(b.allocator)) |prefix| {
-        compile.addLibraryPath(.{ .cwd_relative = prefix.lib });
-    }
+    addSystemPaths(compile.root_module, b.allocator);
     compile.linkSystemLibrary("SDL3");
     compile.linkSystemLibrary("luajit-5.1");
     compile.addCSourceFile(.{ .file = b.path("engine/vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
@@ -125,9 +109,6 @@ fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
         compile.addCSourceFile(.{ .file = b.path(src), .flags = imgui_flags });
     }
     compile.addIncludePath(imgui_include);
-    if (detectSystemPrefix(b.allocator)) |prefix| {
-        compile.addIncludePath(.{ .cwd_relative = prefix.include });
-    }
     compile.linkSystemLibrary("c++");
 }
 
