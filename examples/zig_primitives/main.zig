@@ -5,11 +5,32 @@ const std = @import("std");
 const engine_mod = @import("engine");
 const Engine = engine_mod.Engine;
 const core = engine_mod.core_components;
+const c = engine_mod.c;
 
 // Example-specific component (no Lua metadata needed for pure Zig).
 const Spin = struct { speed: f32 = 0 };
 
 // ---- Systems ----
+
+fn debugUiSystem(engine: *Engine, dt: f32) void {
+    _ = dt;
+    _ = c.igBegin("Debug", null, 0);
+
+    var cam_view = engine.registry.view(.{ core.Camera }, .{});
+    var cam_iter = cam_view.entityIterator();
+    if (cam_iter.next()) |cam_entity| {
+        var cam = engine.registry.get(core.Camera, cam_entity);
+
+        c.igSeparatorText("Post-Processing");
+        _ = c.igSliderFloat("Exposure", &cam.exposure, 0.1, 5.0);
+        _ = c.igSliderFloat("Bloom Threshold", &cam.bloom_threshold, 0.0, 3.0);
+        _ = c.igSliderFloat("Bloom Intensity", &cam.bloom_intensity, 0.0, 2.0);
+        _ = c.igSliderFloat("Bloom Soft Knee", &cam.bloom_soft_knee, 0.0, 1.0);
+        _ = c.igSliderFloat("Blur Passes", &cam.bloom_blur_passes, 0, 5);
+    }
+
+    c.igEnd();
+}
 
 fn spinSystem(engine: *Engine, dt: f32) void {
     var view = engine.registry.view(.{ core.Rotation, Spin }, .{});
@@ -97,7 +118,8 @@ pub fn main() !void {
         }
     }
 
-    // Register Zig system and run
+    // Register Zig systems and run
+    engine.addSystem(&debugUiSystem);
     engine.addSystem(&spinSystem);
     try engine.run();
 }

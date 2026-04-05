@@ -47,10 +47,11 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) 
 
 /// Add C include paths for @cImport to a module.
 // TODO: Replace hardcoded /opt/homebrew paths with pkg-config or env vars for cross-platform builds.
-fn addCIncludes(mod: *std.Build.Module, vendor_path: std.Build.LazyPath) void {
+fn addCIncludes(b: *std.Build, mod: *std.Build.Module, vendor_path: std.Build.LazyPath) void {
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/luajit-2.1" });
     mod.addIncludePath(vendor_path);
+    mod.addIncludePath(b.path("vendor/imgui"));
 }
 
 /// Configure shared link dependencies on a compile step.
@@ -60,6 +61,27 @@ fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
     compile.linkSystemLibrary("luajit-5.1");
     compile.addCSourceFile(.{ .file = b.path("vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
     compile.addCSourceFile(.{ .file = b.path("vendor/cgltf_impl.c"), .flags = &.{"-std=c99"} });
+
+    // Dear ImGui (C++ core + C wrapper + SDL3/GPU backends)
+    const imgui_flags: []const []const u8 = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-DIMGUI_IMPL_API=extern \"C\"" };
+    const imgui_include: std.Build.LazyPath = b.path("vendor/imgui");
+    const imgui_cpp_files = [_][]const u8{
+        "vendor/imgui/imgui.cpp",
+        "vendor/imgui/imgui_draw.cpp",
+        "vendor/imgui/imgui_tables.cpp",
+        "vendor/imgui/imgui_widgets.cpp",
+        "vendor/imgui/imgui_demo.cpp",
+        "vendor/imgui/cimgui.cpp",
+        "vendor/imgui/imgui_impl_sdl3.cpp",
+        "vendor/imgui/imgui_impl_sdlgpu3.cpp",
+        "vendor/imgui/cimgui_impl_sdlgpu3.cpp",
+    };
+    for (imgui_cpp_files) |src| {
+        compile.addCSourceFile(.{ .file = b.path(src), .flags = imgui_flags });
+    }
+    compile.addIncludePath(imgui_include);
+    compile.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+    compile.linkSystemLibrary("c++");
 }
 
 /// Build an example executable. If components_file is null, uses core_components.zig.
@@ -85,7 +107,7 @@ fn addExample(
         .optimize = optimize,
         .link_libc = true,
     });
-    addCIncludes(lua_mod, vendor_path);
+    addCIncludes(b, lua_mod, vendor_path);
 
     const core_components_mod = b.createModule(.{
         .root_source_file = b.path("src/core_components.zig"),
@@ -130,7 +152,7 @@ fn addExample(
             .{ .name = "math3d", .module = math3d_mod },
         },
     });
-    addCIncludes(engine_mod, vendor_path);
+    addCIncludes(b, engine_mod, vendor_path);
 
     // Renderer, component_ops, and lua_api modules
     const renderer_mod = b.createModule(.{
@@ -158,7 +180,7 @@ fn addExample(
             .{ .name = "lua", .module = lua_mod },
         },
     });
-    addCIncludes(component_ops_mod, vendor_path);
+    addCIncludes(b, component_ops_mod, vendor_path);
 
     const lua_api_mod = b.createModule(.{
         .root_source_file = b.path("src/lua_api.zig"),
@@ -184,7 +206,7 @@ fn addExample(
             .{ .name = "geometry", .module = geometry_mod },
         },
     });
-    addCIncludes(gltf_mod, vendor_path);
+    addCIncludes(b, gltf_mod, vendor_path);
 
     const postprocess_mod = b.createModule(.{
         .root_source_file = b.path("src/postprocess.zig"),
@@ -308,7 +330,7 @@ fn addIntegrationTests(
         .optimize = optimize,
         .link_libc = true,
     });
-    addCIncludes(lua_mod, vendor_path);
+    addCIncludes(b, lua_mod, vendor_path);
 
     const core_components_mod = b.createModule(.{
         .root_source_file = b.path("src/core_components.zig"),
@@ -351,7 +373,7 @@ fn addIntegrationTests(
             .{ .name = "math3d", .module = math3d_mod },
         },
     });
-    addCIncludes(engine_mod, vendor_path);
+    addCIncludes(b, engine_mod, vendor_path);
 
     const renderer_mod = b.createModule(.{
         .root_source_file = b.path("src/renderer.zig"),
@@ -378,7 +400,7 @@ fn addIntegrationTests(
             .{ .name = "lua", .module = lua_mod },
         },
     });
-    addCIncludes(component_ops_mod, vendor_path);
+    addCIncludes(b, component_ops_mod, vendor_path);
 
     const lua_api_mod = b.createModule(.{
         .root_source_file = b.path("src/lua_api.zig"),
@@ -404,7 +426,7 @@ fn addIntegrationTests(
             .{ .name = "geometry", .module = geometry_mod },
         },
     });
-    addCIncludes(gltf_mod, vendor_path);
+    addCIncludes(b, gltf_mod, vendor_path);
 
     const postprocess_mod = b.createModule(.{
         .root_source_file = b.path("src/postprocess.zig"),

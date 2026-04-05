@@ -17,6 +17,8 @@ const lc = lua.c;
 pub const HandleKind = enum { mesh, material };
 pub const c = @cImport({
     @cInclude("SDL3/SDL.h");
+    @cInclude("cimgui.h");
+    @cInclude("cimgui_impl_sdlgpu3.h");
 });
 const stbi = @cImport({
     @cInclude("stb_image.h");
@@ -235,6 +237,9 @@ pub const Engine = struct {
         if (self.lua_state) |L| lc.lua_close(L);
 
         if (self.gpu_device) |_| {
+            c.cImGui_ImplSDLGPU3_Shutdown();
+            c.cImGui_ImplSDL3_Shutdown();
+            c.igDestroyContext(null);
             postprocess.deinitPostProcess(self);
             const device = self.gpu_device.?;
             self.assets.deinit(device);
@@ -281,9 +286,15 @@ pub const Engine = struct {
 
             var event: c.SDL_Event = undefined;
             while (c.SDL_PollEvent(&event)) {
+                _ = c.cImGui_ImplSDL3_ProcessEvent(&event);
                 if (event.type == c.SDL_EVENT_QUIT) running = false;
                 if (event.type == c.SDL_EVENT_KEY_DOWN and event.key.scancode == c.SDL_SCANCODE_ESCAPE) running = false;
             }
+
+            // ImGui new frame (before systems so user code can draw UI)
+            c.cImGui_ImplSDLGPU3_NewFrame();
+            c.cImGui_ImplSDL3_NewFrame();
+            c.igNewFrame();
 
             self.runZigSystems(dt);
             self.runLuaSystems(dt);
@@ -295,10 +306,12 @@ pub const Engine = struct {
             var sw_w: u32 = 0;
             var sw_h: u32 = 0;
             if (!c.SDL_AcquireGPUSwapchainTexture(cmd, self.sdl_window, &swapchain_tex, &sw_w, &sw_h)) {
+                c.igEndFrame();
                 _ = c.SDL_SubmitGPUCommandBuffer(cmd);
                 continue;
             }
             if (swapchain_tex == null) {
+                c.igEndFrame();
                 _ = c.SDL_SubmitGPUCommandBuffer(cmd);
                 continue;
             }
@@ -331,6 +344,34 @@ pub const Engine = struct {
                     .blur_passes = @intFromFloat(@max(cam.bloom_blur_passes, 0)),
                 };
                 postprocess.executePostProcess(self, cmd, swapchain_tex.?, sw_w, sw_h, settings);
+            }
+
+            // ImGui render pass — LDR overlay directly to swapchain
+            c.igRender();
+            const draw_data = c.igGetDrawData();
+            if (draw_data != null) {
+                c.cImGui_ImplSDLGPU3_PrepareDrawData(draw_data, cmd);
+
+                const imgui_color_target = c.SDL_GPUColorTargetInfo{
+                    .texture = swapchain_tex,
+                    .mip_level = 0,
+                    .layer_or_depth_plane = 0,
+                    .clear_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+                    .load_op = c.SDL_GPU_LOADOP_LOAD,
+                    .store_op = c.SDL_GPU_STOREOP_STORE,
+                    .resolve_texture = null,
+                    .resolve_mip_level = 0,
+                    .resolve_layer = 0,
+                    .cycle = false,
+                    .cycle_resolve_texture = false,
+                    .padding1 = 0,
+                    .padding2 = 0,
+                };
+                const imgui_pass = c.SDL_BeginGPURenderPass(cmd, &imgui_color_target, 1, null);
+                if (imgui_pass) |pass| {
+                    c.cImGui_ImplSDLGPU3_RenderDrawData(draw_data, cmd, pass);
+                    c.SDL_EndGPURenderPass(pass);
+                }
             }
 
             _ = c.SDL_SubmitGPUCommandBuffer(cmd);
@@ -394,6 +435,22 @@ pub const Engine = struct {
 
         // Post-processing (bloom)
         try postprocess.initPostProcess(self);
+
+        // Dear ImGui
+        _ = c.igCreateContext(null);
+        if (!c.cImGui_ImplSDL3_InitForSDLGPU(self.sdl_window)) {
+            std.debug.print("ImGui SDL3 init failed\n", .{});
+            return error.ImGuiInitFailed;
+        }
+        var gpu_init_info = c.cImGui_ImplSDLGPU3_InitInfo{
+            .Device = self.gpu_device.?,
+            .ColorTargetFormat = self.swapchain_format,
+            .MSAASamples = c.SDL_GPU_SAMPLECOUNT_1,
+        };
+        if (!c.cImGui_ImplSDLGPU3_Init(&gpu_init_info)) {
+            std.debug.print("ImGui SDL_GPU init failed\n", .{});
+            return error.ImGuiInitFailed;
+        }
 
         // Built-in meshes
         const allocator = std.heap.c_allocator;
