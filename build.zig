@@ -49,6 +49,7 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) 
     addShader(b, pp_mod, "postprocess", "dof_bokeh", "frag", .fragment);
     addShader(b, pp_mod, "postprocess", "dof_composite", "frag", .fragment);
     addShader(b, pp_mod, "postprocess", "dof_tent", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "lensflare", "frag", .fragment);
 }
 
 /// Add C include paths for @cImport to a module.

@@ -57,7 +57,13 @@ lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1,
   0.5,   -- vignette_smoothness
   0.08,  -- chromatic_aberration
   0.03,  -- grain
-  0.0    -- color_temp
+  0.0,   -- color_temp
+  0.15,  -- flare_intensity
+  0.37,  -- flare_ghost_dispersal
+  0.5,   -- flare_halo_width
+  0.005, -- flare_chroma_distortion
+  0.5,   -- flare_starburst
+  0.5    -- flare_dirt_intensity
 )
 
 -- Adding a fly_camera component enables the built-in FPS camera controller.
@@ -182,6 +188,16 @@ lunatic.system("debug_ui", function(dt)
     cam_ref.chromatic_aberration = ui.slider_float("Chromatic Aberration", cam_ref.chromatic_aberration, 0, 3)
     cam_ref.grain = ui.slider_float("Film Grain", cam_ref.grain, 0, 0.2)
     cam_ref.color_temp = ui.slider_float("Color Temperature", cam_ref.color_temp, -3, 3)
+  end
+
+  if ui.collapsing_header("Lens Flare") then
+    local cam_ref = lunatic.ref(cam, "camera")
+    cam_ref.flare_intensity = ui.slider_float("Flare Intensity", cam_ref.flare_intensity, 0, 3)
+    cam_ref.flare_ghost_dispersal = ui.slider_float("Ghost Dispersal", cam_ref.flare_ghost_dispersal, 0.1, 1.0)
+    cam_ref.flare_halo_width = ui.slider_float("Halo Width", cam_ref.flare_halo_width, 0.1, 0.9)
+    cam_ref.flare_chroma_distortion = ui.slider_float("Chroma Distortion", cam_ref.flare_chroma_distortion, 0, 0.02)
+    cam_ref.flare_starburst = ui.slider_float("Starburst", cam_ref.flare_starburst, 0, 1)
+    cam_ref.flare_dirt_intensity = ui.slider_float("Lens Dirt", cam_ref.flare_dirt_intensity, 0, 1)
   end
 
   if ui.collapsing_header("Bloom Shape") then

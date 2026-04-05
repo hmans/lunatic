@@ -416,6 +416,13 @@ pub const Engine = struct {
                     .chromatic_aberration = cam.chromatic_aberration,
                     .grain_intensity = cam.grain,
                     .color_temp = cam.color_temp,
+                    .flare_intensity = cam.flare_intensity,
+                    .flare_ghost_dispersal = cam.flare_ghost_dispersal,
+                    .flare_halo_width = cam.flare_halo_width,
+                    .flare_chroma_distortion = cam.flare_chroma_distortion,
+                    .flare_starburst = cam.flare_starburst,
+                    .flare_dirt_intensity = cam.flare_dirt_intensity,
+                    .camera_angle_z = self.registry.getConst(core_components.Rotation, cam_entity).z * (std.math.pi / 180.0),
                 };
                 postprocess.executePostProcess(self, cmd, swapchain_tex.?, sw_w, sw_h, settings);
                 const tpp1 = c.SDL_GetPerformanceCounter();

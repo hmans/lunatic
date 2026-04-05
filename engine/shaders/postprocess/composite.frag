@@ -7,9 +7,11 @@ layout(location = 0) out vec4 out_color;
 
 layout(set = 2, binding = 0) uniform sampler2D hdr_scene;
 layout(set = 2, binding = 1) uniform sampler2D bloom_tex;
+layout(set = 2, binding = 2) uniform sampler2D flare_tex;
+layout(set = 2, binding = 3) uniform sampler2D dirt_tex;
 
 layout(set = 3, binding = 0) uniform CompositeParams {
-    vec4 params;  // .x = bloom_intensity, .y = exposure
+    vec4 params;  // .x = bloom_intensity, .y = exposure, .z = flare_intensity, .w = dirt_intensity
     vec4 params2; // .x = vignette_intensity, .y = vignette_smoothness
     vec4 params3; // .x = chromatic_aberration, .y = grain_intensity, .z = grain_time
     vec4 params4; // .x = color_temp (negative=cool, positive=warm)
@@ -43,9 +45,34 @@ void main() {
         float bg = texture(bloom_tex, uv).g;
         float bb = texture(bloom_tex, uv - offset).b;
         color += vec3(br, bg, bb) * composite.params.x;
+
+        // Lens flare ghosts (additive, in HDR before tonemapping)
+        float flare_intensity = composite.params.z;
+        if (flare_intensity > 0.0) {
+            float fr = texture(flare_tex, uv + offset * 0.5).r;
+            float fg = texture(flare_tex, uv).g;
+            float fb = texture(flare_tex, uv - offset * 0.5).b;
+            color += vec3(fr, fg, fb) * flare_intensity;
+        }
     } else {
         color = texture(hdr_scene, uv).rgb;
         color += texture(bloom_tex, uv).rgb * composite.params.x;
+        // Lens flare ghosts
+        color += texture(flare_tex, uv).rgb * composite.params.z;
+    }
+
+    // Lens dirt — bright smudges amplify bloom + flare glow
+    float dirt_intensity = composite.params.w;
+    if (dirt_intensity > 0.0) {
+        vec3 dirt = texture(dirt_tex, uv).rgb;
+        // Use bloom + flare textures as the glow driver
+        // Flare texture already has intensity baked in, so scale it down for dirt
+        float bloom_lum = dot(texture(bloom_tex, uv).rgb, vec3(0.333));
+        float flare_lum = dot(texture(flare_tex, uv).rgb, vec3(0.333));
+        float glow = bloom_lum * composite.params.x + flare_lum * 0.3;
+        // Soft threshold: dirt only appears where glow is significant
+        float dirt_mask = smoothstep(0.05, 0.25, glow);
+        color += dirt * glow * dirt_mask * dirt_intensity * 8.0;
     }
 
     // Exposure

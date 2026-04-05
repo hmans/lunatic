@@ -51,6 +51,12 @@ pub const Camera = struct {
     chromatic_aberration: f32 = 0.0, // 0 = off, 0.5-2.0 = subtle to strong RGB fringing
     grain: f32 = 0.0, // 0 = off, 0.02-0.1 = subtle film grain
     color_temp: f32 = 0.0, // negative = cool/blue, positive = warm/orange
+    flare_intensity: f32 = 0.0, // 0 = off, 0.5-2.0 = lens flare ghost strength
+    flare_ghost_dispersal: f32 = 0.37, // Spacing between ghost copies (0.1-1.0)
+    flare_halo_width: f32 = 0.5, // Halo ring radius (0.1-0.9)
+    flare_chroma_distortion: f32 = 0.005, // Per-ghost chromatic shift (0.0-0.02)
+    flare_starburst: f32 = 0.5, // Starburst ray modulation (0=off, 1=full)
+    flare_dirt_intensity: f32 = 0.5, // Lens dirt overlay (0=off, 1=full)
     pub const lua = .{ .name = "camera" };
 };
 

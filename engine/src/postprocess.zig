@@ -30,6 +30,8 @@ const upsample_frag_spv = @embedFile("shader_upsample_frag_spv");
 const upsample_frag_msl = @embedFile("shader_upsample_frag_msl");
 const composite_frag_spv = @embedFile("shader_composite_frag_spv");
 const composite_frag_msl = @embedFile("shader_composite_frag_msl");
+const lensflare_frag_spv = @embedFile("shader_lensflare_frag_spv");
+const lensflare_frag_msl = @embedFile("shader_lensflare_frag_msl");
 
 // ============================================================
 // Uniform structs (must match GLSL layouts)
@@ -60,10 +62,15 @@ const UpsampleParams = extern struct {
 };
 
 const CompositeParams = extern struct {
-    params: [4]f32, // .x = bloom_intensity, .y = exposure
+    params: [4]f32, // .x = bloom_intensity, .y = exposure, .z = flare_intensity
     params2: [4]f32, // .x = vignette_intensity, .y = vignette_smoothness
     params3: [4]f32, // .x = chromatic_aberration, .y = grain_intensity, .z = grain_time
     params4: [4]f32, // .x = color_temp
+};
+
+const FlareParams = extern struct {
+    params: [4]f32, // .x = ghost_dispersal, .y = halo_width, .z = chroma_distortion, .w = intensity
+    params2: [4]f32, // .x = starburst_intensity, .y = camera_angle_z (radians)
 };
 
 // ============================================================
@@ -111,6 +118,11 @@ pub const PostProcessState = struct {
     dof_half: ?*c.SDL_GPUTexture = null, // RGBA16F, half res — prefiltered
     dof_bokeh: ?*c.SDL_GPUTexture = null, // RGBA16F, half res — gather result
 
+    // Lens flare
+    flare_texture: ?*c.SDL_GPUTexture = null,
+    flare_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    lens_dirt_texture: ?*c.SDL_GPUTexture = null, // loaded from file, not resolution-dependent
+
     // DoF pipelines
     dof_coc_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
     dof_prefilter_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
@@ -131,6 +143,13 @@ pub const CameraPostSettings = struct {
     chromatic_aberration: f32,
     grain_intensity: f32,
     color_temp: f32,
+    flare_intensity: f32,
+    flare_ghost_dispersal: f32,
+    flare_halo_width: f32,
+    flare_chroma_distortion: f32,
+    flare_starburst: f32,
+    flare_dirt_intensity: f32,
+    camera_angle_z: f32,
 };
 
 // ============================================================
@@ -386,8 +405,24 @@ pub fn initPostProcess(self: *Engine) !void {
         composite_frag_msl,
         self.swapchain_format,
         1,
-        2,
+        4, // hdr_scene, bloom_tex, flare_tex, dirt_tex
     ) orelse return error.PipelineFailed;
+
+    self.postprocess.flare_pipeline = createPostProcessPipeline(
+        device,
+        lensflare_frag_spv,
+        lensflare_frag_msl,
+        hdr_format,
+        1, // FlareParams
+        1, // bright_tex
+    ) orelse return error.PipelineFailed;
+
+    // Load lens dirt texture (optional — flare still works without it)
+    if (self.createTextureFromFile("assets/textures/lensdirt.jpg")) |id| {
+        if (self.assets.texture_registry[id]) |entry| {
+            self.postprocess.lens_dirt_texture = entry.texture;
+        }
+    } else |_| {}
 
     // DoF pipelines
     self.postprocess.dof_coc_pipeline = createPostProcessPipeline(
@@ -432,6 +467,7 @@ pub fn ensureTextures(self: *Engine, w: u32, h: u32) !void {
     if (pp.dof_coc) |t| c.SDL_ReleaseGPUTexture(device, t);
     if (pp.dof_half) |t| c.SDL_ReleaseGPUTexture(device, t);
     if (pp.dof_bokeh) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.flare_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
     for (&pp.mip_textures) |*mt| {
         if (mt.*) |t| c.SDL_ReleaseGPUTexture(device, t);
         mt.* = null;
@@ -460,6 +496,14 @@ pub fn ensureTextures(self: *Engine, w: u32, h: u32) !void {
         count += 1;
     }
     pp.mip_count = count;
+
+    // Lens flare texture at mip[2] resolution (1/8 res)
+    if (count > 2) {
+        pp.flare_texture = createRenderTexture(device, hdr_format, pp.mip_widths[2], pp.mip_heights[2]) orelse return error.TextureFailed;
+    } else {
+        pp.flare_texture = null;
+    }
+
     pp.cached_w = w;
     pp.cached_h = h;
 }
@@ -479,9 +523,11 @@ pub fn deinitPostProcess(self: *Engine) void {
     if (pp.dof_coc) |t| c.SDL_ReleaseGPUTexture(device, t);
     if (pp.dof_half) |t| c.SDL_ReleaseGPUTexture(device, t);
     if (pp.dof_bokeh) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.flare_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
     if (pp.downsample_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.upsample_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.composite_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+    if (pp.flare_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.dof_coc_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.dof_prefilter_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.dof_bokeh_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
@@ -707,7 +753,44 @@ pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain
         }
     }
 
-    // === Composite: HDR scene + bloom (mip0) → swapchain ===
+    // === Lens Flare Ghosts (reads bloom mip[2], writes to flare_texture) ===
+    // Use mip[2] (1/8 res) as input — softer features, less total energy.
+    const flare_src_mip: u32 = 2;
+    if (settings.flare_intensity > 0 and pp.mip_count > flare_src_mip) {
+        const flare_tex = pp.flare_texture.?;
+        const flare_w = pp.mip_widths[flare_src_mip];
+        const flare_h = pp.mip_heights[flare_src_mip];
+
+        const pass = beginFullscreenPass(cmd, flare_tex) orelse return;
+        c.SDL_BindGPUGraphicsPipeline(pass, pp.flare_pipeline.?);
+        setFullscreenViewport(pass, flare_w, flare_h);
+
+        const binding = [1]c.SDL_GPUTextureSamplerBinding{
+            .{ .texture = pp.mip_textures[flare_src_mip].?, .sampler = sampler },
+        };
+        c.SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+
+        const flare_params = FlareParams{
+            .params = .{
+                settings.flare_ghost_dispersal,
+                settings.flare_halo_width,
+                settings.flare_chroma_distortion,
+                settings.flare_intensity,
+            },
+            .params2 = .{
+                settings.flare_starburst,
+                settings.camera_angle_z,
+                0,
+                0,
+            },
+        };
+        c.SDL_PushGPUFragmentUniformData(cmd, 0, &flare_params, @sizeOf(FlareParams));
+
+        drawFullscreenTriangle(pass);
+        c.SDL_EndGPURenderPass(pass);
+    }
+
+    // === Composite: HDR scene + bloom (mip0) + flare → swapchain ===
     {
         const pass = beginFullscreenPass(cmd, swapchain_tex) orelse return;
         c.SDL_BindGPUGraphicsPipeline(pass, pp.composite_pipeline.?);
@@ -719,15 +802,27 @@ pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain
         else
             pp.hdr_texture.?;
 
-        const bindings = [2]c.SDL_GPUTextureSamplerBinding{
+        // flare source, or HDR as dummy (multiplied by 0 intensity in shader)
+        const flare_tex = if (settings.flare_intensity > 0 and pp.mip_count > flare_src_mip)
+            pp.flare_texture.?
+        else
+            pp.hdr_texture.?;
+
+        // dirt texture: use loaded texture if available, or HDR as dummy (intensity forced to 0)
+        const dirt_tex = pp.lens_dirt_texture orelse pp.hdr_texture.?;
+        const dirt_intensity: f32 = if (pp.lens_dirt_texture != null) settings.flare_dirt_intensity else 0;
+
+        const bindings = [4]c.SDL_GPUTextureSamplerBinding{
             .{ .texture = pp.hdr_texture.?, .sampler = sampler },
             .{ .texture = bloom_tex, .sampler = sampler },
+            .{ .texture = flare_tex, .sampler = sampler },
+            .{ .texture = dirt_tex, .sampler = sampler },
         };
-        c.SDL_BindGPUFragmentSamplers(pass, 0, &bindings, 2);
+        c.SDL_BindGPUFragmentSamplers(pass, 0, &bindings, 4);
 
         const grain_time: f32 = @floatFromInt(self.current_frame);
         const params = CompositeParams{
-            .params = .{ settings.bloom_intensity, settings.exposure, 0, 0 },
+            .params = .{ settings.bloom_intensity, settings.exposure, settings.flare_intensity, dirt_intensity },
             .params2 = .{ settings.vignette_intensity, settings.vignette_smoothness, 0, 0 },
             .params3 = .{ settings.chromatic_aberration, settings.grain_intensity, grain_time, 0 },
             .params4 = .{ settings.color_temp, 0, 0, 0 },
