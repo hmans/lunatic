@@ -5,6 +5,7 @@ const ShaderStage = enum { vertex, fragment };
 fn addShader(
     b: *std.Build,
     mod: *std.Build.Module,
+    comptime dir: []const u8,
     comptime name: []const u8,
     comptime ext: []const u8,
     stage: ShaderStage,
@@ -16,7 +17,7 @@ fn addShader(
 
     const glslc = b.addSystemCommand(&.{
         "glslc", stage_flag,
-        "shaders/" ++ name ++ "." ++ ext,
+        "engine/shaders/" ++ dir ++ "/" ++ name ++ "." ++ ext,
         "-o",
     });
     const spv = glslc.addOutputFileArg(name ++ "." ++ ext ++ ".spv");
@@ -37,17 +38,17 @@ fn addShader(
 }
 
 fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) void {
-    addShader(b, mod, "default", "vert", .vertex);
-    addShader(b, mod, "default", "frag", .fragment);
-    addShader(b, pp_mod, "fullscreen", "vert", .vertex);
-    addShader(b, pp_mod, "downsample", "frag", .fragment);
-    addShader(b, pp_mod, "upsample", "frag", .fragment);
-    addShader(b, pp_mod, "composite", "frag", .fragment);
-    addShader(b, pp_mod, "dof_coc", "frag", .fragment);
-    addShader(b, pp_mod, "dof_prefilter", "frag", .fragment);
-    addShader(b, pp_mod, "dof_bokeh", "frag", .fragment);
-    addShader(b, pp_mod, "dof_composite", "frag", .fragment);
-    addShader(b, pp_mod, "dof_tent", "frag", .fragment);
+    addShader(b, mod, "scene", "default", "vert", .vertex);
+    addShader(b, mod, "scene", "default", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "fullscreen", "vert", .vertex);
+    addShader(b, pp_mod, "postprocess", "downsample", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "upsample", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "composite", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "dof_coc", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "dof_prefilter", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "dof_bokeh", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "dof_composite", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "dof_tent", "frag", .fragment);
 }
 
 /// Add C include paths for @cImport to a module.
@@ -56,7 +57,7 @@ fn addCIncludes(b: *std.Build, mod: *std.Build.Module, vendor_path: std.Build.La
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/luajit-2.1" });
     mod.addIncludePath(vendor_path);
-    mod.addIncludePath(b.path("vendor/imgui"));
+    mod.addIncludePath(b.path("engine/vendor/imgui"));
 }
 
 /// Configure shared link dependencies on a compile step.
@@ -64,22 +65,22 @@ fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
     compile.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     compile.linkSystemLibrary("SDL3");
     compile.linkSystemLibrary("luajit-5.1");
-    compile.addCSourceFile(.{ .file = b.path("vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
-    compile.addCSourceFile(.{ .file = b.path("vendor/cgltf_impl.c"), .flags = &.{"-std=c99"} });
+    compile.addCSourceFile(.{ .file = b.path("engine/vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
+    compile.addCSourceFile(.{ .file = b.path("engine/vendor/cgltf_impl.c"), .flags = &.{"-std=c99"} });
 
     // Dear ImGui (C++ core + C wrapper + SDL3/GPU backends)
     const imgui_flags: []const []const u8 = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-DIMGUI_IMPL_API=extern \"C\"" };
-    const imgui_include: std.Build.LazyPath = b.path("vendor/imgui");
+    const imgui_include: std.Build.LazyPath = b.path("engine/vendor/imgui");
     const imgui_cpp_files = [_][]const u8{
-        "vendor/imgui/imgui.cpp",
-        "vendor/imgui/imgui_draw.cpp",
-        "vendor/imgui/imgui_tables.cpp",
-        "vendor/imgui/imgui_widgets.cpp",
-        "vendor/imgui/imgui_demo.cpp",
-        "vendor/imgui/cimgui.cpp",
-        "vendor/imgui/imgui_impl_sdl3.cpp",
-        "vendor/imgui/imgui_impl_sdlgpu3.cpp",
-        "vendor/imgui/cimgui_impl_sdlgpu3.cpp",
+        "engine/vendor/imgui/imgui.cpp",
+        "engine/vendor/imgui/imgui_draw.cpp",
+        "engine/vendor/imgui/imgui_tables.cpp",
+        "engine/vendor/imgui/imgui_widgets.cpp",
+        "engine/vendor/imgui/imgui_demo.cpp",
+        "engine/vendor/imgui/cimgui.cpp",
+        "engine/vendor/imgui/imgui_impl_sdl3.cpp",
+        "engine/vendor/imgui/imgui_impl_sdlgpu3.cpp",
+        "engine/vendor/imgui/cimgui_impl_sdlgpu3.cpp",
     };
     for (imgui_cpp_files) |src| {
         compile.addCSourceFile(.{ .file = b.path(src), .flags = imgui_flags });
@@ -89,8 +90,7 @@ fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
     compile.linkSystemLibrary("c++");
 }
 
-/// Build the full engine module graph. Returns the engine module and renderer/postprocess
-/// modules (needed for shader embedding).
+/// Build the full engine module graph.
 const EngineModules = struct {
     engine: *std.Build.Module,
     renderer: *std.Build.Module,
@@ -105,10 +105,10 @@ fn buildEngineModules(
     entt: *std.Build.Dependency,
 ) EngineModules {
     const ecs_mod = entt.module("zig-ecs");
-    const vendor_path = b.path("vendor");
+    const vendor_path = b.path("engine/vendor");
 
     const lua_mod = b.createModule(.{
-        .root_source_file = b.path("src/lua.zig"),
+        .root_source_file = b.path("engine/src/lua.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -116,7 +116,7 @@ fn buildEngineModules(
     addCIncludes(b, lua_mod, vendor_path);
 
     const core_components_mod = b.createModule(.{
-        .root_source_file = b.path("src/core_components.zig"),
+        .root_source_file = b.path("engine/src/core_components.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -131,19 +131,19 @@ fn buildEngineModules(
     });
 
     const geometry_mod = b.createModule(.{
-        .root_source_file = b.path("src/geometry.zig"),
+        .root_source_file = b.path("engine/src/geometry.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const math3d_mod = b.createModule(.{
-        .root_source_file = b.path("src/math3d.zig"),
+        .root_source_file = b.path("engine/src/math3d.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const engine_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine.zig"),
+        .root_source_file = b.path("engine/src/engine.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -158,7 +158,7 @@ fn buildEngineModules(
     addCIncludes(b, engine_mod, vendor_path);
 
     const renderer_mod = b.createModule(.{
-        .root_source_file = b.path("src/renderer.zig"),
+        .root_source_file = b.path("engine/src/renderer.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -172,7 +172,7 @@ fn buildEngineModules(
     });
 
     const component_ops_mod = b.createModule(.{
-        .root_source_file = b.path("src/component_ops.zig"),
+        .root_source_file = b.path("engine/src/component_ops.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -185,7 +185,7 @@ fn buildEngineModules(
     addCIncludes(b, component_ops_mod, vendor_path);
 
     const lua_api_mod = b.createModule(.{
-        .root_source_file = b.path("src/lua_api.zig"),
+        .root_source_file = b.path("engine/src/lua_api.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -199,7 +199,7 @@ fn buildEngineModules(
     });
 
     const gltf_mod = b.createModule(.{
-        .root_source_file = b.path("src/gltf.zig"),
+        .root_source_file = b.path("engine/src/gltf.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -211,7 +211,7 @@ fn buildEngineModules(
     addCIncludes(b, gltf_mod, vendor_path);
 
     const postprocess_mod = b.createModule(.{
-        .root_source_file = b.path("src/postprocess.zig"),
+        .root_source_file = b.path("engine/src/postprocess.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -273,7 +273,7 @@ pub fn build(b: *std.Build) void {
     // Tests
     const math_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/math3d.zig"),
+            .root_source_file = b.path("engine/src/math3d.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -281,19 +281,18 @@ pub fn build(b: *std.Build) void {
 
     const geometry_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/geometry.zig"),
+            .root_source_file = b.path("engine/src/geometry.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
 
-    // Integration tests reuse the same engine module graph
     const test_mods = buildEngineModules(b, target, optimize, entt);
     addShaders(b, test_mods.renderer, test_mods.postprocess);
 
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tests.zig"),
+            .root_source_file = b.path("engine/src/tests.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,

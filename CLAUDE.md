@@ -10,12 +10,13 @@ A 3D game engine: Zig core + SDL3 GPU + LuaJIT scripting + zig-ecs.
 
 ## Project Structure
 
-- `src/` — engine core (Zig)
+- `engine/src/` — engine core (Zig)
+- `engine/shaders/scene/` — scene rendering shaders (default.vert/frag)
+- `engine/shaders/postprocess/` — post-processing shaders (bloom, DoF, composite, etc.)
+- `engine/vendor/` — vendored C/C++ libs (stb_image, cgltf, Dear ImGui + dcimgui)
 - `game/main.zig` — game entry point (minimal: init, load script, run)
 - `game/main.lua` — game logic (scene setup, systems, debug UI)
 - `game/components.zig` — game-specific components (extends core with Spin, Player, etc.)
-- `shaders/` — GLSL 450 shaders (compiled to SPIR-V + MSL at build time)
-- `vendor/` — vendored C/C++ libs (stb_image, cgltf, Dear ImGui + dcimgui)
 - `assets/` — binary assets tracked via Git LFS (fonts, textures, models)
 
 ## Details
