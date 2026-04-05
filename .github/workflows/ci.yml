@@ -17,7 +17,7 @@ jobs:
         include:
           - os: macos-14
             name: macOS-arm64
-          - os: macos-13
+          - os: macos-15
             name: macOS-x64
           - os: ubuntu-24.04
             name: Linux-x64
@@ -59,13 +59,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libluajit-5.1-dev glslc spirv-cross
 
-      - name: Build
-        run: zig build
-
       - name: Test
         run: zig build test
         env:
           SDL_VIDEODRIVER: dummy
+
+      - name: Build
+        run: zig build
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
