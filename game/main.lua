@@ -81,7 +81,7 @@ lunatic.physics_optimize()
 
 -- Spawner state
 local spawn_timer = 0
-local spawn_interval = 0.027 -- seconds between spawns (~37/sec)
+local spawn_interval = 0.005 -- seconds between spawns (~200/sec)
 local max_bodies = 5000
 local body_ring = {}         -- circular buffer of entity IDs
 local ring_head = 1          -- next slot to write

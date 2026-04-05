@@ -144,13 +144,24 @@ pub fn physicsSystem(self: *Engine, dt: f32) void {
     const phys = self.physics.system orelse return;
     const body_iface = phys.getBodyInterfaceNoLock();
 
-    // Fixed timestep accumulator — cap at 4 steps to prevent spiral of death
+    // Fixed timestep accumulator — cap at 4 steps and 8ms budget to prevent spiral of death
     physics_accumulator += dt;
     var steps: u32 = 0;
+    const budget_start = engine_mod.c.SDL_GetPerformanceCounter();
+    const budget_freq = engine_mod.c.SDL_GetPerformanceFrequency();
+    const max_budget_us: u64 = 8000; // 8ms max per frame
+
     while (physics_accumulator >= physics_timestep and steps < 4) {
         phys.update(physics_timestep, .{}) catch break;
         physics_accumulator -= physics_timestep;
         steps += 1;
+
+        // Check budget
+        const elapsed_us = (engine_mod.c.SDL_GetPerformanceCounter() - budget_start) * 1_000_000 / budget_freq;
+        if (elapsed_us > max_budget_us) {
+            physics_accumulator = 0; // drop remaining time
+            break;
+        }
     }
     if (steps == 0) return;
 
