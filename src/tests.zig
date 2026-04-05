@@ -126,13 +126,16 @@ test "add unknown component errors" {
     );
 }
 
-test "add with missing args errors" {
+test "add with missing args uses defaults" {
     const L = try setup();
     defer teardown();
     try run(L,
         \\local e = lunatic.spawn()
-        \\local ok, err = pcall(lunatic.add, e, "position", 1, 2)
-        \\assert(not ok, "expected error for missing z argument")
+        \\lunatic.add(e, "position", 1, 2)
+        \\local x, y, z = lunatic.get(e, "position")
+        \\assert(math.abs(x - 1) < 0.001)
+        \\assert(math.abs(y - 2) < 0.001)
+        \\assert(math.abs(z - 0) < 0.001, "missing z should default to 0")
     );
 }
 

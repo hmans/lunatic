@@ -87,6 +87,12 @@ void main() {
         roughness = max(roughness, 0.04);
     }
 
+    // Specular anti-aliasing: widen roughness when the normal changes faster
+    // than the pixel can resolve. Prevents sub-pixel GGX peaks from flickering.
+    // (Tokuyoshi/Kaplanyan 2019, simplified)
+    float sigma2 = dot(fwidth(N), vec3(0.333));
+    roughness = sqrt(roughness * roughness + sigma2 * sigma2);
+
     // Cook-Torrance BRDF
     float NdotL = max(dot(N, L), 0.0);
     float NdotV = max(dot(N, V), 0.001);
@@ -137,9 +143,10 @@ void main() {
         color = mix(color, scene.fog_color.xyz, fog_factor);
     }
 
-    // Tone mapping (Reinhard) + gamma correction
-    color = color / (color + vec3(1.0));
-    color = pow(color, vec3(1.0 / 2.2));
+    // Clamp to sane HDR range. GGX specular can produce extreme single-pixel
+    // values (thousands) at low roughness, causing temporal fireflies.
+    // 64x overbright is more than enough for bloom while preventing outliers.
+    color = min(color, vec3(64.0));
 
     out_color = vec4(color, 1.0);
 }

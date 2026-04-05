@@ -36,9 +36,13 @@ fn addShader(
     });
 }
 
-fn addShaders(b: *std.Build, mod: *std.Build.Module) void {
+fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) void {
     addShader(b, mod, "default", "vert", .vertex);
     addShader(b, mod, "default", "frag", .fragment);
+    addShader(b, pp_mod, "fullscreen", "vert", .vertex);
+    addShader(b, pp_mod, "threshold", "frag", .fragment);
+    addShader(b, pp_mod, "blur", "frag", .fragment);
+    addShader(b, pp_mod, "composite", "frag", .fragment);
 }
 
 /// Add C include paths for @cImport to a module.
@@ -182,8 +186,19 @@ fn addExample(
     });
     addCIncludes(gltf_mod, vendor_path);
 
+    const postprocess_mod = b.createModule(.{
+        .root_source_file = b.path("src/postprocess.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = engine_mod },
+        },
+    });
+
     // Wire cross-module deps
     engine_mod.addImport("renderer", renderer_mod);
+    engine_mod.addImport("postprocess", postprocess_mod);
     engine_mod.addImport("lua_api", lua_api_mod);
     engine_mod.addImport("gltf", gltf_mod);
 
@@ -201,7 +216,7 @@ fn addExample(
     });
 
     addLinkDeps(b, exe);
-    addShaders(b, renderer_mod);
+    addShaders(b, renderer_mod, postprocess_mod);
 
     return exe;
 }
@@ -391,13 +406,24 @@ fn addIntegrationTests(
     });
     addCIncludes(gltf_mod, vendor_path);
 
+    const postprocess_mod = b.createModule(.{
+        .root_source_file = b.path("src/postprocess.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = engine_mod },
+        },
+    });
+
     // Wire cross-module deps (same as addExample)
     engine_mod.addImport("renderer", renderer_mod);
+    engine_mod.addImport("postprocess", postprocess_mod);
     engine_mod.addImport("lua_api", lua_api_mod);
     engine_mod.addImport("gltf", gltf_mod);
 
     // Renderer needs shader embeds even for tests (module is compiled but not executed in headless)
-    addShaders(b, renderer_mod);
+    addShaders(b, renderer_mod, postprocess_mod);
 
     const tests = b.addTest(.{
         .root_module = b.createModule(.{

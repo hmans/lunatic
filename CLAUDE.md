@@ -11,7 +11,8 @@ A 3D game engine: Zig core + SDL3 GPU + LuaJIT scripting + zig-ecs.
 ## Details
 
 - Components declare Lua semantics via a `pub const lua` struct literal: `.{ .name = "position" }` for data components, `.{ .name = "mesh", .resolve = .mesh }` for asset handles. Tag components (zero-sized structs) are auto-detected. Data component fields must be `f32` or `u32`. All Lua bridge dispatch goes through the `ComponentOps` vtable generated in `component_ops.zig`.
-- Engine code is split by responsibility: `engine.zig` (lifecycle, registries), `renderer.zig` (GPU pipeline, render system), `lua_api.zig` (Lua bindings), `component_ops.zig` (comptime vtable generator). Both renderer and lua_api import the Engine type from engine.zig.
+- Engine code is split by responsibility: `engine.zig` (lifecycle, registries, frame orchestration), `renderer.zig` (GPU pipeline, scene rendering), `postprocess.zig` (HDR bloom: threshold, blur, composite+tonemap — GPU handles only, settings come from Camera component), `lua_api.zig` (Lua bindings), `component_ops.zig` (comptime vtable generator). Both renderer and lua_api import the Engine type from engine.zig.
+- Post-processing settings (exposure, bloom_threshold, bloom_intensity, bloom_soft_knee, bloom_blur_passes) live on the Camera component. Each camera gets independent post-processing. bloom_intensity=0 means no bloom (just tonemapping).
 - Adding a new asset handle type (e.g. `TextureHandle` with string name resolution): define struct with `.resolve = .texture` in its `.lua` metadata, add to the `.all` tuple, add a `.texture` variant to `HandleKind` in `engine.zig`, and add a case to `Engine.resolveHandle()`'s switch.
 - Zig systems are registered with `engine.addSystem(fn)` and run before Lua systems each frame. Pure Zig examples/games can skip Lua entirely. Core component types are accessible via `engine_mod.core_components`.
 

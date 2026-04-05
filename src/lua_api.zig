@@ -61,6 +61,7 @@ pub fn registerLuaApi(self: *Engine) void {
         .{ "set_clear_color", &luaSetClearColor },
         .{ "set_fog", &luaSetFog },
         .{ "set_ambient", &luaSetAmbient },
+        .{ "set_bloom", &luaSetBloom },
         .{ "spawn", &luaSpawn },
         .{ "destroy", &luaDestroy },
         .{ "add", &luaAdd },
@@ -658,6 +659,23 @@ fn luaSetAmbient(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const rgb = checkVec3(L, 1);
     self.ambient_color = rgb ++ .{0.0};
+    return 0;
+}
+
+/// lunatic.set_bloom(entity, threshold, intensity, exposure)
+/// Sets bloom parameters on a camera entity's Camera component.
+/// intensity = 0 disables bloom (just tonemapping).
+fn luaSetBloom(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const entity = entityFromLua(self, L, 1);
+    const cam = self.registry.tryGet(engine_mod.core_components.Camera, entity) orelse {
+        _ = lc.luaL_error(L, "set_bloom: entity has no camera component");
+        unreachable;
+    };
+    const nargs = lc.lua_gettop(L);
+    if (nargs >= 2) cam.bloom_threshold = checkFloat(L, 2);
+    if (nargs >= 3) cam.bloom_intensity = checkFloat(L, 3);
+    if (nargs >= 4) cam.exposure = checkFloat(L, 4);
     return 0;
 }
 

@@ -39,7 +39,9 @@ pub fn main() !void {
     // Light
     const light = engine.registry.create();
     engine.registry.add(light, core.DirectionalLight{
-        .dir_x = 0.3, .dir_y = 0.8, .dir_z = 0.5,
+        .dir_x = 0.3,
+        .dir_y = 0.8,
+        .dir_z = 0.5,
     });
 
     // Materials
@@ -47,7 +49,9 @@ pub fn main() !void {
     const green = try engine.createMaterial(.{ .albedo = .{ 0.2, 0.8, 0.3, 1 } });
     const blue = try engine.createMaterial(.{ .albedo = .{ 0.2, 0.3, 0.9, 1 } });
     const yellow = try engine.createMaterial(.{ .albedo = .{ 0.9, 0.8, 0.2, 1 } });
-    const materials = [_]u32{ 0, red, green, blue, yellow }; // 0 = default
+    const emissive_hot = try engine.createMaterial(.{ .albedo = .{ 1, 1, 1, 1 }, .emissive = .{ 3, 1.5, 0.3 } });
+    const emissive_cool = try engine.createMaterial(.{ .albedo = .{ 1, 1, 1, 1 }, .emissive = .{ 0.3, 0.8, 3 } });
+    const materials = [_]u32{ 0, red, green, blue, yellow, emissive_hot, emissive_cool };
 
     const meshes = [_]u32{ 0, 1 }; // cube, sphere (built-in)
 
@@ -55,7 +59,15 @@ pub fn main() !void {
     const cam = engine.registry.create();
     engine.registry.add(cam, core.Position{ .x = 0, .y = 8, .z = 12 });
     engine.registry.add(cam, core.Rotation{ .x = 34, .y = 0, .z = 0 });
-    engine.registry.add(cam, core.Camera{ .fov = 60, .near = 0.1, .far = 100 });
+    engine.registry.add(cam, core.Camera{
+        .fov = 60,
+        .near = 0.1,
+        .far = 100,
+        .exposure = 1.2,
+        .bloom_threshold = 0.8,
+        .bloom_intensity = 0.6,
+        .bloom_blur_passes = 2,
+    });
 
     // Grid of shapes
     var prng = std.Random.DefaultPrng.init(42);

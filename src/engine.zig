@@ -7,6 +7,7 @@ const Mat4 = math3d.Mat4;
 const ecs = @import("zig-ecs");
 const geometry = @import("geometry");
 const renderer = @import("renderer");
+const postprocess = @import("postprocess");
 const lua_api = @import("lua_api");
 pub const gltf = @import("gltf");
 
@@ -165,6 +166,9 @@ pub const Engine = struct {
     clear_color: [4]f32 = .{ 0.08, 0.08, 0.12, 1.0 },
     ambient_color: [4]f32 = .{ 0.15, 0.15, 0.2, 0.0 },
 
+    // Post-processing (bloom)
+    postprocess: postprocess.PostProcessState = .{},
+
     // Fog
     fog_enabled: bool = false,
     fog_start: f32 = 10.0,
@@ -230,7 +234,9 @@ pub const Engine = struct {
         for (self.live_queries[0..self.live_query_count]) |*lq| lq.deinit();
         if (self.lua_state) |L| lc.lua_close(L);
 
-        if (self.gpu_device) |device| {
+        if (self.gpu_device) |_| {
+            postprocess.deinitPostProcess(self);
+            const device = self.gpu_device.?;
             self.assets.deinit(device);
             if (self.msaa_color_texture) |mt| c.SDL_ReleaseGPUTexture(device, mt);
             if (self.depth_texture) |dt| c.SDL_ReleaseGPUTexture(device, dt);
@@ -281,7 +287,53 @@ pub const Engine = struct {
 
             self.runZigSystems(dt);
             self.runLuaSystems(dt);
-            renderer.renderSystem(self, device, dt);
+
+            // --- Frame rendering ---
+            const cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse continue;
+
+            var swapchain_tex: ?*c.SDL_GPUTexture = null;
+            var sw_w: u32 = 0;
+            var sw_h: u32 = 0;
+            if (!c.SDL_AcquireGPUSwapchainTexture(cmd, self.sdl_window, &swapchain_tex, &sw_w, &sw_h)) {
+                _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+                continue;
+            }
+            if (swapchain_tex == null) {
+                _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+                continue;
+            }
+
+            // Ensure post-process textures match swapchain size
+            postprocess.ensureTextures(self, sw_w, sw_h) catch {
+                _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+                continue;
+            };
+
+            // Prepare shared scene data (lights, draw list, render targets)
+            const frame = renderer.prepareFrame(self, sw_w, sw_h);
+            const hdr_tex = self.postprocess.hdr_texture.?;
+
+            // Per-camera: render scene → HDR, then postprocess → swapchain
+            var cam_view = self.registry.view(.{ core_components.Position, core_components.Camera }, .{});
+            var cam_iter = cam_view.entityIterator();
+            while (cam_iter.next()) |cam_entity| {
+                const cam = cam_view.getConst(core_components.Camera, cam_entity);
+
+                // Scene render for this camera → HDR texture
+                renderer.renderCamera(self, cmd, cam_entity, hdr_tex, sw_w, sw_h, frame, cam.exposure);
+
+                // Post-process → swapchain with this camera's settings
+                const settings = postprocess.BloomSettings{
+                    .exposure = cam.exposure,
+                    .threshold = cam.bloom_threshold,
+                    .intensity = cam.bloom_intensity,
+                    .soft_knee = cam.bloom_soft_knee,
+                    .blur_passes = @intFromFloat(@max(cam.bloom_blur_passes, 0)),
+                };
+                postprocess.executePostProcess(self, cmd, swapchain_tex.?, sw_w, sw_h, settings);
+            }
+
+            _ = c.SDL_SubmitGPUCommandBuffer(cmd);
         }
     }
 
@@ -339,6 +391,9 @@ pub const Engine = struct {
 
         // Pipeline + render targets
         try renderer.initPipeline(self, config);
+
+        // Post-processing (bloom)
+        try postprocess.initPostProcess(self);
 
         // Built-in meshes
         const allocator = std.heap.c_allocator;

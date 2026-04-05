@@ -141,9 +141,17 @@ fn fromLua(comptime T: type, L: ?*lc.lua_State, base: c_int) T {
     inline for (fields, 0..) |field, idx| {
         const lua_idx = base + @as(c_int, @intCast(idx));
         if (comptime field.type == f32) {
-            @field(result, field.name) = @floatCast(lc.luaL_checknumber(L, lua_idx));
+            const default: f64 = if (field.default_value_ptr) |ptr|
+                @as(*const f32, @ptrCast(@alignCast(ptr))).*
+            else
+                0;
+            @field(result, field.name) = @floatCast(lc.luaL_optnumber(L, lua_idx, default));
         } else if (comptime field.type == u32) {
-            @field(result, field.name) = @intCast(lc.luaL_checkinteger(L, lua_idx));
+            const default: lc.lua_Integer = if (field.default_value_ptr) |ptr|
+                @as(*const u32, @ptrCast(@alignCast(ptr))).*
+            else
+                0;
+            @field(result, field.name) = @intCast(lc.luaL_optinteger(L, lua_idx, default));
         }
     }
     return result;

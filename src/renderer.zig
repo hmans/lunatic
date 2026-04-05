@@ -66,6 +66,50 @@ pub const DrawEntry = struct {
 };
 
 // ============================================================
+// sRGB → HDR conversion (inverse of composite shader's tonemap + gamma)
+// ============================================================
+
+/// Convert a display-space (sRGB) color to the linear HDR value that the
+/// composite shader's ACES tonemap + gamma will map back to the original.
+fn srgbToHdr(srgb: f32, exposure: f32) f32 {
+    // Undo gamma: sRGB ��� linear
+    const linear = std.math.pow(f32, srgb, 2.2);
+    // Undo ACES Narkowicz: solve  y = (x(2.51x+0.03)) / (x(2.43x+0.59)+0.14)
+    // Rearranging: (2.43y - 2.51)x² + (0.59y - 0.03)x + 0.14y = 0
+    // Use quadratic formula, take the smaller positive root.
+    const y = linear;
+    const a = 2.43 * y - 2.51;
+    const b = 0.59 * y - 0.03;
+    const cv = 0.14 * y;
+    const discriminant = b * b - 4.0 * a * cv;
+    if (discriminant < 0) return linear; // fallback
+    const sq = @sqrt(discriminant);
+    // a is negative for y < ~1.03, so the valid root is (-b + sqrt) / 2a
+    const r1 = (-b + sq) / (2.0 * a);
+    const r2 = (-b - sq) / (2.0 * a);
+    const x = if (r1 >= 0 and (r2 < 0 or r1 < r2)) r1 else r2;
+    // Undo exposure
+    return if (exposure > 0) x / exposure else x;
+}
+
+fn srgbToHdr4(color: [4]f32, exposure: f32) [4]f32 {
+    return .{
+        srgbToHdr(color[0], exposure),
+        srgbToHdr(color[1], exposure),
+        srgbToHdr(color[2], exposure),
+        color[3],
+    };
+}
+
+fn srgbToHdr3(color: [3]f32, exposure: f32) [3]f32 {
+    return .{
+        srgbToHdr(color[0], exposure),
+        srgbToHdr(color[1], exposure),
+        srgbToHdr(color[2], exposure),
+    };
+}
+
+// ============================================================
 // GPU helpers
 // ============================================================
 
@@ -155,7 +199,9 @@ pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
 
     self.sample_count = config.msaa;
     self.swapchain_format = c.SDL_GetGPUSwapchainTextureFormat(device, self.sdl_window);
-    const swapchain_format = self.swapchain_format;
+
+    // Scene pipeline renders to HDR float texture for post-processing
+    const scene_format: c.SDL_GPUTextureFormat = c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
 
     const vertex_attrs = [_]c.SDL_GPUVertexAttribute{
         .{ .location = 0, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = @offsetOf(Vertex, "px") },
@@ -169,7 +215,7 @@ pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
     };
 
     const color_target_desc = [_]c.SDL_GPUColorTargetDescription{
-        .{ .format = swapchain_format, .blend_state = std.mem.zeroes(c.SDL_GPUColorTargetBlendState) },
+        .{ .format = scene_format, .blend_state = std.mem.zeroes(c.SDL_GPUColorTargetBlendState) },
     };
 
     self.pipeline = c.SDL_CreateGPUGraphicsPipeline(device, &c.SDL_GPUGraphicsPipelineCreateInfo{
@@ -236,7 +282,7 @@ pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
         return error.DepthTextureFailed;
     };
     if (config.msaa.isMultisample()) {
-        self.msaa_color_texture = createMsaaColorTexture(device, swapchain_format, config.width, config.height, config.msaa) orelse {
+        self.msaa_color_texture = createMsaaColorTexture(device, scene_format, config.width, config.height, config.msaa) orelse {
             std.debug.print("Failed to create MSAA color texture: {s}\n", .{c.SDL_GetError()});
             return error.DepthTextureFailed;
         };
@@ -386,159 +432,155 @@ fn submitDrawCalls(
     }
 }
 
-pub fn renderSystem(self: *Engine, device: *c.SDL_GPUDevice, dt: f32) void {
-    _ = dt;
-    const cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse return;
+/// Cached per-frame scene data (computed once, shared across cameras).
+pub const FrameContext = struct {
+    light_dir: [4]f32,
+    draw_count: u32,
+};
 
-    var swapchain_tex: ?*c.SDL_GPUTexture = null;
-    var sw_w: u32 = 0;
-    var sw_h: u32 = 0;
-    if (!c.SDL_AcquireGPUSwapchainTexture(cmd, self.sdl_window, &swapchain_tex, &sw_w, &sw_h)) {
-        _ = c.SDL_SubmitGPUCommandBuffer(cmd);
-        return;
-    }
-    if (swapchain_tex == null) {
-        _ = c.SDL_SubmitGPUCommandBuffer(cmd);
-        return;
-    }
+/// Prepare shared scene data for the frame: gather lights, build sorted draw list,
+/// and resize render targets if needed.
+pub fn prepareFrame(self: *Engine, w: u32, h: u32) FrameContext {
+    const device = self.gpu_device.?;
+    const hdr_format: c.SDL_GPUTextureFormat = c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
 
-    // Recreate render targets if swapchain dimensions changed
-    if (sw_w != self.rt_w or sw_h != self.rt_h) {
+    // Recreate render targets if dimensions changed
+    if (w != self.rt_w or h != self.rt_h) {
         if (self.depth_texture) |old_dt| c.SDL_ReleaseGPUTexture(device, old_dt);
-        self.depth_texture = createDepthTexture(device, sw_w, sw_h, self.sample_count);
+        self.depth_texture = createDepthTexture(device, w, h, self.sample_count);
         if (self.sample_count.isMultisample()) {
             if (self.msaa_color_texture) |mt| c.SDL_ReleaseGPUTexture(device, mt);
-            self.msaa_color_texture = createMsaaColorTexture(device, self.swapchain_format, sw_w, sw_h, self.sample_count);
+            self.msaa_color_texture = createMsaaColorTexture(device, hdr_format, w, h, self.sample_count);
         }
-        self.rt_w = sw_w;
-        self.rt_h = sw_h;
-        if (self.depth_texture == null) {
-            _ = c.SDL_SubmitGPUCommandBuffer(cmd);
-            return;
-        }
+        self.rt_w = w;
+        self.rt_h = h;
     }
 
-    // Phase 1: Gather scene data
-    const light_dir = gatherLights(&self.registry);
+    return .{
+        .light_dir = gatherLights(&self.registry),
+        .draw_count = buildDrawList(self),
+    };
+}
 
-    // Phase 2: Build sorted draw list (once, shared across all cameras)
-    const draw_count = buildDrawList(self);
+/// Render the scene from a single camera into the given color target texture.
+pub fn renderCamera(
+    self: *Engine,
+    cmd: *c.SDL_GPUCommandBuffer,
+    cam_entity: ecs.Entity,
+    color_target_tex: *c.SDL_GPUTexture,
+    w: u32,
+    h: u32,
+    frame: FrameContext,
+    exposure: f32,
+) void {
+    if (self.depth_texture == null) return;
 
-    // Phase 3: Render pass per camera
-    const sw_w_f: f32 = @floatFromInt(sw_w);
-    const sw_h_f: f32 = @floatFromInt(sw_h);
-    const clear_color = c.SDL_FColor{ .r = self.clear_color[0], .g = self.clear_color[1], .b = self.clear_color[2], .a = self.clear_color[3] };
+    const cam_pos = self.registry.getConst(Position, cam_entity);
+    const cam = self.registry.getConst(Camera, cam_entity);
     const is_msaa = self.sample_count.isMultisample();
 
-    var cam_view = self.registry.view(.{ Position, Camera }, .{});
-    var cam_iter = cam_view.entityIterator();
-    var first_camera = true;
-    while (cam_iter.next()) |cam_entity| {
-        const cam_pos = cam_view.getConst(Position, cam_entity);
-        const cam = cam_view.getConst(Camera, cam_entity);
+    // Convert display-space clear color to linear HDR so it round-trips through tonemap
+    const hdr_clear = srgbToHdr4(self.clear_color, exposure);
+    const clear_color = c.SDL_FColor{ .r = hdr_clear[0], .g = hdr_clear[1], .b = hdr_clear[2], .a = hdr_clear[3] };
 
-        const color_load_op: c_uint = if (first_camera) c.SDL_GPU_LOADOP_CLEAR else c.SDL_GPU_LOADOP_LOAD;
+    const color_target = if (is_msaa) c.SDL_GPUColorTargetInfo{
+        .texture = self.msaa_color_texture,
+        .mip_level = 0,
+        .layer_or_depth_plane = 0,
+        .clear_color = clear_color,
+        .load_op = c.SDL_GPU_LOADOP_CLEAR,
+        .store_op = c.SDL_GPU_STOREOP_RESOLVE_AND_STORE,
+        .resolve_texture = color_target_tex,
+        .resolve_mip_level = 0,
+        .resolve_layer = 0,
+        .cycle = true,
+        .cycle_resolve_texture = false,
+        .padding1 = 0,
+        .padding2 = 0,
+    } else c.SDL_GPUColorTargetInfo{
+        .texture = color_target_tex,
+        .mip_level = 0,
+        .layer_or_depth_plane = 0,
+        .clear_color = clear_color,
+        .load_op = c.SDL_GPU_LOADOP_CLEAR,
+        .store_op = c.SDL_GPU_STOREOP_STORE,
+        .resolve_texture = null,
+        .resolve_mip_level = 0,
+        .resolve_layer = 0,
+        .cycle = true,
+        .cycle_resolve_texture = false,
+        .padding1 = 0,
+        .padding2 = 0,
+    };
 
-        const color_target = if (is_msaa) c.SDL_GPUColorTargetInfo{
-            .texture = self.msaa_color_texture,
-            .mip_level = 0,
-            .layer_or_depth_plane = 0,
-            .clear_color = clear_color,
-            .load_op = color_load_op,
-            .store_op = c.SDL_GPU_STOREOP_RESOLVE_AND_STORE,
-            .resolve_texture = swapchain_tex,
-            .resolve_mip_level = 0,
-            .resolve_layer = 0,
-            .cycle = first_camera,
-            .cycle_resolve_texture = false,
-            .padding1 = 0,
-            .padding2 = 0,
-        } else c.SDL_GPUColorTargetInfo{
-            .texture = swapchain_tex,
-            .mip_level = 0,
-            .layer_or_depth_plane = 0,
-            .clear_color = clear_color,
-            .load_op = color_load_op,
-            .store_op = c.SDL_GPU_STOREOP_STORE,
-            .resolve_texture = null,
-            .resolve_mip_level = 0,
-            .resolve_layer = 0,
-            .cycle = first_camera,
-            .cycle_resolve_texture = false,
-            .padding1 = 0,
-            .padding2 = 0,
-        };
+    const depth_target = c.SDL_GPUDepthStencilTargetInfo{
+        .texture = self.depth_texture,
+        .clear_depth = 1.0,
+        .load_op = c.SDL_GPU_LOADOP_CLEAR,
+        .store_op = c.SDL_GPU_STOREOP_DONT_CARE,
+        .stencil_load_op = c.SDL_GPU_LOADOP_DONT_CARE,
+        .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
+        .cycle = true,
+        .clear_stencil = 0,
+        .mip_level = 0,
+        .layer = 0,
+    };
 
-        const depth_target = c.SDL_GPUDepthStencilTargetInfo{
-            .texture = self.depth_texture,
-            .clear_depth = 1.0,
-            .load_op = c.SDL_GPU_LOADOP_CLEAR,
-            .store_op = c.SDL_GPU_STOREOP_DONT_CARE,
-            .stencil_load_op = c.SDL_GPU_LOADOP_DONT_CARE,
-            .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
-            .cycle = first_camera,
-            .clear_stencil = 0,
-            .mip_level = 0,
-            .layer = 0,
-        };
+    const render_pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target) orelse return;
+    c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
 
-        first_camera = false;
+    // Viewport and scissor
+    const w_f: f32 = @floatFromInt(w);
+    const h_f: f32 = @floatFromInt(h);
+    const vp_x = cam.viewport_x * w_f;
+    const vp_y = cam.viewport_y * h_f;
+    const vp_w = cam.viewport_w * w_f;
+    const vp_h = cam.viewport_h * h_f;
+    c.SDL_SetGPUViewport(render_pass, &c.SDL_GPUViewport{
+        .x = vp_x,
+        .y = vp_y,
+        .w = vp_w,
+        .h = vp_h,
+        .min_depth = 0.0,
+        .max_depth = 1.0,
+    });
+    c.SDL_SetGPUScissor(render_pass, &c.SDL_Rect{
+        .x = @intFromFloat(vp_x),
+        .y = @intFromFloat(vp_y),
+        .w = @intFromFloat(vp_w),
+        .h = @intFromFloat(vp_h),
+    });
 
-        const render_pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target) orelse continue;
-        c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
+    // View-projection matrix
+    const aspect: f32 = vp_w / vp_h;
+    const proj = Mat4.perspective(cam.fov, aspect, cam.near, cam.far);
 
-        // Viewport and scissor
-        const vp_x = cam.viewport_x * sw_w_f;
-        const vp_y = cam.viewport_y * sw_h_f;
-        const vp_w = cam.viewport_w * sw_w_f;
-        const vp_h = cam.viewport_h * sw_h_f;
-        c.SDL_SetGPUViewport(render_pass, &c.SDL_GPUViewport{
-            .x = vp_x,
-            .y = vp_y,
-            .w = vp_w,
-            .h = vp_h,
-            .min_depth = 0.0,
-            .max_depth = 1.0,
-        });
-        c.SDL_SetGPUScissor(render_pass, &c.SDL_Rect{
-            .x = @intFromFloat(vp_x),
-            .y = @intFromFloat(vp_y),
-            .w = @intFromFloat(vp_w),
-            .h = @intFromFloat(vp_h),
-        });
-
-        // View-projection matrix
-        const aspect: f32 = vp_w / vp_h;
-        const proj = Mat4.perspective(cam.fov, aspect, cam.near, cam.far);
-
-        const eye = Vec3.new(cam_pos.x, cam_pos.y, cam_pos.z);
-        const view = if (self.registry.tryGet(LookAt, cam_entity)) |look_at| blk: {
-            const target_entity: ecs.Entity = @bitCast(look_at.target);
-            if (self.registry.valid(target_entity)) {
-                if (self.registry.tryGet(Position, target_entity)) |target_pos| {
-                    break :blk Mat4.lookAt(eye, Vec3.new(target_pos.x, target_pos.y, target_pos.z), Vec3.new(0, 1, 0));
-                }
+    const eye = Vec3.new(cam_pos.x, cam_pos.y, cam_pos.z);
+    const view = if (self.registry.tryGet(LookAt, cam_entity)) |look_at| blk: {
+        const target_entity: ecs.Entity = @bitCast(look_at.target);
+        if (self.registry.valid(target_entity)) {
+            if (self.registry.tryGet(Position, target_entity)) |target_pos| {
+                break :blk Mat4.lookAt(eye, Vec3.new(target_pos.x, target_pos.y, target_pos.z), Vec3.new(0, 1, 0));
             }
-            break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
-        } else if (self.registry.tryGet(Rotation, cam_entity)) |cam_rot| blk: {
-            break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, cam_rot.x, cam_rot.y, cam_rot.z);
-        } else Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
+        }
+        break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
+    } else if (self.registry.tryGet(Rotation, cam_entity)) |cam_rot| blk: {
+        break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, cam_rot.x, cam_rot.y, cam_rot.z);
+    } else Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
 
-        const vp = Mat4.mul(proj, view);
+    const vp = Mat4.mul(proj, view);
 
-        // Scene uniforms
-        const scene_uniforms = SceneUniforms{
-            .light_dir = light_dir,
-            .camera_pos = .{ cam_pos.x, cam_pos.y, cam_pos.z, 0.0 },
-            .fog_color = .{ self.fog_color[0], self.fog_color[1], self.fog_color[2], if (self.fog_enabled) 1.0 else 0.0 },
-            .fog_params = .{ self.fog_start, self.fog_end, 0.0, 0.0 },
-            .ambient = self.ambient_color,
-        };
-        c.SDL_PushGPUFragmentUniformData(cmd, 0, &scene_uniforms, @sizeOf(SceneUniforms));
+    // Scene uniforms — convert fog color to linear HDR to match scene buffer space
+    const hdr_fog = srgbToHdr3(self.fog_color, exposure);
+    const scene_uniforms = SceneUniforms{
+        .light_dir = frame.light_dir,
+        .camera_pos = .{ cam_pos.x, cam_pos.y, cam_pos.z, 0.0 },
+        .fog_color = .{ hdr_fog[0], hdr_fog[1], hdr_fog[2], if (self.fog_enabled) 1.0 else 0.0 },
+        .fog_params = .{ self.fog_start, self.fog_end, 0.0, 0.0 },
+        .ambient = self.ambient_color,
+    };
+    c.SDL_PushGPUFragmentUniformData(cmd, 0, &scene_uniforms, @sizeOf(SceneUniforms));
 
-        submitDrawCalls(self, cmd, render_pass, vp, draw_count);
-        c.SDL_EndGPURenderPass(render_pass);
-    }
-
-    _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+    submitDrawCalls(self, cmd, render_pass, vp, frame.draw_count);
+    c.SDL_EndGPURenderPass(render_pass);
 }
