@@ -41,6 +41,12 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install sdl3
 
+      - name: Install SDL3 build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libwayland-dev libxkbcommon-dev libegl-dev libgles-dev
+
       - name: Install SDL3 (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -48,6 +54,7 @@ jobs:
           cmake -S /tmp/SDL3-src -B /tmp/SDL3-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
           cmake --build /tmp/SDL3-build -j$(nproc)
           sudo cmake --install /tmp/SDL3-build
+          sudo ldconfig
 
       # Other dependencies
       - name: Install dependencies (macOS)
