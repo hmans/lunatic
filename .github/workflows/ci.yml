@@ -66,3 +66,9 @@ jobs:
         run: zig build test
         env:
           SDL_VIDEODRIVER: dummy
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lunatic-${{ matrix.name }}
+          path: zig-out/bin/lunatic*
