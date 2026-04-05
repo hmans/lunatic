@@ -87,7 +87,8 @@ pub const PhysicsState = struct {
 
 pub fn initPhysics(self: *Engine) !void {
     try zp.init(std.heap.c_allocator, .{
-        .num_threads = -1, // auto-detect cores
+        .temp_allocator_size = 64 * 1024 * 1024, // 64MB scratch (default 16MB)
+        .num_threads = -1,
     });
 
     self.physics = .{};
@@ -98,8 +99,8 @@ pub fn initPhysics(self: *Engine) !void {
         &self.physics.obj_pair_filter.filter,
         .{
             .max_bodies = 16384,
-            .max_body_pairs = 65536,
-            .max_contact_constraints = 65536,
+            .max_body_pairs = 16384 * 4,
+            .max_contact_constraints = 16384 * 4,
         },
     );
     self.physics.initialized = true;
