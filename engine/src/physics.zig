@@ -73,12 +73,24 @@ const ObjPairFilter = extern struct {
 // Physics state — stored on Engine
 // ============================================================
 
+const max_interp_bodies = 16384;
+
+const Transform = struct {
+    pos: [3]f32 = .{ 0, 0, 0 },
+    rot: [3]f32 = .{ 0, 0, 0 }, // Euler degrees
+};
+
 pub const PhysicsState = struct {
     system: ?*zp.PhysicsSystem = null,
     bp_layer_iface: BPLayerInterface = .{},
     obj_vs_bp_filter: ObjVsBPFilter = .{},
     obj_pair_filter: ObjPairFilter = .{},
     initialized: bool = false,
+
+    // Interpolation state — indexed by body_id index bits
+    prev: [max_interp_bodies]Transform = .{Transform{}} ** max_interp_bodies,
+    curr: [max_interp_bodies]Transform = .{Transform{}} ** max_interp_bodies,
+    alpha: f32 = 1.0,
 };
 
 // ============================================================
@@ -138,56 +150,111 @@ pub fn getBodyInterface(self: *Engine) *zp.BodyInterface {
 const physics_timestep: f32 = 1.0 / 60.0;
 var physics_accumulator: f32 = 0;
 
-/// Step the physics simulation and sync body transforms back to ECS.
-/// Uses fixed timestep (1/60s) with accumulator to decouple from frame rate.
+const sdl = engine_mod.c;
+
+/// Step the physics simulation with fixed timestep and write interpolated
+/// transforms to ECS for smooth rendering.
 pub fn physicsSystem(self: *Engine, dt: f32) void {
     const phys = self.physics.system orelse return;
     const body_iface = phys.getBodyInterfaceNoLock();
 
-    // Fixed timestep accumulator — cap at 4 steps and 8ms budget to prevent spiral of death
     physics_accumulator += dt;
     var steps: u32 = 0;
-    const budget_start = engine_mod.c.SDL_GetPerformanceCounter();
-    const budget_freq = engine_mod.c.SDL_GetPerformanceFrequency();
-    const max_budget_us: u64 = 8000; // 8ms max per frame
+    const budget_start = sdl.SDL_GetPerformanceCounter();
+    const budget_freq = sdl.SDL_GetPerformanceFrequency();
+    const max_budget_us: u64 = 8000;
 
     while (physics_accumulator >= physics_timestep and steps < 4) {
+        // Save current → prev before stepping
+        if (steps == 0) {
+            savePrevTransforms(self, body_iface);
+        }
+
         phys.update(physics_timestep, .{}) catch break;
         physics_accumulator -= physics_timestep;
         steps += 1;
 
-        // Check budget
-        const elapsed_us = (engine_mod.c.SDL_GetPerformanceCounter() - budget_start) * 1_000_000 / budget_freq;
+        const elapsed_us = (sdl.SDL_GetPerformanceCounter() - budget_start) * 1_000_000 / budget_freq;
         if (elapsed_us > max_budget_us) {
-            physics_accumulator = 0; // drop remaining time
+            physics_accumulator = 0;
             break;
         }
     }
-    if (steps == 0) return;
 
-    // Sync physics → ECS for all entities with RigidBody + Position + Rotation
+    // Sync current transforms from Jolt
+    if (steps > 0) {
+        syncCurrentTransforms(self, body_iface);
+    }
+
+    // Compute interpolation alpha and write lerped values to ECS
+    self.physics.alpha = if (physics_accumulator > 0 and physics_accumulator < physics_timestep)
+        physics_accumulator / physics_timestep
+    else
+        1.0;
+
+    writeInterpolatedTransforms(self);
+}
+
+fn savePrevTransforms(self: *Engine, body_iface: *const zp.BodyInterface) void {
+    var view = self.registry.view(.{core.RigidBody}, .{});
+    var iter = view.entityIterator();
+    while (iter.next()) |entity| {
+        const rb = view.getConst(entity);
+        const body_id: zp.BodyId = @enumFromInt(rb.body_id);
+        if (body_id == .invalid) continue;
+        const idx = body_id.indexBits();
+        if (idx >= max_interp_bodies) continue;
+
+        // Copy current Jolt state to prev
+        const pos = body_iface.getPosition(body_id);
+        const rot = body_iface.getRotation(body_id);
+        const euler = quatToEuler(rot);
+        self.physics.prev[idx] = .{ .pos = .{ pos[0], pos[1], pos[2] }, .rot = euler };
+    }
+}
+
+fn syncCurrentTransforms(self: *Engine, body_iface: *const zp.BodyInterface) void {
+    var view = self.registry.view(.{core.RigidBody}, .{});
+    var iter = view.entityIterator();
+    while (iter.next()) |entity| {
+        const rb = view.getConst(entity);
+        const body_id: zp.BodyId = @enumFromInt(rb.body_id);
+        if (body_id == .invalid) continue;
+        const idx = body_id.indexBits();
+        if (idx >= max_interp_bodies) continue;
+
+        const pos = body_iface.getPosition(body_id);
+        const rot = body_iface.getRotation(body_id);
+        const euler = quatToEuler(rot);
+        self.physics.curr[idx] = .{ .pos = .{ pos[0], pos[1], pos[2] }, .rot = euler };
+    }
+}
+
+fn writeInterpolatedTransforms(self: *Engine) void {
+    const alpha = self.physics.alpha;
+    const inv = 1.0 - alpha;
+
     var view = self.registry.view(.{ core.Position, core.Rotation, core.RigidBody }, .{});
     var iter = view.entityIterator();
     while (iter.next()) |entity| {
         const rb = view.getConst(core.RigidBody, entity);
         const body_id: zp.BodyId = @enumFromInt(rb.body_id);
         if (body_id == .invalid) continue;
+        const idx = body_id.indexBits();
+        if (idx >= max_interp_bodies) continue;
 
-        const pos = body_iface.getPosition(body_id);
-        const rot = body_iface.getRotation(body_id);
-
-        // Jolt quaternion → Euler angles (degrees) to match engine convention
-        const euler = quatToEuler(rot);
+        const prev = self.physics.prev[idx];
+        const curr = self.physics.curr[idx];
 
         var ecs_pos = view.get(core.Position, entity);
-        ecs_pos.x = pos[0];
-        ecs_pos.y = pos[1];
-        ecs_pos.z = pos[2];
+        ecs_pos.x = prev.pos[0] * inv + curr.pos[0] * alpha;
+        ecs_pos.y = prev.pos[1] * inv + curr.pos[1] * alpha;
+        ecs_pos.z = prev.pos[2] * inv + curr.pos[2] * alpha;
 
         var ecs_rot = view.get(core.Rotation, entity);
-        ecs_rot.x = euler[0];
-        ecs_rot.y = euler[1];
-        ecs_rot.z = euler[2];
+        ecs_rot.x = prev.rot[0] * inv + curr.rot[0] * alpha;
+        ecs_rot.y = prev.rot[1] * inv + curr.rot[1] * alpha;
+        ecs_rot.z = prev.rot[2] * inv + curr.rot[2] * alpha;
     }
 }
 
