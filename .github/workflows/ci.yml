@@ -43,12 +43,11 @@ jobs:
 
       - name: Install SDL3 (Linux)
         if: runner.os == 'Linux'
-        id: sdl
-        uses: libsdl-org/setup-sdl@v1
-        with:
-          version: 3-latest
-          build-type: Release
-          add-to-environment: true
+        run: |
+          git clone --depth 1 --branch release-3.2.14 https://github.com/libsdl-org/SDL.git /tmp/SDL3-src
+          cmake -S /tmp/SDL3-src -B /tmp/SDL3-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build /tmp/SDL3-build -j$(nproc)
+          sudo cmake --install /tmp/SDL3-build
 
       # Other dependencies
       - name: Install dependencies (macOS)
