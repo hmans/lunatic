@@ -358,7 +358,7 @@ pub fn countBatches(self: *Engine, draw_count: u32) u32 {
 
 /// Upload per-instance data (model + MVP matrices) to the GPU storage buffer.
 /// Must be called before the render pass within the same command buffer.
-fn uploadInstanceData(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, vp: Mat4, draw_count: u32) void {
+fn uploadInstances(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, vp: Mat4, draw_count: u32) void {
     if (draw_count == 0) return;
     const transfer = self.instance_transfer orelse return;
     const gpu_buf = self.instance_buffer orelse return;
@@ -515,7 +515,40 @@ pub fn prepareFrame(self: *Engine, w: u32, h: u32) FrameContext {
 }
 
 /// Render the scene from a single camera into the given color target texture.
-pub fn renderCamera(
+fn computeVP(self: *Engine, cam_entity: ecs.Entity, w: u32, h: u32) Mat4 {
+    const cam_pos = self.registry.getConst(Position, cam_entity);
+    const cam = self.registry.getConst(Camera, cam_entity);
+    const w_f: f32 = @floatFromInt(w);
+    const h_f: f32 = @floatFromInt(h);
+    const vp_w = cam.viewport_w * w_f;
+    const vp_h = cam.viewport_h * h_f;
+    const aspect: f32 = vp_w / vp_h;
+    const proj = Mat4.perspective(cam.fov, aspect, cam.near, cam.far);
+
+    const eye = Vec3.new(cam_pos.x, cam_pos.y, cam_pos.z);
+    const view = if (self.registry.tryGet(LookAt, cam_entity)) |look_at| blk: {
+        const target_entity: ecs.Entity = @bitCast(look_at.target);
+        if (self.registry.valid(target_entity)) {
+            if (self.registry.tryGet(Position, target_entity)) |target_pos| {
+                break :blk Mat4.lookAt(eye, Vec3.new(target_pos.x, target_pos.y, target_pos.z), Vec3.new(0, 1, 0));
+            }
+        }
+        break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
+    } else if (self.registry.tryGet(Rotation, cam_entity)) |cam_rot| blk: {
+        break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, cam_rot.x, cam_rot.y, cam_rot.z);
+    } else Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
+
+    return Mat4.mul(proj, view);
+}
+
+/// Compute per-instance matrices and upload to GPU. Must be called before executeScenePass.
+pub fn uploadInstanceData(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, cam_entity: ecs.Entity, w: u32, h: u32, frame: FrameContext) void {
+    const vp = computeVP(self, cam_entity, w, h);
+    uploadInstances(self, cmd, vp, frame.draw_count);
+}
+
+/// Execute the scene render pass (assumes instance data already uploaded).
+pub fn executeScenePass(
     self: *Engine,
     cmd: *c.SDL_GPUCommandBuffer,
     cam_entity: ecs.Entity,
@@ -531,9 +564,7 @@ pub fn renderCamera(
     const cam = self.registry.getConst(Camera, cam_entity);
     const is_msaa = self.sample_count.isMultisample();
 
-    // Convert display-space clear color to linear HDR so it round-trips through tonemap
     const hdr_clear = srgbToHdr4(self.clear_color, exposure);
-    // Alpha stores linear depth for DoF — background/sky gets max depth
     const clear_color = c.SDL_FColor{ .r = hdr_clear[0], .g = hdr_clear[1], .b = hdr_clear[2], .a = 1000.0 };
 
     const color_target = if (is_msaa) c.SDL_GPUColorTargetInfo{
@@ -579,38 +610,15 @@ pub fn renderCamera(
         .layer = 0,
     };
 
-    // Compute view-projection matrix
+    const render_pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target) orelse return;
+    c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
+
     const w_f: f32 = @floatFromInt(w);
     const h_f: f32 = @floatFromInt(h);
     const vp_x = cam.viewport_x * w_f;
     const vp_y = cam.viewport_y * h_f;
     const vp_w = cam.viewport_w * w_f;
     const vp_h = cam.viewport_h * h_f;
-    const aspect: f32 = vp_w / vp_h;
-    const proj = Mat4.perspective(cam.fov, aspect, cam.near, cam.far);
-
-    const eye = Vec3.new(cam_pos.x, cam_pos.y, cam_pos.z);
-    const view = if (self.registry.tryGet(LookAt, cam_entity)) |look_at| blk: {
-        const target_entity: ecs.Entity = @bitCast(look_at.target);
-        if (self.registry.valid(target_entity)) {
-            if (self.registry.tryGet(Position, target_entity)) |target_pos| {
-                break :blk Mat4.lookAt(eye, Vec3.new(target_pos.x, target_pos.y, target_pos.z), Vec3.new(0, 1, 0));
-            }
-        }
-        break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
-    } else if (self.registry.tryGet(Rotation, cam_entity)) |cam_rot| blk: {
-        break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, cam_rot.x, cam_rot.y, cam_rot.z);
-    } else Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
-
-    const vp = Mat4.mul(proj, view);
-
-    // Upload instance data (copy pass — must happen before render pass)
-    uploadInstanceData(self, cmd, vp, frame.draw_count);
-
-    // Begin render pass
-    const render_pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target) orelse return;
-    c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
-
     c.SDL_SetGPUViewport(render_pass, &c.SDL_GPUViewport{
         .x = vp_x,
         .y = vp_y,
@@ -626,7 +634,6 @@ pub fn renderCamera(
         .h = @intFromFloat(vp_h),
     });
 
-    // Scene uniforms
     const hdr_fog = srgbToHdr3(self.fog_color, exposure);
     const scene_uniforms = SceneUniforms{
         .light_dir = frame.light_dir,

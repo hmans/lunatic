@@ -135,13 +135,24 @@ pub fn getBodyInterface(self: *Engine) *zp.BodyInterface {
 // Built-in physics system
 // ============================================================
 
+const physics_timestep: f32 = 1.0 / 60.0;
+var physics_accumulator: f32 = 0;
+
 /// Step the physics simulation and sync body transforms back to ECS.
+/// Uses fixed timestep (1/60s) with accumulator to decouple from frame rate.
 pub fn physicsSystem(self: *Engine, dt: f32) void {
     const phys = self.physics.system orelse return;
     const body_iface = phys.getBodyInterfaceNoLock();
 
-    // Step simulation
-    phys.update(dt, .{}) catch return;
+    // Fixed timestep accumulator — cap at 4 steps to prevent spiral of death
+    physics_accumulator += dt;
+    var steps: u32 = 0;
+    while (physics_accumulator >= physics_timestep and steps < 4) {
+        phys.update(physics_timestep, .{}) catch break;
+        physics_accumulator -= physics_timestep;
+        steps += 1;
+    }
+    if (steps == 0) return;
 
     // Sync physics → ECS for all entities with RigidBody + Position + Rotation
     var view = self.registry.view(.{ core.Position, core.Rotation, core.RigidBody }, .{});

@@ -168,6 +168,7 @@ pub const Config = struct {
     height: u32 = 600,
     headless: bool = false,
     msaa: SampleCount = .@"4",
+    debug_stats: bool = false,
 };
 
 // ============================================================
@@ -179,7 +180,12 @@ pub const FrameStats = struct {
     entities_rendered: u32 = 0,
     physics_active: u32 = 0,
     physics_total: u32 = 0,
-    time_render_us: u64 = 0,
+    // Render sub-timings
+    time_prepare_us: u64 = 0, // draw list build + sort
+    time_instances_us: u64 = 0, // matrix computation + upload
+    time_scene_us: u64 = 0, // scene render pass
+    time_postprocess_us: u64 = 0, // DoF + bloom + composite
+    time_imgui_us: u64 = 0, // ImGui overlay
 };
 
 pub const Engine = struct {
@@ -237,6 +243,7 @@ pub const Engine = struct {
 
     // State
     headless: bool = false,
+    debug_stats: bool = false,
 
     // ---- Lifecycle ----
 
@@ -246,6 +253,7 @@ pub const Engine = struct {
         self.* = Engine{
             .registry = ecs.Registry.init(std.heap.c_allocator),
             .headless = config.headless,
+            .debug_stats = config.debug_stats,
         };
         errdefer self.registry.deinit();
 
@@ -365,24 +373,38 @@ pub const Engine = struct {
                 continue;
             };
 
-            // Prepare shared scene data (lights, draw list, render targets)
-            const t2 = c.SDL_GetPerformanceCounter();
+            const pf = c.SDL_GetPerformanceFrequency();
+
+            // Phase 1: Prepare (draw list build + sort)
+            const tp0 = c.SDL_GetPerformanceCounter();
             const frame = renderer.prepareFrame(self, sw_w, sw_h);
             self.stats.entities_rendered = frame.draw_count;
-            // draw_calls will be updated by countBatches
             self.stats.draw_calls = renderer.countBatches(self, frame.draw_count);
+            const tp1 = c.SDL_GetPerformanceCounter();
+            self.stats.time_prepare_us = (tp1 - tp0) * 1_000_000 / pf;
+
             const hdr_tex = self.postprocess.hdr_texture.?;
 
-            // Per-camera: render scene → HDR, then postprocess → swapchain
+            // Per-camera rendering
             var cam_view = self.registry.view(.{ core_components.Position, core_components.Camera }, .{});
             var cam_iter = cam_view.entityIterator();
             while (cam_iter.next()) |cam_entity| {
                 const cam = cam_view.getConst(core_components.Camera, cam_entity);
 
-                // Scene render for this camera → HDR texture
-                renderer.renderCamera(self, cmd, cam_entity, hdr_tex, sw_w, sw_h, frame, cam.exposure);
+                // Phase 2: Instance data (matrix computation + GPU upload)
+                const ti0 = c.SDL_GetPerformanceCounter();
+                renderer.uploadInstanceData(self, cmd, cam_entity, sw_w, sw_h, frame);
+                const ti1 = c.SDL_GetPerformanceCounter();
+                self.stats.time_instances_us = (ti1 - ti0) * 1_000_000 / pf;
 
-                // Post-process → swapchain with this camera's settings
+                // Phase 3: Scene render pass
+                const ts0 = c.SDL_GetPerformanceCounter();
+                renderer.executeScenePass(self, cmd, cam_entity, hdr_tex, sw_w, sw_h, frame, cam.exposure);
+                const ts1 = c.SDL_GetPerformanceCounter();
+                self.stats.time_scene_us = (ts1 - ts0) * 1_000_000 / pf;
+
+                // Phase 4: Post-process (DoF + bloom + composite)
+                const tpp0 = c.SDL_GetPerformanceCounter();
                 const settings = postprocess.CameraPostSettings{
                     .exposure = cam.exposure,
                     .bloom_intensity = cam.bloom_intensity,
@@ -396,12 +418,12 @@ pub const Engine = struct {
                     .color_temp = cam.color_temp,
                 };
                 postprocess.executePostProcess(self, cmd, swapchain_tex.?, sw_w, sw_h, settings);
+                const tpp1 = c.SDL_GetPerformanceCounter();
+                self.stats.time_postprocess_us = (tpp1 - tpp0) * 1_000_000 / pf;
             }
 
-            const t3 = c.SDL_GetPerformanceCounter();
-            self.stats.time_render_us = (t3 - t2) * 1_000_000 / c.SDL_GetPerformanceFrequency();
-
-            // ImGui render pass — LDR overlay directly to swapchain
+            // Phase 5: ImGui overlay
+            const tui0 = c.SDL_GetPerformanceCounter();
             c.igRender();
             const draw_data = c.igGetDrawData();
             if (draw_data != null) {
@@ -428,8 +450,49 @@ pub const Engine = struct {
                     c.SDL_EndGPURenderPass(pass);
                 }
             }
+            const tui1 = c.SDL_GetPerformanceCounter();
+            self.stats.time_imgui_us = (tui1 - tui0) * 1_000_000 / pf;
 
             _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+
+            // Debug stats to console (once per second)
+            if (self.debug_stats and self.current_frame % 60 == 0) {
+                self.printDebugStats();
+            }
+        }
+    }
+
+    fn printDebugStats(self: *Engine) void {
+        const s = self.stats;
+        const io = c.igGetIO();
+        const fps: f32 = if (io) |i| i.*.Framerate else 0;
+
+        std.debug.print(
+            \\[stats] {d:.0}fps | {d} draws ({d} entities) | physics {d}/{d}
+            \\  prepare {d:.2}ms | instances {d:.2}ms | scene {d:.2}ms | postprocess {d:.2}ms | imgui {d:.2}ms
+            \\
+        , .{
+            fps,
+            s.draw_calls,
+            s.entities_rendered,
+            s.physics_active,
+            s.physics_total,
+            @as(f64, @floatFromInt(s.time_prepare_us)) / 1000.0,
+            @as(f64, @floatFromInt(s.time_instances_us)) / 1000.0,
+            @as(f64, @floatFromInt(s.time_scene_us)) / 1000.0,
+            @as(f64, @floatFromInt(s.time_postprocess_us)) / 1000.0,
+            @as(f64, @floatFromInt(s.time_imgui_us)) / 1000.0,
+        });
+
+        // Per-system breakdown
+        for (self.systems[0..self.system_count]) |sys| {
+            if (sys.disabled) continue;
+            const kind_label: []const u8 = if (sys.kind == .zig) "zig" else "lua";
+            std.debug.print("  {d:.2}ms [{s}] {s}\n", .{
+                @as(f64, @floatFromInt(sys.time_us)) / 1000.0,
+                kind_label,
+                sys.name(),
+            });
         }
     }
 
@@ -887,12 +950,25 @@ pub const Engine = struct {
             c.igTextUnformatted(sys_line);
         }
 
-        // Render time as a pseudo-system entry
-        var render_buf: [128]u8 = undefined;
-        const render_line = std.fmt.bufPrintZ(&render_buf, "{d:.2}ms [gpu] render", .{
-            @as(f64, @floatFromInt(s.time_render_us)) / 1000.0,
-        }) catch "???";
-        c.igTextUnformatted(render_line);
+        // Render sub-phases
+        c.igSeparatorText("Render");
+
+        const render_phases = [_]struct { name: []const u8, us: u64 }{
+            .{ .name = "prepare", .us = s.time_prepare_us },
+            .{ .name = "instances", .us = s.time_instances_us },
+            .{ .name = "scene", .us = s.time_scene_us },
+            .{ .name = "postprocess", .us = s.time_postprocess_us },
+            .{ .name = "imgui", .us = s.time_imgui_us },
+        };
+
+        for (render_phases) |phase| {
+            var phase_buf: [128]u8 = undefined;
+            const phase_line = std.fmt.bufPrintZ(&phase_buf, "{d:.2}ms {s}", .{
+                @as(f64, @floatFromInt(phase.us)) / 1000.0,
+                phase.name,
+            }) catch "???";
+            c.igTextUnformatted(phase_line);
+        }
 
         c.igEnd();
     }

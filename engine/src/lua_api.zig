@@ -766,7 +766,8 @@ fn luaGetStats(L: ?*lc.lua_State) callconv(.c) c_int {
     lc.lua_setfield(L, -2, "physics_active");
     lc.lua_pushnumber(L, @floatFromInt(s.physics_total));
     lc.lua_setfield(L, -2, "physics_total");
-    lc.lua_pushnumber(L, @as(f64, @floatFromInt(s.time_render_us)) / 1000.0);
+    const total_render = s.time_prepare_us + s.time_instances_us + s.time_scene_us + s.time_postprocess_us + s.time_imgui_us;
+    lc.lua_pushnumber(L, @as(f64, @floatFromInt(total_render)) / 1000.0);
     lc.lua_setfield(L, -2, "time_render_ms");
 
     return 1;
