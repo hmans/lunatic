@@ -96,6 +96,7 @@ const EngineModules = struct {
     renderer: *std.Build.Module,
     postprocess: *std.Build.Module,
     lua: *std.Build.Module,
+    joltc: *std.Build.Step.Compile,
 };
 
 fn buildEngineModules(
@@ -103,8 +104,10 @@ fn buildEngineModules(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     entt: *std.Build.Dependency,
+    zphysics_dep: *std.Build.Dependency,
 ) EngineModules {
     const ecs_mod = entt.module("zig-ecs");
+    const zphysics_mod = zphysics_dep.module("root");
     const vendor_path = b.path("engine/vendor");
 
     const lua_mod = b.createModule(.{
@@ -220,9 +223,21 @@ fn buildEngineModules(
         },
     });
 
+    const physics_mod = b.createModule(.{
+        .root_source_file = b.path("engine/src/physics.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zphysics", .module = zphysics_mod },
+            .{ .name = "engine", .module = engine_mod },
+        },
+    });
+
     // Wire cross-module deps
     engine_mod.addImport("renderer", renderer_mod);
     engine_mod.addImport("postprocess", postprocess_mod);
+    engine_mod.addImport("physics", physics_mod);
     engine_mod.addImport("lua_api", lua_api_mod);
     engine_mod.addImport("gltf", gltf_mod);
 
@@ -231,6 +246,7 @@ fn buildEngineModules(
         .renderer = renderer_mod,
         .postprocess = postprocess_mod,
         .lua = lua_mod,
+        .joltc = zphysics_dep.artifact("joltc"),
     };
 }
 
@@ -242,9 +258,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const zphysics_dep = b.dependency("zphysics", .{
+        .target = target,
+        .optimize = optimize,
+        .enable_cross_platform_determinism = true,
+        .no_exceptions = true,
+    });
 
     // Game executable
-    const mods = buildEngineModules(b, target, optimize, entt);
+    const mods = buildEngineModules(b, target, optimize, entt, zphysics_dep);
     addShaders(b, mods.renderer, mods.postprocess);
 
     const exe = b.addExecutable(.{
@@ -259,6 +281,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.linkLibrary(mods.joltc);
     addLinkDeps(b, exe);
     b.installArtifact(exe);
 
@@ -287,7 +310,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const test_mods = buildEngineModules(b, target, optimize, entt);
+    const test_mods = buildEngineModules(b, target, optimize, entt, zphysics_dep);
     addShaders(b, test_mods.renderer, test_mods.postprocess);
 
     const integration_tests = b.addTest(.{
@@ -302,6 +325,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    integration_tests.linkLibrary(test_mods.joltc);
     addLinkDeps(b, integration_tests);
 
     const test_step = b.step("test", "Run all tests");

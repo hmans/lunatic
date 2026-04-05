@@ -442,7 +442,7 @@ test "system receives dt" {
         \\end)
     );
 
-    test_engine.runLuaSystems(0.016);
+    test_engine.runAllSystems(0.016);
 
     try run(L,
         \\assert(received_dt ~= nil, "system was not called")
@@ -461,9 +461,9 @@ test "failing system is disabled" {
         \\end)
     );
 
-    test_engine.runLuaSystems(0.016);
-    test_engine.runLuaSystems(0.016);
-    test_engine.runLuaSystems(0.016);
+    test_engine.runAllSystems(0.016);
+    test_engine.runAllSystems(0.016);
+    test_engine.runAllSystems(0.016);
 
     try run(L,
         \\assert(call_count == 1, "expected 1 call, got " .. call_count)
@@ -479,7 +479,7 @@ test "multiple systems run in order" {
         \\lunatic.system("second", function(dt) table.insert(order, "b") end)
     );
 
-    test_engine.runLuaSystems(0.016);
+    test_engine.runAllSystems(0.016);
 
     try run(L,
         \\assert(#order == 2)

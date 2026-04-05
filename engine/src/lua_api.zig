@@ -81,6 +81,11 @@ pub fn registerLuaApi(self: *Engine) void {
         .{ "create_sphere_mesh", &luaCreateSphereMesh },
         .{ "load_gltf", &luaLoadGltf },
         .{ "system", &luaSystemRegister },
+        .{ "get_stats", &luaGetStats },
+        .{ "physics_add_box", &luaPhysicsAddBox },
+        .{ "physics_add_sphere", &luaPhysicsAddSphere },
+        .{ "physics_add_floor", &luaPhysicsAddFloor },
+        .{ "physics_optimize", &luaPhysicsOptimize },
     };
 
     inline for (fns) |entry| {
@@ -220,6 +225,13 @@ fn luaSpawn(L: ?*lc.lua_State) callconv(.c) c_int {
 fn luaDestroy(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const entity = entityFromLua(self, L, 1);
+    // Clean up physics body if present
+    if (self.registry.tryGet(core_comp.RigidBody, entity)) |rb| {
+        const body_id: phys.BodyId = @enumFromInt(rb.body_id);
+        if (body_id != .invalid) {
+            phys.getBodyInterface(self).removeAndDestroyBody(body_id);
+        }
+    }
     removeFromAllLiveQueries(self, @bitCast(entity));
     self.registry.destroy(entity);
     return 0;
@@ -739,6 +751,136 @@ fn luaSetBloomRadius(L: ?*lc.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+/// lunatic.get_stats() → table { draw_calls, entities, physics_active, physics_total,
+///                               time_systems_ms, time_render_ms }
+fn luaGetStats(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const s = self.stats;
+    lc.lua_newtable(L);
+
+    lc.lua_pushnumber(L, @floatFromInt(s.draw_calls));
+    lc.lua_setfield(L, -2, "draw_calls");
+    lc.lua_pushnumber(L, @floatFromInt(s.entities_rendered));
+    lc.lua_setfield(L, -2, "entities");
+    lc.lua_pushnumber(L, @floatFromInt(s.physics_active));
+    lc.lua_setfield(L, -2, "physics_active");
+    lc.lua_pushnumber(L, @floatFromInt(s.physics_total));
+    lc.lua_setfield(L, -2, "physics_total");
+    lc.lua_pushnumber(L, @as(f64, @floatFromInt(s.time_render_us)) / 1000.0);
+    lc.lua_setfield(L, -2, "time_render_ms");
+
+    return 1;
+}
+
+// ============================================================
+// Physics callbacks
+// ============================================================
+
+const phys = engine_mod.physics;
+
+/// lunatic.physics_add_box(entity, half_x, half_y, half_z, motion_type)
+/// motion_type: "static", "dynamic", "kinematic" (default: "dynamic")
+/// Creates a Jolt box body and sets the entity's rigid_body component.
+fn luaPhysicsAddBox(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const entity = entityFromLua(self, L, 1);
+    const hx = checkFloat(L, 2);
+    const hy = checkFloat(L, 3);
+    const hz = checkFloat(L, 4);
+    const motion = luaMotionType(L, 5);
+
+    const pos = self.registry.getConst(core_comp.Position, entity);
+    const shape_settings = phys.BoxShapeSettings.create(.{ hx, hy, hz }) catch return 0;
+    const shape = shape_settings.asShapeSettings().createShape() catch return 0;
+    defer shape.release();
+
+    const nargs = lc.lua_gettop(L);
+    const restitution: f32 = if (nargs >= 6) checkFloat(L, 6) else 0.0;
+    const friction: f32 = if (nargs >= 7) checkFloat(L, 7) else 0.2;
+
+    const body_iface = phys.getBodyInterface(self);
+    const body_id = body_iface.createAndAddBody(.{
+        .position = .{ pos.x, pos.y, pos.z, 0 },
+        .shape = shape,
+        .motion_type = motion,
+        .object_layer = if (motion == .static) phys.object_layers.non_moving else phys.object_layers.moving,
+        .restitution = restitution,
+        .friction = friction,
+    }, .activate) catch return 0;
+
+    self.registry.addOrReplace(entity, core_comp.RigidBody{ .body_id = @intFromEnum(body_id) });
+    return 0;
+}
+
+/// lunatic.physics_add_sphere(entity, radius, motion_type, restitution, friction)
+fn luaPhysicsAddSphere(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const entity = entityFromLua(self, L, 1);
+    const radius = checkFloat(L, 2);
+    const motion = luaMotionType(L, 3);
+    const nargs = lc.lua_gettop(L);
+    const restitution: f32 = if (nargs >= 4) checkFloat(L, 4) else 0.0;
+    const friction: f32 = if (nargs >= 5) checkFloat(L, 5) else 0.2;
+
+    const pos = self.registry.getConst(core_comp.Position, entity);
+    const shape_settings = phys.SphereShapeSettings.create(radius) catch return 0;
+    const shape = shape_settings.asShapeSettings().createShape() catch return 0;
+    defer shape.release();
+
+    const body_iface = phys.getBodyInterface(self);
+    const body_id = body_iface.createAndAddBody(.{
+        .position = .{ pos.x, pos.y, pos.z, 0 },
+        .shape = shape,
+        .motion_type = motion,
+        .object_layer = if (motion == .static) phys.object_layers.non_moving else phys.object_layers.moving,
+        .restitution = restitution,
+        .friction = friction,
+    }, .activate) catch return 0;
+
+    self.registry.addOrReplace(entity, core_comp.RigidBody{ .body_id = @intFromEnum(body_id) });
+    return 0;
+}
+
+/// lunatic.physics_add_floor(y) — static infinite floor at given y height
+fn luaPhysicsAddFloor(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const nargs = lc.lua_gettop(L);
+    const hx: f32 = if (nargs >= 1) checkFloat(L, 1) else 50;
+    const hz: f32 = if (nargs >= 2) checkFloat(L, 2) else 50;
+    const y: f32 = if (nargs >= 3) checkFloat(L, 3) else 0;
+
+    const shape_settings = phys.BoxShapeSettings.create(.{ hx, 0.5, hz }) catch return 0;
+    const shape = shape_settings.asShapeSettings().createShape() catch return 0;
+    defer shape.release();
+
+    const body_iface = phys.getBodyInterface(self);
+    _ = body_iface.createAndAddBody(.{
+        .position = .{ 0, y - 0.5, 0, 0 },
+        .shape = shape,
+        .motion_type = .static,
+        .object_layer = phys.object_layers.non_moving,
+    }, .dont_activate) catch return 0;
+
+    return 0;
+}
+
+/// lunatic.physics_optimize() — call after adding static bodies
+fn luaPhysicsOptimize(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    if (self.physics.system) |sys| sys.optimizeBroadPhase();
+    return 0;
+}
+
+const core_comp = engine_mod.core_components;
+
+fn luaMotionType(L: ?*lc.lua_State, idx: c_int) phys.MotionType {
+    if (lc.lua_type(L, idx) != lc.LUA_TSTRING) return .dynamic;
+    const s = std.mem.span(lc.luaL_checklstring(L, idx, null));
+    if (std.mem.eql(u8, s, "static")) return .static;
+    if (std.mem.eql(u8, s, "kinematic")) return .kinematic;
+    return .dynamic;
+}
+
 // ============================================================
 // ImGui UI callbacks (no engine upvalue — pure ImGui wrappers)
 // ============================================================
@@ -962,18 +1104,17 @@ fn luaLoadGltf(L: ?*lc.lua_State) callconv(.c) c_int {
 
 fn luaSystemRegister(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    _ = lc.luaL_checklstring(L, 1, null);
+    const name = lc.luaL_checklstring(L, 1, null);
     lc.luaL_checktype(L, 2, lc.LUA_TFUNCTION);
 
     lc.lua_pushvalue(L, 2);
     const ref = lc.luaL_ref(L, lc.LUA_REGISTRYINDEX);
 
-    if (self.lua_system_count >= engine_mod.max_lua_systems) {
-        _ = lc.luaL_error(L, "too many Lua systems (max 64)");
+    if (self.system_count >= engine_mod.max_systems) {
+        _ = lc.luaL_error(L, "too many systems");
         return 0;
     }
 
-    self.lua_system_refs[self.lua_system_count] = ref;
-    self.lua_system_count += 1;
+    self.addLuaSystem(name, ref);
     return 0;
 }

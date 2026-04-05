@@ -78,8 +78,20 @@ pub const FlyCamera = struct {
     pub const lua = .{ .name = "fly_camera" };
 };
 
+/// Tracks entity lifetime in seconds. Incremented automatically by the engine.
+pub const Age = struct {
+    seconds: f32 = 0,
+    pub const lua = .{ .name = "age" };
+};
+
+/// Rigid body physics (Jolt). body_id is managed by the physics system.
+pub const RigidBody = struct {
+    body_id: u32 = 0,
+    pub const lua = .{ .name = "rigid_body" };
+};
+
 /// Core component tuple — engine modules reference these directly.
-pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, LookAt, FlyCamera };
+pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, LookAt, FlyCamera, Age, RigidBody };
 
 /// Concatenate core components with example-specific ones.
 /// Usage: `pub const all = core.withExtra(.{ Spin, Player });`

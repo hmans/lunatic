@@ -71,37 +71,70 @@ lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1,
 lunatic.add(cam, "fly_camera")
 
 --------------------------------------------------------------------------------
--- Entities
+-- Physics
 --------------------------------------------------------------------------------
 
--- Spawn a 9x9 grid of randomly shaped, colored, spinning objects
-for x = -4, 4 do
-  for z = -4, 4 do
-    local e = lunatic.spawn()
-    lunatic.add(e, "position", x * 2, 0, z * 2)
-    lunatic.add(e, "rotation", 0, math.random() * 360, 0)
-    lunatic.add(e, "spin", 30 + math.random() * 60)
-    lunatic.add(e, "mesh", meshes[math.random(#meshes)])
-    lunatic.add(e, "material", materials[math.random(#materials)])
+-- Visible floor (scale and physics half-extents must match:
+-- unit cube is ±0.5, so scale=S gives size S, half-extent = S/2)
+local floor = lunatic.spawn()
+lunatic.add(floor, "position", 0, -0.25, 0)
+lunatic.add(floor, "mesh", "cube")
+lunatic.add(floor, "scale", 20, 0.5, 20)
+lunatic.add(floor, "rotation", 0, 0, 0)
+lunatic.physics_add_box(floor, 10, 0.25, 10, "static")
+lunatic.physics_optimize()
+
+-- Spawner state
+local spawn_timer = 0
+local spawn_interval = 0.08 -- seconds between spawns
+local max_bodies = 5000
+local body_queue = {}        -- ring buffer of entity IDs
+
+local function spawn_physics_object()
+  -- Kill oldest if at capacity
+  if #body_queue >= max_bodies then
+    lunatic.destroy(table.remove(body_queue, 1))
   end
+
+  local e = lunatic.spawn()
+  local x = (math.random() - 0.5) * 6
+  local z = (math.random() - 0.5) * 6
+  local y = 12 + math.random() * 8
+  lunatic.add(e, "position", x, y, z)
+  lunatic.add(e, "rotation", math.random() * 360, math.random() * 360, 0)
+
+  local scale = 0.2 + math.random() * 0.6
+  lunatic.add(e, "scale", scale, scale, scale)
+  lunatic.add(e, "mesh", "sphere")
+  lunatic.add(e, "material", materials[math.random(#materials)])
+  lunatic.physics_add_sphere(e, scale * 0.5, "dynamic", 0.1, 1.5)
+
+  body_queue[#body_queue + 1] = e
 end
 
 --------------------------------------------------------------------------------
 -- Systems
 --------------------------------------------------------------------------------
 
--- A persistent query caches the entity set; the engine maintains it
--- automatically as entities gain/lose the queried components.
-local spinners = lunatic.create_query("rotation", "spin")
+-- Spawn new objects and kill fallen ones
+lunatic.system("spawner", function(dt)
+  spawn_timer = spawn_timer + dt
+  while spawn_timer >= spawn_interval do
+    spawn_physics_object()
+    spawn_timer = spawn_timer - spawn_interval
+  end
 
--- Systems run every frame. lunatic.ref() returns a mutable reference to a
--- component — writes to it update the ECS directly (no setter needed).
-lunatic.system("spin", function(dt)
-  lunatic.each_query(spinners, function(e)
-    local rot = lunatic.ref(e, "rotation")
-    local spin = lunatic.ref(e, "spin")
-    rot.y = rot.y + spin.speed * dt
-  end)
+  -- Kill bodies that fell off the world
+  local i = 1
+  while i <= #body_queue do
+    local pos = lunatic.ref(body_queue[i], "position")
+    if pos.y < -20 then
+      lunatic.destroy(body_queue[i])
+      table.remove(body_queue, i)
+    else
+      i = i + 1
+    end
+  end
 end)
 
 -- Debug UI using the ImGui bindings exposed via the `ui` global table.
@@ -111,8 +144,6 @@ lunatic.system("debug_ui", function(dt)
   ui.set_next_window_pos(16, 16, "first_use")
   ui.set_next_window_size(280, 0, "first_use")
   ui.begin_window("Debug")
-
-  ui.text(string.format("%.0f fps", ui.fps()))
 
   if ui.collapsing_header("Post-Processing") then
     local cam_ref = lunatic.ref(cam, "camera")

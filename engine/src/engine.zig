@@ -8,6 +8,7 @@ const ecs = @import("zig-ecs");
 const geometry = @import("geometry");
 const renderer = @import("renderer");
 pub const postprocess = @import("postprocess");
+pub const physics = @import("physics");
 const lua_api = @import("lua_api");
 pub const gltf = @import("gltf");
 
@@ -61,7 +62,31 @@ pub const max_materials = 64;
 pub const max_textures = 64;
 pub const max_lua_systems = 64;
 pub const max_zig_systems = 64;
+pub const max_systems = max_zig_systems + max_lua_systems;
 pub const ZigSystemFn = *const fn (*Engine, f32) void;
+
+pub const SystemKind = enum { zig, lua };
+
+pub const SystemEntry = struct {
+    name_buf: [31:0]u8 = .{0} ** 31,
+    kind: SystemKind = .zig,
+    time_us: u64 = 0,
+    // Payload
+    zig_fn: ?ZigSystemFn = null,
+    lua_ref: c_int = 0,
+    disabled: bool = false,
+
+    pub fn name(self: *const SystemEntry) [*:0]const u8 {
+        return @ptrCast(&self.name_buf);
+    }
+
+    pub fn setName(self: *SystemEntry, src: [*:0]const u8) void {
+        const s = std.mem.span(src);
+        const len = @min(s.len, 31);
+        @memcpy(self.name_buf[0..len], s[0..len]);
+        self.name_buf[len] = 0;
+    }
+};
 
 // ============================================================
 // Asset store — groups mesh, material, and texture registries
@@ -149,6 +174,14 @@ pub const Config = struct {
 // Engine
 // ============================================================
 
+pub const FrameStats = struct {
+    draw_calls: u32 = 0,
+    entities_rendered: u32 = 0,
+    physics_active: u32 = 0,
+    physics_total: u32 = 0,
+    time_render_us: u64 = 0,
+};
+
 pub const Engine = struct {
     // ECS
     registry: ecs.Registry,
@@ -170,6 +203,7 @@ pub const Engine = struct {
 
     // Post-processing (bloom)
     postprocess: postprocess.PostProcessState = .{},
+    physics: physics.PhysicsState = .{},
 
     // Fog
     fog_enabled: bool = false,
@@ -183,22 +217,20 @@ pub const Engine = struct {
     // Draw sorting scratch buffer
     draw_list: [renderer.max_renderables]renderer.DrawEntry = undefined,
 
-    // Frame counter
+    // Frame counter + stats
     current_frame: u64 = 0,
+    stats: FrameStats = .{},
 
     // Live queries (persistent entity sets, managed by lua_api)
     live_queries: [lua_api.max_live_queries]lua_api.LiveQuery = .{lua_api.LiveQuery{}} ** lua_api.max_live_queries,
     live_query_count: u32 = 0,
 
-    // Zig systems (function pointers, called before Lua systems each frame)
-    zig_systems: [max_zig_systems]ZigSystemFn = undefined,
-    zig_system_count: u32 = 0,
+    // All systems (Zig + Lua, unified, ordered)
+    systems: [max_systems]SystemEntry = .{SystemEntry{}} ** max_systems,
+    system_count: u32 = 0,
 
     // Lua
     lua_state: ?*lc.lua_State = null,
-    lua_system_refs: [max_lua_systems]c_int = .{0} ** max_lua_systems,
-    lua_system_disabled: [max_lua_systems]bool = .{false} ** max_lua_systems,
-    lua_system_count: u32 = 0,
 
     // State
     headless: bool = false,
@@ -236,6 +268,7 @@ pub const Engine = struct {
         for (self.live_queries[0..self.live_query_count]) |*lq| lq.deinit();
         if (self.lua_state) |L| lc.lua_close(L);
 
+        physics.deinitPhysics(self);
         if (self.gpu_device) |_| {
             c.cImGui_ImplSDLGPU3_Shutdown();
             c.cImGui_ImplSDL3_Shutdown();
@@ -296,8 +329,13 @@ pub const Engine = struct {
             c.cImGui_ImplSDL3_NewFrame();
             c.igNewFrame();
 
-            self.runZigSystems(dt);
-            self.runLuaSystems(dt);
+            self.runAllSystems(dt);
+
+            // Physics stats
+            if (self.physics.system) |phys_sys| {
+                self.stats.physics_active = phys_sys.getNumActiveBodies();
+                self.stats.physics_total = phys_sys.getNumBodies();
+            }
 
             // --- Frame rendering ---
             const cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse continue;
@@ -323,7 +361,10 @@ pub const Engine = struct {
             };
 
             // Prepare shared scene data (lights, draw list, render targets)
+            const t2 = c.SDL_GetPerformanceCounter();
             const frame = renderer.prepareFrame(self, sw_w, sw_h);
+            self.stats.entities_rendered = frame.draw_count;
+            self.stats.draw_calls = frame.draw_count;
             const hdr_tex = self.postprocess.hdr_texture.?;
 
             // Per-camera: render scene → HDR, then postprocess → swapchain
@@ -350,6 +391,9 @@ pub const Engine = struct {
                 };
                 postprocess.executePostProcess(self, cmd, swapchain_tex.?, sw_w, sw_h, settings);
             }
+
+            const t3 = c.SDL_GetPerformanceCounter();
+            self.stats.time_render_us = (t3 - t2) * 1_000_000 / c.SDL_GetPerformanceFrequency();
 
             // ImGui render pass — LDR overlay directly to swapchain
             c.igRender();
@@ -490,8 +534,14 @@ pub const Engine = struct {
         // Built-in materials
         _ = try self.createNamedMaterial("default", .{});
 
+        // Physics
+        try physics.initPhysics(self);
+
         // Built-in systems
-        self.addSystem(&Engine.flyCameraSystem);
+        self.addSystem("age", &Engine.ageSystem);
+        self.addSystem("physics", &physics.physicsSystem);
+        self.addSystem("fly_camera", &Engine.flyCameraSystem);
+        self.addSystem("stats_overlay", &Engine.statsOverlaySystem);
     }
 
     // ---- Mesh API ----
@@ -733,20 +783,108 @@ pub const Engine = struct {
 
     // ---- Zig systems ----
 
-    /// Register a Zig system function to be called each frame with delta time.
-    pub fn addSystem(self: *Engine, func: ZigSystemFn) void {
-        if (self.zig_system_count >= max_zig_systems) return;
-        self.zig_systems[self.zig_system_count] = func;
-        self.zig_system_count += 1;
+    /// Register a named Zig system function.
+    pub fn addSystem(self: *Engine, name: [*:0]const u8, func: ZigSystemFn) void {
+        if (self.system_count >= max_systems) return;
+        self.systems[self.system_count] = .{ .kind = .zig, .zig_fn = func };
+        self.systems[self.system_count].setName(name);
+        self.system_count += 1;
     }
 
-    fn runZigSystems(self: *Engine, dt: f32) void {
-        for (self.zig_systems[0..self.zig_system_count]) |sys| {
-            sys(self, dt);
+    /// Register a Lua system (called from lua_api).
+    pub fn addLuaSystem(self: *Engine, name: [*:0]const u8, lua_ref: c_int) void {
+        if (self.system_count >= max_systems) return;
+        self.systems[self.system_count] = .{ .kind = .lua, .lua_ref = lua_ref };
+        self.systems[self.system_count].setName(name);
+        self.system_count += 1;
+    }
+
+    pub fn runAllSystems(self: *Engine, dt: f32) void {
+        const L = self.lua_state;
+        const perf_freq = c.SDL_GetPerformanceFrequency();
+
+        for (self.systems[0..self.system_count]) |*sys| {
+            if (sys.disabled) continue;
+            const t_start = c.SDL_GetPerformanceCounter();
+
+            switch (sys.kind) {
+                .zig => {
+                    if (sys.zig_fn) |func| func(self, dt);
+                },
+                .lua => {
+                    if (L) |state| {
+                        lc.lua_rawgeti(state, lc.LUA_REGISTRYINDEX, sys.lua_ref);
+                        lc.lua_pushnumber(state, dt);
+                        if (lc.lua_pcall(state, 1, 0, 0) != 0) {
+                            const err = lc.lua_tolstring(state, -1, null);
+                            std.debug.print("Lua system '{s}' error: {s}\n", .{ sys.name(), err });
+                            lc.lua_pop(state, 1);
+                            sys.disabled = true;
+                        }
+                    }
+                },
+            }
+
+            const t_end = c.SDL_GetPerformanceCounter();
+            sys.time_us = (t_end - t_start) * 1_000_000 / perf_freq;
         }
     }
 
     // ---- Built-in systems ----
+
+    /// Built-in stats overlay — top-right corner, always visible.
+    pub fn statsOverlaySystem(self: *Engine, _: f32) void {
+        const s = self.stats;
+        const io = c.igGetIO();
+        const display_w: f32 = if (io) |i| i.*.DisplaySize.x else 800;
+
+        c.igSetNextWindowPosEx(.{ .x = display_w - 16, .y = 16 }, c.ImGuiCond_Always, .{ .x = 1, .y = 0 });
+        _ = c.igBegin("##stats", null, c.ImGuiWindowFlags_NoTitleBar | c.ImGuiWindowFlags_NoResize | c.ImGuiWindowFlags_NoMove | c.ImGuiWindowFlags_AlwaysAutoResize | c.ImGuiWindowFlags_NoSavedSettings | c.ImGuiWindowFlags_NoFocusOnAppearing | c.ImGuiWindowFlags_NoNav);
+
+        var buf: [128]u8 = undefined;
+        const line1 = std.fmt.bufPrintZ(&buf, "{d:.0} fps | {d} draw calls", .{ if (io) |i| i.*.Framerate else 0, s.draw_calls }) catch "???";
+        c.igTextUnformatted(line1);
+
+        var buf2: [128]u8 = undefined;
+        const line2 = std.fmt.bufPrintZ(&buf2, "physics {d}/{d} active", .{
+            s.physics_active,
+            s.physics_total,
+        }) catch "???";
+        c.igTextUnformatted(line2);
+
+        c.igSeparatorText("Systems");
+
+        for (self.systems[0..self.system_count]) |*sys| {
+            if (sys.disabled) continue;
+            const kind_label: [*:0]const u8 = if (sys.kind == .zig) "zig" else "lua";
+            var sys_buf: [128]u8 = undefined;
+            const sys_line = std.fmt.bufPrintZ(&sys_buf, "{d:.2}ms [{s}] {s}", .{
+                @as(f64, @floatFromInt(sys.time_us)) / 1000.0,
+                kind_label,
+                sys.name(),
+            }) catch "???";
+            c.igTextUnformatted(sys_line);
+        }
+
+        // Render time as a pseudo-system entry
+        var render_buf: [128]u8 = undefined;
+        const render_line = std.fmt.bufPrintZ(&render_buf, "{d:.2}ms [gpu] render", .{
+            @as(f64, @floatFromInt(s.time_render_us)) / 1000.0,
+        }) catch "???";
+        c.igTextUnformatted(render_line);
+
+        c.igEnd();
+    }
+
+    /// Increment Age.seconds for all entities with the Age component.
+    pub fn ageSystem(self: *Engine, dt: f32) void {
+        var view = self.registry.view(.{core_components.Age}, .{});
+        var iter = view.entityIterator();
+        while (iter.next()) |entity| {
+            var age = view.get(entity);
+            age.seconds += dt;
+        }
+    }
 
     /// FPS-style fly camera. Processes entities with FlyCamera + Position + Rotation.
     /// Right-click activates (hides cursor + enables look/move), release to interact with UI.
@@ -805,36 +943,17 @@ pub const Engine = struct {
         }
     }
 
-    // ---- Lua systems ----
-
-    /// Run all registered Lua systems with the given delta time. Disables systems that error.
-    pub fn runLuaSystems(self: *Engine, dt: f32) void {
-        const L = self.lua_state orelse return;
-        for (0..self.lua_system_count) |i| {
-            if (self.lua_system_disabled[i]) continue;
-            lc.lua_rawgeti(L, lc.LUA_REGISTRYINDEX, self.lua_system_refs[i]);
-            lc.lua_pushnumber(L, dt);
-            if (lc.lua_pcall(L, 1, 0, 0) != 0) {
-                if (comptime !builtin.is_test) {
-                    const err = lc.lua_tolstring(L, -1, null);
-                    std.debug.print("Lua system error (disabling): {s}\n", .{err});
-                }
-                lc.lua_pop(L, 1);
-                self.lua_system_disabled[i] = true;
-            }
-        }
-    }
-
-    /// Unregister all Lua systems and free their registry references.
+    /// Unregister all systems and free Lua registry references.
     pub fn resetSystems(self: *Engine) void {
         if (self.lua_state) |L| {
-            for (0..self.lua_system_count) |i| {
-                lc.luaL_unref(L, lc.LUA_REGISTRYINDEX, self.lua_system_refs[i]);
+            for (self.systems[0..self.system_count]) |sys| {
+                if (sys.kind == .lua and sys.lua_ref != 0) {
+                    lc.luaL_unref(L, lc.LUA_REGISTRYINDEX, sys.lua_ref);
+                }
             }
         }
-        self.lua_system_count = 0;
-        self.lua_system_refs = .{0} ** max_lua_systems;
-        self.lua_system_disabled = .{false} ** max_lua_systems;
+        self.system_count = 0;
+        self.systems = .{SystemEntry{}} ** max_systems;
     }
 };
 
