@@ -435,6 +435,17 @@ pub const Engine = struct {
 
         // Dear ImGui
         _ = c.igCreateContext(null);
+        styleImGui();
+
+        // Load custom font (falls back to default if file not found)
+        const io = c.igGetIO();
+        if (io) |imgui_io| {
+            const font = c.ImFontAtlas_AddFontFromFileTTF(imgui_io.*.Fonts, "assets/fonts/IBMPlexSans-Regular.ttf", 16, null, null);
+            if (font == null) {
+                std.debug.print("ImGui: custom font not found, using default\n", .{});
+            }
+        }
+
         if (!c.cImGui_ImplSDL3_InitForSDLGPU(self.sdl_window)) {
             std.debug.print("ImGui SDL3 init failed\n", .{});
             return error.ImGuiInitFailed;
@@ -865,4 +876,75 @@ fn uploadGPUBuffer(device: *c.SDL_GPUDevice, data: []const u8, usage: c.SDL_GPUB
     _ = c.SDL_SubmitGPUCommandBuffer(cmd);
     c.SDL_ReleaseGPUTransferBuffer(device, transfer);
     return buf;
+}
+
+// ============================================================
+// ImGui theme
+// ============================================================
+
+fn styleImGui() void {
+    const style = c.igGetStyle();
+    c.igStyleColorsDark(style);
+
+    // Geometry — rounded, spacious
+    style.*.WindowRounding = 8;
+    style.*.ChildRounding = 6;
+    style.*.FrameRounding = 4;
+    style.*.PopupRounding = 6;
+    style.*.GrabRounding = 3;
+    style.*.TabRounding = 4;
+    style.*.ScrollbarRounding = 6;
+    style.*.WindowPadding = .{ .x = 12, .y = 10 };
+    style.*.FramePadding = .{ .x = 8, .y = 5 };
+    style.*.ItemSpacing = .{ .x = 8, .y = 6 };
+    style.*.WindowBorderSize = 0;
+    style.*.FrameBorderSize = 0;
+    style.*.SeparatorSize = 1;
+
+    // Semi-transparent windows
+    style.*.Alpha = 0.97;
+
+    // Colors — dark blue-grey palette
+    const colors = &style.*.Colors;
+    colors[@intCast(c.ImGuiCol_WindowBg)] = .{ .x = 0.08, .y = 0.08, .z = 0.12, .w = 0.92 };
+    colors[@intCast(c.ImGuiCol_ChildBg)] = .{ .x = 0.07, .y = 0.07, .z = 0.10, .w = 0.50 };
+    colors[@intCast(c.ImGuiCol_PopupBg)] = .{ .x = 0.08, .y = 0.08, .z = 0.12, .w = 0.95 };
+    colors[@intCast(c.ImGuiCol_Border)] = .{ .x = 0.25, .y = 0.26, .z = 0.32, .w = 0.50 };
+
+    colors[@intCast(c.ImGuiCol_FrameBg)] = .{ .x = 0.14, .y = 0.14, .z = 0.20, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_FrameBgHovered)] = .{ .x = 0.22, .y = 0.22, .z = 0.30, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_FrameBgActive)] = .{ .x = 0.28, .y = 0.28, .z = 0.38, .w = 1.0 };
+
+    colors[@intCast(c.ImGuiCol_TitleBg)] = .{ .x = 0.06, .y = 0.06, .z = 0.09, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_TitleBgActive)] = .{ .x = 0.10, .y = 0.10, .z = 0.16, .w = 1.0 };
+
+    colors[@intCast(c.ImGuiCol_Header)] = .{ .x = 0.18, .y = 0.18, .z = 0.25, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_HeaderHovered)] = .{ .x = 0.28, .y = 0.28, .z = 0.38, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_HeaderActive)] = .{ .x = 0.34, .y = 0.34, .z = 0.46, .w = 1.0 };
+
+    // Accent — muted teal
+    colors[@intCast(c.ImGuiCol_SliderGrab)] = .{ .x = 0.35, .y = 0.60, .z = 0.65, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_SliderGrabActive)] = .{ .x = 0.45, .y = 0.75, .z = 0.80, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_Button)] = .{ .x = 0.18, .y = 0.30, .z = 0.35, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_ButtonHovered)] = .{ .x = 0.25, .y = 0.42, .z = 0.48, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_ButtonActive)] = .{ .x = 0.32, .y = 0.52, .z = 0.58, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_CheckMark)] = .{ .x = 0.45, .y = 0.75, .z = 0.80, .w = 1.0 };
+
+    colors[@intCast(c.ImGuiCol_Tab)] = .{ .x = 0.12, .y = 0.12, .z = 0.18, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_TabHovered)] = .{ .x = 0.25, .y = 0.42, .z = 0.48, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_TabSelected)] = .{ .x = 0.20, .y = 0.34, .z = 0.40, .w = 1.0 };
+
+    colors[@intCast(c.ImGuiCol_SeparatorHovered)] = .{ .x = 0.35, .y = 0.60, .z = 0.65, .w = 0.78 };
+    colors[@intCast(c.ImGuiCol_SeparatorActive)] = .{ .x = 0.35, .y = 0.60, .z = 0.65, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_ResizeGrip)] = .{ .x = 0.35, .y = 0.60, .z = 0.65, .w = 0.20 };
+    colors[@intCast(c.ImGuiCol_ResizeGripHovered)] = .{ .x = 0.35, .y = 0.60, .z = 0.65, .w = 0.67 };
+    colors[@intCast(c.ImGuiCol_ResizeGripActive)] = .{ .x = 0.35, .y = 0.60, .z = 0.65, .w = 0.95 };
+
+    colors[@intCast(c.ImGuiCol_Text)] = .{ .x = 0.88, .y = 0.88, .z = 0.92, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_TextDisabled)] = .{ .x = 0.45, .y = 0.45, .z = 0.50, .w = 1.0 };
+
+    colors[@intCast(c.ImGuiCol_ScrollbarBg)] = .{ .x = 0.06, .y = 0.06, .z = 0.09, .w = 0.50 };
+    colors[@intCast(c.ImGuiCol_ScrollbarGrab)] = .{ .x = 0.22, .y = 0.22, .z = 0.30, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_ScrollbarGrabHovered)] = .{ .x = 0.30, .y = 0.30, .z = 0.40, .w = 1.0 };
+    colors[@intCast(c.ImGuiCol_ScrollbarGrabActive)] = .{ .x = 0.38, .y = 0.38, .z = 0.50, .w = 1.0 };
 }
