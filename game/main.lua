@@ -1,76 +1,110 @@
--- game/main.lua — PBR test with MetalRoughSpheres
--- Swap to DamagedHelmet.glb or your own model to test
+-- Lunatic game — spinning shapes with bloom and fly camera
+--
+-- This file is the game entry point. The engine loads it at startup and
+-- executes it once; any lunatic.system() calls register per-frame callbacks
+-- that run every tick after that.
+--
+-- Right-click + drag to look around, WASD to move, Space/Ctrl for up/down.
+-- Shift for fast movement. The Debug window lets you tweak post-processing.
 
--- Setup
-lunatic.set_clear_color(0.15, 0.15, 0.18)
-lunatic.set_ambient(0.1, 0.1, 0.12)
-lunatic.set_fog(false)
+--------------------------------------------------------------------------------
+-- Scene settings
+--------------------------------------------------------------------------------
 
--- Directional light
+-- Dark background to make emissive bloom pop
+lunatic.set_clear_color(0.08, 0.08, 0.12)
+lunatic.set_ambient(0.15, 0.15, 0.25)
+
+-- Fog fades distant objects into the background color
+-- Args: start distance, end distance, r, g, b
+lunatic.set_fog(15, 60, 0.08, 0.08, 0.12)
+
+--------------------------------------------------------------------------------
+-- Light
+--------------------------------------------------------------------------------
+
+-- A single directional light (sun). Args: direction x, y, z
 local light = lunatic.spawn()
-lunatic.add(light, "directional_light", 0.3, 0.8, 0.5, 1, 1, 1)
+lunatic.add(light, "directional_light", 0.3, 0.8, 0.5)
 
--- Load test model
-local model = lunatic.load_gltf("assets/MetalRoughSpheres.glb")
+--------------------------------------------------------------------------------
+-- Materials
+--------------------------------------------------------------------------------
 
-for i, mesh_id in ipairs(model.meshes) do
-  local e = lunatic.spawn()
-  lunatic.add(e, "position", 0, 0, 0)
-  lunatic.add(e, "rotation", 0, 0, 0)
-  lunatic.add(e, "mesh", mesh_id)
-  local mat_id = model.materials[i] or model.materials[1]
-  if mat_id then
-    lunatic.add(e, "material", mat_id)
+-- Basic colored materials (PBR with default metallic=0, roughness=0.5)
+local red    = lunatic.create_material({ albedo = { 0.9, 0.2, 0.2 } })
+local green  = lunatic.create_material({ albedo = { 0.2, 0.8, 0.3 } })
+local blue   = lunatic.create_material({ albedo = { 0.2, 0.3, 0.9 } })
+local yellow = lunatic.create_material({ albedo = { 0.9, 0.8, 0.2 } })
+
+-- Emissive materials glow beyond 1.0 in the HDR buffer, which triggers bloom.
+-- The emissive values (3, 1.5, 0.3) etc. are in linear HDR — values > 1 bloom.
+local hot    = lunatic.create_material({ albedo = { 1, 1, 1 }, emissive = { 3, 1.5, 0.3 } })
+local cool   = lunatic.create_material({ albedo = { 1, 1, 1 }, emissive = { 0.3, 0.8, 3 } })
+
+local materials = { lunatic.material.default, red, green, blue, yellow, hot, cool }
+local meshes = { lunatic.mesh.cube, lunatic.mesh.sphere }
+
+--------------------------------------------------------------------------------
+-- Camera
+--------------------------------------------------------------------------------
+
+-- Camera args: fov, near, far, viewport_x, viewport_y, viewport_w, viewport_h,
+--              exposure, bloom_intensity
+-- Trailing args use struct defaults if omitted (see core_components.zig).
+local cam = lunatic.spawn()
+lunatic.add(cam, "position", 0, 8, 12)
+lunatic.add(cam, "rotation", 34, 0, 0)
+lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1, 1.2, 0.15)
+
+-- Adding a fly_camera component enables the built-in FPS camera controller.
+-- Optional args: speed, fast_speed, sensitivity (defaults: 10, 30, 0.15)
+lunatic.add(cam, "fly_camera")
+
+--------------------------------------------------------------------------------
+-- Entities
+--------------------------------------------------------------------------------
+
+-- Spawn a 9x9 grid of randomly shaped, colored, spinning objects
+for x = -4, 4 do
+  for z = -4, 4 do
+    local e = lunatic.spawn()
+    lunatic.add(e, "position", x * 2, 0, z * 2)
+    lunatic.add(e, "rotation", 0, math.random() * 360, 0)
+    lunatic.add(e, "spin", 30 + math.random() * 60)
+    lunatic.add(e, "mesh", meshes[math.random(#meshes)])
+    lunatic.add(e, "material", materials[math.random(#materials)])
   end
 end
 
--- Free-fly camera
-local cam = lunatic.spawn()
-lunatic.add(cam, "position", 0, 0, 25)
-lunatic.add(cam, "rotation", 0, 0, 0)
-lunatic.add(cam, "camera", 60, 0.1, 200, 0, 0, 1, 1)
+--------------------------------------------------------------------------------
+-- Systems
+--------------------------------------------------------------------------------
 
--- Grab mouse for FPS-style look
-lunatic.set_mouse_grab(true)
+-- A persistent query caches the entity set; the engine maintains it
+-- automatically as entities gain/lose the queried components.
+local spinners = lunatic.create_query("rotation", "spin")
 
-lunatic.system("fly_camera", function(dt)
-  local pos = lunatic.ref(cam, "position")
-  local rot = lunatic.ref(cam, "rotation")
-  local move_speed = lunatic.key_down("Left Shift") and 30 or 10
-  local mouse_sensitivity = 0.15
+-- Systems run every frame. lunatic.ref() returns a mutable reference to a
+-- component — writes to it update the ECS directly (no setter needed).
+lunatic.system("spin", function(dt)
+  lunatic.each_query(spinners, function(e)
+    local rot = lunatic.ref(e, "rotation")
+    local spin = lunatic.ref(e, "spin")
+    rot.y = rot.y + spin.speed * dt
+  end)
+end)
 
-  -- Mouse look
-  local dx, dy = lunatic.mouse_delta()
-  rot.y = rot.y + dx * mouse_sensitivity
-  rot.x = rot.x + dy * mouse_sensitivity
-  -- Clamp pitch
-  if rot.x > 89 then rot.x = 89 end
-  if rot.x < -89 then rot.x = -89 end
+-- Debug UI using the ImGui bindings exposed via the `ui` global table.
+-- ui.slider_float() takes the current value and returns the (possibly modified)
+-- value — a functional style that works naturally with Lua.
+lunatic.system("debug_ui", function(dt)
+  ui.begin_window("Debug")
+  ui.separator_text("Post-Processing")
 
-  -- Get actual camera axes from the rotation matrix
-  local fx, fy, fz, rx, ry, rz = lunatic.camera_axes(rot.x, rot.y, rot.z)
+  local cam_ref = lunatic.ref(cam, "camera")
+  cam_ref.exposure = ui.slider_float("Exposure", cam_ref.exposure, 0.1, 5.0)
+  cam_ref.bloom_intensity = ui.slider_float("Bloom Intensity", cam_ref.bloom_intensity, 0.0, 1.0)
 
-  -- WASD + Q/E
-  if lunatic.key_down("W") then
-    pos.x = pos.x + fx * move_speed * dt
-    pos.y = pos.y + fy * move_speed * dt
-    pos.z = pos.z + fz * move_speed * dt
-  end
-  if lunatic.key_down("S") then
-    pos.x = pos.x - fx * move_speed * dt
-    pos.y = pos.y - fy * move_speed * dt
-    pos.z = pos.z - fz * move_speed * dt
-  end
-  if lunatic.key_down("A") then
-    pos.x = pos.x - rx * move_speed * dt
-    pos.y = pos.y - ry * move_speed * dt
-    pos.z = pos.z - rz * move_speed * dt
-  end
-  if lunatic.key_down("D") then
-    pos.x = pos.x + rx * move_speed * dt
-    pos.y = pos.y + ry * move_speed * dt
-    pos.z = pos.z + rz * move_speed * dt
-  end
-  if lunatic.key_down("Space")          then pos.y = pos.y + move_speed * dt end
-  if lunatic.key_down("Left Ctrl") then pos.y = pos.y - move_speed * dt end
+  ui.end_window()
 end)

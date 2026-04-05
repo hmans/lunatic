@@ -87,6 +87,23 @@ pub fn registerLuaApi(self: *Engine) void {
 
     lc.lua_setglobal(L, "lunatic");
 
+    // ImGui UI bindings (no engine upvalue needed)
+    lc.lua_newtable(L);
+    const ui_fns = .{
+        .{ "begin_window", &luaUiBegin },
+        .{ "end_window", &luaUiEnd },
+        .{ "text", &luaUiText },
+        .{ "separator_text", &luaUiSeparatorText },
+        .{ "slider_float", &luaUiSliderFloat },
+        .{ "checkbox", &luaUiCheckbox },
+        .{ "button", &luaUiButton },
+    };
+    inline for (ui_fns) |entry| {
+        lc.lua_pushcclosure(L, entry[1], 0);
+        lc.lua_setfield(L, -2, entry[0]);
+    }
+    lc.lua_setglobal(L, "ui");
+
     _ = lc.luaL_newmetatable(L, ref_metatable_name);
 
     lc.lua_pushlightuserdata(L, self_ptr);
@@ -676,6 +693,63 @@ fn luaSetBloom(L: ?*lc.lua_State) callconv(.c) c_int {
     if (nargs >= 2) cam.bloom_intensity = checkFloat(L, 2);
     if (nargs >= 3) cam.exposure = checkFloat(L, 3);
     return 0;
+}
+
+// ============================================================
+// ImGui UI callbacks (no engine upvalue — pure ImGui wrappers)
+// ============================================================
+
+const ig = engine_mod.c;
+
+fn luaUiBegin(L: ?*lc.lua_State) callconv(.c) c_int {
+    const name = lc.luaL_checklstring(L, 1, null);
+    _ = ig.igBegin(name, null, 0);
+    return 0;
+}
+
+fn luaUiEnd(_: ?*lc.lua_State) callconv(.c) c_int {
+    ig.igEnd();
+    return 0;
+}
+
+fn luaUiText(L: ?*lc.lua_State) callconv(.c) c_int {
+    const text = lc.luaL_checklstring(L, 1, null);
+    ig.igTextUnformatted(text);
+    return 0;
+}
+
+fn luaUiSeparatorText(L: ?*lc.lua_State) callconv(.c) c_int {
+    const text = lc.luaL_checklstring(L, 1, null);
+    ig.igSeparatorText(text);
+    return 0;
+}
+
+/// ui.slider_float(label, current_value, min, max) → new_value
+fn luaUiSliderFloat(L: ?*lc.lua_State) callconv(.c) c_int {
+    const label = lc.luaL_checklstring(L, 1, null);
+    var value: f32 = @floatCast(lc.luaL_checknumber(L, 2));
+    const min: f32 = @floatCast(lc.luaL_checknumber(L, 3));
+    const max: f32 = @floatCast(lc.luaL_checknumber(L, 4));
+    _ = ig.igSliderFloat(label, &value, min, max);
+    lc.lua_pushnumber(L, value);
+    return 1;
+}
+
+/// ui.checkbox(label, current_value) → new_value
+fn luaUiCheckbox(L: ?*lc.lua_State) callconv(.c) c_int {
+    const label = lc.luaL_checklstring(L, 1, null);
+    var checked: bool = lc.lua_toboolean(L, 2) != 0;
+    _ = ig.igCheckbox(label, &checked);
+    lc.lua_pushboolean(L, if (checked) 1 else 0);
+    return 1;
+}
+
+/// ui.button(label) → was_clicked
+fn luaUiButton(L: ?*lc.lua_State) callconv(.c) c_int {
+    const label = lc.luaL_checklstring(L, 1, null);
+    const clicked = ig.igButton(label);
+    lc.lua_pushboolean(L, if (clicked) 1 else 0);
+    return 1;
 }
 
 // ============================================================

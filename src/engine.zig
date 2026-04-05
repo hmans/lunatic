@@ -464,6 +464,9 @@ pub const Engine = struct {
 
         // Built-in materials
         _ = try self.createNamedMaterial("default", .{});
+
+        // Built-in systems
+        self.addSystem(&Engine.flyCameraSystem);
     }
 
     // ---- Mesh API ----
@@ -695,6 +698,14 @@ pub const Engine = struct {
         };
     }
 
+    // ---- Input helpers ----
+
+    /// Check if a keyboard key is currently pressed.
+    pub fn isKeyDown(_: *Engine, scancode: c_uint) bool {
+        const state = c.SDL_GetKeyboardState(null);
+        return state[scancode];
+    }
+
     // ---- Zig systems ----
 
     /// Register a Zig system function to be called each frame with delta time.
@@ -707,6 +718,65 @@ pub const Engine = struct {
     fn runZigSystems(self: *Engine, dt: f32) void {
         for (self.zig_systems[0..self.zig_system_count]) |sys| {
             sys(self, dt);
+        }
+    }
+
+    // ---- Built-in systems ----
+
+    /// FPS-style fly camera. Processes entities with FlyCamera + Position + Rotation.
+    /// Right-click activates (hides cursor + enables look/move), release to interact with UI.
+    pub fn flyCameraSystem(self: *Engine, dt: f32) void {
+        const io = c.igGetIO();
+        if (io != null and io.*.WantCaptureMouse) return;
+
+        var dx: f32 = 0;
+        var dy: f32 = 0;
+        const buttons = c.SDL_GetRelativeMouseState(&dx, &dy);
+        const rmb_held = (buttons & c.SDL_BUTTON_RMASK) != 0;
+
+        if (rmb_held) {
+            _ = c.SDL_HideCursor();
+        } else {
+            _ = c.SDL_ShowCursor();
+        }
+
+        var view = self.registry.view(.{ core_components.Position, core_components.Rotation, core_components.FlyCamera }, .{});
+        var iter = view.entityIterator();
+        while (iter.next()) |entity| {
+            var pos = view.get(core_components.Position, entity);
+            var rot = view.get(core_components.Rotation, entity);
+            const fly = view.getConst(core_components.FlyCamera, entity);
+
+            if (!rmb_held) continue;
+
+            // Mouse look
+            rot.y += dx * fly.sensitivity;
+            rot.x += dy * fly.sensitivity;
+            rot.x = std.math.clamp(rot.x, -89, 89);
+
+            // Camera axes from pitch/yaw
+            const deg2rad = std.math.pi / 180.0;
+            const pitch = rot.x * deg2rad;
+            const yaw = rot.y * deg2rad;
+            const cp = @cos(pitch);
+            const sp = @sin(pitch);
+            const cy = @cos(yaw);
+            const sy = @sin(yaw);
+
+            const fx = sy * cp;
+            const fy = -sp;
+            const fz = -cy * cp;
+            const rx = cy;
+            const ry: f32 = 0;
+            const rz = sy;
+
+            const speed: f32 = if (self.isKeyDown(c.SDL_SCANCODE_LSHIFT)) fly.fast_speed else fly.speed;
+            if (self.isKeyDown(c.SDL_SCANCODE_W)) { pos.x += fx * speed * dt; pos.y += fy * speed * dt; pos.z += fz * speed * dt; }
+            if (self.isKeyDown(c.SDL_SCANCODE_S)) { pos.x -= fx * speed * dt; pos.y -= fy * speed * dt; pos.z -= fz * speed * dt; }
+            if (self.isKeyDown(c.SDL_SCANCODE_A)) { pos.x -= rx * speed * dt; pos.y -= ry * speed * dt; pos.z -= rz * speed * dt; }
+            if (self.isKeyDown(c.SDL_SCANCODE_D)) { pos.x += rx * speed * dt; pos.y += ry * speed * dt; pos.z += rz * speed * dt; }
+            if (self.isKeyDown(c.SDL_SCANCODE_SPACE)) pos.y += speed * dt;
+            if (self.isKeyDown(c.SDL_SCANCODE_LCTRL)) pos.y -= speed * dt;
         }
     }
 
