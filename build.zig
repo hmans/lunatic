@@ -51,18 +51,57 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) 
     addShader(b, pp_mod, "postprocess", "dof_tent", "frag", .fragment);
 }
 
+/// Detected system library prefix (Homebrew, /usr/local, /usr, etc.)
+const SystemPrefix = struct {
+    include: []const u8,
+    lib: []const u8,
+    luajit_include: []const u8,
+};
+
+fn detectSystemPrefix(allocator: std.mem.Allocator) ?SystemPrefix {
+    const candidates = [_][]const u8{
+        "/opt/homebrew", // Homebrew on Apple Silicon
+        "/usr/local", // Homebrew on Intel Mac, manual installs
+        "/usr", // Standard Linux
+    };
+
+    for (candidates) |prefix| {
+        const sdl_check = std.fmt.allocPrint(allocator, "{s}/include/SDL3/SDL.h", .{prefix}) catch continue;
+        std.fs.cwd().access(sdl_check, .{}) catch continue;
+
+        // Found SDL3 — look for LuaJIT headers
+        const luajit_21 = std.fmt.allocPrint(allocator, "{s}/include/luajit-2.1", .{prefix}) catch continue;
+        const luajit_dir = blk: {
+            std.fs.cwd().access(luajit_21, .{}) catch {
+                break :blk std.fmt.allocPrint(allocator, "{s}/include/luajit-5.1", .{prefix}) catch continue;
+            };
+            break :blk luajit_21;
+        };
+
+        return .{
+            .include = std.fmt.allocPrint(allocator, "{s}/include", .{prefix}) catch continue,
+            .lib = std.fmt.allocPrint(allocator, "{s}/lib", .{prefix}) catch continue,
+            .luajit_include = luajit_dir,
+        };
+    }
+    return null;
+}
+
 /// Add C include paths for @cImport to a module.
-// TODO: Replace hardcoded /opt/homebrew paths with pkg-config or env vars for cross-platform builds.
 fn addCIncludes(b: *std.Build, mod: *std.Build.Module, vendor_path: std.Build.LazyPath) void {
-    mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/luajit-2.1" });
+    if (detectSystemPrefix(b.allocator)) |prefix| {
+        mod.addIncludePath(.{ .cwd_relative = prefix.include });
+        mod.addIncludePath(.{ .cwd_relative = prefix.luajit_include });
+    }
     mod.addIncludePath(vendor_path);
     mod.addIncludePath(b.path("engine/vendor/imgui"));
 }
 
 /// Configure shared link dependencies on a compile step.
 fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
-    compile.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    if (detectSystemPrefix(b.allocator)) |prefix| {
+        compile.addLibraryPath(.{ .cwd_relative = prefix.lib });
+    }
     compile.linkSystemLibrary("SDL3");
     compile.linkSystemLibrary("luajit-5.1");
     compile.addCSourceFile(.{ .file = b.path("engine/vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
@@ -86,7 +125,9 @@ fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
         compile.addCSourceFile(.{ .file = b.path(src), .flags = imgui_flags });
     }
     compile.addIncludePath(imgui_include);
-    compile.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+    if (detectSystemPrefix(b.allocator)) |prefix| {
+        compile.addIncludePath(.{ .cwd_relative = prefix.include });
+    }
     compile.linkSystemLibrary("c++");
 }
 

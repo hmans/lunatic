@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            name: macOS-arm64
+          - os: ubuntu-24.04
+            name: Linux-x86_64
+
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: "0.15.2"
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sdl3 luajit shaderc spirv-cross
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsdl3-dev libluajit-5.1-dev glslc spirv-cross
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test
+        env:
+          SDL_VIDEODRIVER: dummy
