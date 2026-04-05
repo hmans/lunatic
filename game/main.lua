@@ -100,7 +100,9 @@ local function spawn_physics_object()
   lunatic.add(e, "position", x, y, z)
   lunatic.add(e, "rotation", math.random() * 360, math.random() * 360, 0)
 
-  local scale = 0.2 + math.random() * 0.6
+  -- Bias toward small spheres: square the random for exponential falloff
+  local r = math.random() * math.random() -- products cluster near 0
+  local scale = 0.15 + r * 1.2
   lunatic.add(e, "scale", scale, scale, scale)
   lunatic.add(e, "mesh", "sphere")
   -- Ember balls are rare (10% chance), otherwise pick from white/matte/silver
