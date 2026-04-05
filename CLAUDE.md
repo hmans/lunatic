@@ -8,15 +8,51 @@ A 3D game engine: Zig core + SDL3 GPU + LuaJIT scripting + zig-ecs.
 - **Hackable**: Optional Lua scripting for hot-reloadable system implementations; game projects fork and modify the engine repo for maximum flexibility
 - **Agent friendly**: simple architecture and Lua API for easy integration with AI agents (e.g. via natural language descriptions of game logic)
 
+## Project Structure
+
+- `src/` — engine core (Zig)
+- `game/main.zig` — game entry point (minimal: init, load script, run)
+- `game/main.lua` — game logic (scene setup, systems, debug UI)
+- `game/components.zig` — game-specific components (extends core with Spin, Player, etc.)
+- `shaders/` — GLSL 450 shaders (compiled to SPIR-V + MSL at build time)
+- `vendor/` — vendored C/C++ libs (stb_image, cgltf, Dear ImGui + dcimgui)
+- `assets/` — binary assets tracked via Git LFS (fonts, textures, models)
+
 ## Details
 
-- Components declare Lua semantics via a `pub const lua` struct literal: `.{ .name = "position" }` for data components, `.{ .name = "mesh", .resolve = .mesh }` for asset handles. Tag components (zero-sized structs) are auto-detected. Data component fields must be `f32` or `u32`. All Lua bridge dispatch goes through the `ComponentOps` vtable generated in `component_ops.zig`.
-- Engine code is split by responsibility: `engine.zig` (lifecycle, registries, frame orchestration), `renderer.zig` (GPU pipeline, scene rendering), `postprocess.zig` (UE-style mip-chain bloom — GPU handles only, settings from Camera component), `lua_api.zig` (Lua bindings + ImGui `ui` table), `component_ops.zig` (comptime vtable generator). Both renderer and lua_api import the Engine type from engine.zig.
-- Post-processing settings (exposure, bloom_intensity) live on the Camera component. bloom_intensity=0 means no bloom (just tonemapping). Bloom uses a 6-level progressive downsample/upsample mip chain (Jimenez SIGGRAPH 2014).
-- Built-in systems: `flyCameraSystem` (attach `FlyCamera` component to a camera entity), `debugUiSystem` (ImGui post-processing controls). Both auto-registered at engine init.
-- ImGui is exposed to Lua via the `ui` global table: `ui.begin_window`, `ui.end_window`, `ui.text`, `ui.separator_text`, `ui.slider_float`, `ui.checkbox`, `ui.button`. Slider/checkbox use functional style (take current value, return new value).
+- Components declare Lua semantics via a `pub const lua` struct literal: `.{ .name = "position" }` for data components, `.{ .name = "mesh", .resolve = .mesh }` for asset handles. Tag components (zero-sized structs) are auto-detected. Data component fields must be `f32` or `u32`. All Lua bridge dispatch goes through the `ComponentOps` vtable generated in `component_ops.zig`. Missing trailing args in Lua `add()` calls use struct defaults.
+- Engine code is split by responsibility: `engine.zig` (lifecycle, registries, frame orchestration, built-in systems), `renderer.zig` (GPU pipeline, scene rendering), `postprocess.zig` (bloom, DoF, composite+tonemap — GPU handles only, settings from Camera component), `lua_api.zig` (Lua bindings + ImGui `ui` table), `component_ops.zig` (comptime vtable generator).
 - Adding a new asset handle type (e.g. `TextureHandle` with string name resolution): define struct with `.resolve = .texture` in its `.lua` metadata, add to the `.all` tuple, add a `.texture` variant to `HandleKind` in `engine.zig`, and add a case to `Engine.resolveHandle()`'s switch.
-- Zig systems are registered with `engine.addSystem(fn)` and run before Lua systems each frame. Pure Zig examples/games can skip Lua entirely. Core component types are accessible via `engine_mod.core_components`.
+
+### Post-Processing Pipeline
+
+All post-processing settings live on the **Camera component** (per-camera). Pipeline order:
+
+```
+Scene → HDR texture (R16G16B16A16_FLOAT, linear depth in alpha)
+  → DoF (if dof_focus_dist > 0): CoC → prefilter → bokeh gather → tent filter → composite
+  → Bloom (if bloom_intensity > 0): 6-level mip-chain downsample → upsample with per-level tints
+  → Final composite → swapchain: bloom add, exposure, color temp, ACES tonemap, gamma, vignette, chromatic aberration, film grain
+  → ImGui overlay (LDR, directly to swapchain)
+```
+
+Camera post-processing fields: `exposure`, `bloom_intensity`, `dof_focus_dist`, `dof_focus_range`, `dof_blur_radius`, `vignette`, `vignette_smoothness`, `chromatic_aberration`, `grain`, `color_temp`.
+
+Global bloom shape: `engine.postprocess.tints[0..6]` (per-level weights) and `engine.postprocess.radius` (upsample filter width). Tweakable via `lunatic.get/set_bloom_tints()` and `lunatic.get/set_bloom_radius()`.
+
+### Built-in Systems
+
+Auto-registered at engine init:
+- **`flyCameraSystem`**: Attach `FlyCamera` component to a camera entity. Right-click to activate (hides cursor), WASD + Space/Ctrl to move. Configurable speed/sensitivity.
+- **`debugUiSystem`**: ImGui debug panel with post-processing controls.
+
+### ImGui
+
+- Vendored: Dear ImGui v1.92.7 + dcimgui (dear_bindings) C wrapper + SDL3/GPU backends
+- `@cImport` block in `engine.zig` includes `cimgui.h` + `cimgui_impl_sdlgpu3.h` alongside SDL3 (shared opaque types)
+- C function prefix: `ig` (e.g. `c.igBegin`, `c.igSliderFloat`)
+- Custom dark theme with IBM Plex Sans font (HiDPI-aware, rasterized at native resolution)
+- Exposed to Lua via `ui` global table: `begin_window`, `end_window`, `text`, `separator_text`, `slider_float`, `checkbox`, `button`, `collapsing_header`, `set_next_window_pos`, `set_next_window_size`, `fps`. Slider/checkbox use functional style (take current value, return new value).
 
 ## Scale Target
 
@@ -45,3 +81,7 @@ The engine must handle tens of thousands to hundreds of thousands of entities ef
 - **Shader cache staleness**: The zig build cache doesn't always invalidate spirv-cross MSL output when GLSL sources change. Run `rm -rf .zig-cache` after modifying shaders if you see stale behavior.
 - **MSAA + multiple render passes**: Use `STOREOP_RESOLVE_AND_STORE` (not `STOREOP_RESOLVE`) when subsequent render passes need to load from the MSAA color texture. Plain RESOLVE discards MSAA contents.
 - **Shared module graph**: `buildEngineModules()` in `build.zig` creates the full engine module graph. It's called twice (game executable + integration tests). When adding a new `.zig` engine module, add it there.
+- **HDR specular fireflies**: The fragment shader clamps output to 64.0 and uses specular anti-aliasing (`fwidth(N)`) to prevent GGX peaks from flickering. If you see flashing bright pixels, check these.
+- **HDR clear/fog colors**: User-specified sRGB colors are inverse-ACES-transformed in `renderer.zig` so they round-trip correctly through the tonemap. When changing the tonemapper, update `srgbToHdr()`.
+- **DoF depth storage**: Linear depth is stored in the HDR texture's alpha channel (written in `default.frag`). Clear color alpha is set to 1000.0 for background/sky. New fragment shaders must write linear depth to alpha.
+- **PostProcess texture ping-pong**: DoF composite writes to `hdr_texture_b` then swaps with `hdr_texture` to avoid read-write hazards. Bloom and final composite read from whichever is current.
