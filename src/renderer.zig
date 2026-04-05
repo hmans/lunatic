@@ -481,7 +481,8 @@ pub fn renderCamera(
 
     // Convert display-space clear color to linear HDR so it round-trips through tonemap
     const hdr_clear = srgbToHdr4(self.clear_color, exposure);
-    const clear_color = c.SDL_FColor{ .r = hdr_clear[0], .g = hdr_clear[1], .b = hdr_clear[2], .a = hdr_clear[3] };
+    // Alpha stores linear depth for DoF — background/sky gets max depth
+    const clear_color = c.SDL_FColor{ .r = hdr_clear[0], .g = hdr_clear[1], .b = hdr_clear[2], .a = 1000.0 };
 
     const color_target = if (is_msaa) c.SDL_GPUColorTargetInfo{
         .texture = self.msaa_color_texture,

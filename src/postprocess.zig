@@ -14,6 +14,16 @@ const c = engine_mod.c;
 
 const fullscreen_vert_spv = @embedFile("shader_fullscreen_vert_spv");
 const fullscreen_vert_msl = @embedFile("shader_fullscreen_vert_msl");
+const dof_coc_frag_spv = @embedFile("shader_dof_coc_frag_spv");
+const dof_coc_frag_msl = @embedFile("shader_dof_coc_frag_msl");
+const dof_prefilter_frag_spv = @embedFile("shader_dof_prefilter_frag_spv");
+const dof_prefilter_frag_msl = @embedFile("shader_dof_prefilter_frag_msl");
+const dof_bokeh_frag_spv = @embedFile("shader_dof_bokeh_frag_spv");
+const dof_bokeh_frag_msl = @embedFile("shader_dof_bokeh_frag_msl");
+const dof_composite_frag_spv = @embedFile("shader_dof_composite_frag_spv");
+const dof_composite_frag_msl = @embedFile("shader_dof_composite_frag_msl");
+const dof_tent_frag_spv = @embedFile("shader_dof_tent_frag_spv");
+const dof_tent_frag_msl = @embedFile("shader_dof_tent_frag_msl");
 const downsample_frag_spv = @embedFile("shader_downsample_frag_spv");
 const downsample_frag_msl = @embedFile("shader_downsample_frag_msl");
 const upsample_frag_spv = @embedFile("shader_upsample_frag_spv");
@@ -24,6 +34,22 @@ const composite_frag_msl = @embedFile("shader_composite_frag_msl");
 // ============================================================
 // Uniform structs (must match GLSL layouts)
 // ============================================================
+
+const DofParams = extern struct {
+    params: [4]f32, // .x = focus_distance, .y = focus_range, .z = max_blur_radius
+};
+
+const PrefilterParams = extern struct {
+    params: [4]f32, // .xy = texel size of source
+};
+
+const BokehParams = extern struct {
+    params: [4]f32, // .xy = texel size (half res), .z = max blur radius (half-res pixels)
+};
+
+const TentParams = extern struct {
+    params: [4]f32, // .xy = texel size
+};
 
 const DownsampleParams = extern struct {
     params: [4]f32, // .xy = texel size, .z = is_first_pass
@@ -52,8 +78,9 @@ const default_tints = [max_mip_levels]f32{ 0.5, 0.3, 0.2, 0.15, 0.1, 0.08 };
 // ============================================================
 
 pub const PostProcessState = struct {
-    // HDR scene render target (full resolution)
+    // HDR scene render targets (full resolution, two for ping-pong)
     hdr_texture: ?*c.SDL_GPUTexture = null,
+    hdr_texture_b: ?*c.SDL_GPUTexture = null,
 
     // Mip chain textures for bloom (downsample targets / upsample sources)
     mip_textures: [max_mip_levels]?*c.SDL_GPUTexture = .{null} ** max_mip_levels,
@@ -75,12 +102,27 @@ pub const PostProcessState = struct {
     tints: [max_mip_levels]f32 = default_tints,
     // Upsample filter radius multiplier (1.0 = standard, >1 = wider bloom)
     radius: f32 = 1.0,
+
+    // DoF textures (created alongside bloom textures)
+    dof_coc: ?*c.SDL_GPUTexture = null, // R16F, full res — signed CoC
+    dof_half: ?*c.SDL_GPUTexture = null, // RGBA16F, half res — prefiltered
+    dof_bokeh: ?*c.SDL_GPUTexture = null, // RGBA16F, half res — gather result
+
+    // DoF pipelines
+    dof_coc_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    dof_prefilter_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    dof_bokeh_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    dof_composite_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    dof_tent_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
 };
 
-/// Per-camera bloom settings, read from Camera component fields.
-pub const BloomSettings = struct {
+/// Per-camera post-processing settings, read from Camera component fields.
+pub const CameraPostSettings = struct {
     exposure: f32,
-    intensity: f32,
+    bloom_intensity: f32,
+    dof_focus_dist: f32,
+    dof_focus_range: f32,
+    dof_blur_radius: f32,
 };
 
 // ============================================================
@@ -339,6 +381,32 @@ pub fn initPostProcess(self: *Engine) !void {
         2,
     ) orelse return error.PipelineFailed;
 
+    // DoF pipelines
+    self.postprocess.dof_coc_pipeline = createPostProcessPipeline(
+        device, dof_coc_frag_spv, dof_coc_frag_msl,
+        c.SDL_GPU_TEXTUREFORMAT_R16_FLOAT, 1, 1,
+    ) orelse return error.PipelineFailed;
+
+    self.postprocess.dof_prefilter_pipeline = createPostProcessPipeline(
+        device, dof_prefilter_frag_spv, dof_prefilter_frag_msl,
+        hdr_format, 1, 2,
+    ) orelse return error.PipelineFailed;
+
+    self.postprocess.dof_bokeh_pipeline = createPostProcessPipeline(
+        device, dof_bokeh_frag_spv, dof_bokeh_frag_msl,
+        hdr_format, 1, 1,
+    ) orelse return error.PipelineFailed;
+
+    self.postprocess.dof_composite_pipeline = createPostProcessPipeline(
+        device, dof_composite_frag_spv, dof_composite_frag_msl,
+        hdr_format, 0, 3,
+    ) orelse return error.PipelineFailed;
+
+    self.postprocess.dof_tent_pipeline = createPostProcessPipeline(
+        device, dof_tent_frag_spv, dof_tent_frag_msl,
+        hdr_format, 1, 1,
+    ) orelse return error.PipelineFailed;
+
     // Textures at initial resolution
     try ensureTextures(self, self.rt_w, self.rt_h);
 }
@@ -352,12 +420,24 @@ pub fn ensureTextures(self: *Engine, w: u32, h: u32) !void {
 
     // Release old textures
     if (pp.hdr_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.hdr_texture_b) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.dof_coc) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.dof_half) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.dof_bokeh) |t| c.SDL_ReleaseGPUTexture(device, t);
     for (&pp.mip_textures) |*mt| {
         if (mt.*) |t| c.SDL_ReleaseGPUTexture(device, t);
         mt.* = null;
     }
 
     pp.hdr_texture = createRenderTexture(device, hdr_format, w, h) orelse return error.TextureFailed;
+    pp.hdr_texture_b = createRenderTexture(device, hdr_format, w, h) orelse return error.TextureFailed;
+
+    // DoF textures
+    pp.dof_coc = createRenderTexture(device, c.SDL_GPU_TEXTUREFORMAT_R16_FLOAT, w, h) orelse return error.TextureFailed;
+    const half_w = @max(w / 2, 1);
+    const half_h = @max(h / 2, 1);
+    pp.dof_half = createRenderTexture(device, hdr_format, half_w, half_h) orelse return error.TextureFailed;
+    pp.dof_bokeh = createRenderTexture(device, hdr_format, half_w, half_h) orelse return error.TextureFailed;
 
     // Build mip chain: each level is half the previous, starting from full res
     var mw = w;
@@ -384,12 +464,21 @@ pub fn deinitPostProcess(self: *Engine) void {
     const device = self.gpu_device orelse return;
     const pp = &self.postprocess;
     if (pp.hdr_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.hdr_texture_b) |t| c.SDL_ReleaseGPUTexture(device, t);
     for (pp.mip_textures) |mt| {
         if (mt) |t| c.SDL_ReleaseGPUTexture(device, t);
     }
+    if (pp.dof_coc) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.dof_half) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.dof_bokeh) |t| c.SDL_ReleaseGPUTexture(device, t);
     if (pp.downsample_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.upsample_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.composite_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+    if (pp.dof_coc_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+    if (pp.dof_prefilter_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+    if (pp.dof_bokeh_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+    if (pp.dof_composite_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+    if (pp.dof_tent_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.sampler) |s| c.SDL_ReleaseGPUSampler(device, s);
 }
 
@@ -432,13 +521,104 @@ fn drawFullscreenTriangle(pass: *c.SDL_GPURenderPass) void {
 // ============================================================
 
 /// Run post-processing for a single camera.
-/// Progressive downsample → upsample bloom + composite with tone mapping.
-pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain_tex: *c.SDL_GPUTexture, sw_w: u32, sw_h: u32, settings: BloomSettings) void {
+/// DoF (if enabled) → bloom → composite with tone mapping.
+pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain_tex: *c.SDL_GPUTexture, sw_w: u32, sw_h: u32, settings: CameraPostSettings) void {
     const pp = &self.postprocess;
     const sampler = pp.sampler orelse return;
     const mip_count = pp.mip_count;
+    const half_w = @max(sw_w / 2, 1);
+    const half_h = @max(sw_h / 2, 1);
+    const sw_wf: f32 = @floatFromInt(sw_w);
+    const sw_hf: f32 = @floatFromInt(sw_h);
+    const half_wf: f32 = @floatFromInt(half_w);
+    const half_hf: f32 = @floatFromInt(half_h);
 
-    if (settings.intensity > 0 and mip_count > 0) {
+    // === Depth of Field (before bloom, operates on HDR texture) ===
+    if (settings.dof_focus_dist > 0) {
+        // Pass 1: CoC from depth (stored in HDR alpha)
+        {
+            const pass = beginFullscreenPass(cmd, pp.dof_coc.?) orelse return;
+            c.SDL_BindGPUGraphicsPipeline(pass, pp.dof_coc_pipeline.?);
+            setFullscreenViewport(pass, sw_w, sw_h);
+            const binding = [1]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = pp.hdr_texture.?, .sampler = sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+            const params = DofParams{ .params = .{ settings.dof_focus_dist, settings.dof_focus_range, settings.dof_blur_radius, 0 } };
+            c.SDL_PushGPUFragmentUniformData(cmd, 0, &params, @sizeOf(DofParams));
+            drawFullscreenTriangle(pass);
+            c.SDL_EndGPURenderPass(pass);
+        }
+
+        // Pass 2: Prefilter downsample to half res
+        {
+            const pass = beginFullscreenPass(cmd, pp.dof_half.?) orelse return;
+            c.SDL_BindGPUGraphicsPipeline(pass, pp.dof_prefilter_pipeline.?);
+            setFullscreenViewport(pass, half_w, half_h);
+            const bindings = [2]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = pp.hdr_texture.?, .sampler = sampler },
+                .{ .texture = pp.dof_coc.?, .sampler = sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(pass, 0, &bindings, 2);
+            const params = PrefilterParams{ .params = .{ 1.0 / sw_wf, 1.0 / sw_hf, 0, 0 } };
+            c.SDL_PushGPUFragmentUniformData(cmd, 0, &params, @sizeOf(PrefilterParams));
+            drawFullscreenTriangle(pass);
+            c.SDL_EndGPURenderPass(pass);
+        }
+
+        // Pass 3: Bokeh gather at half res
+        {
+            const pass = beginFullscreenPass(cmd, pp.dof_bokeh.?) orelse return;
+            c.SDL_BindGPUGraphicsPipeline(pass, pp.dof_bokeh_pipeline.?);
+            setFullscreenViewport(pass, half_w, half_h);
+            const binding = [1]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = pp.dof_half.?, .sampler = sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+            const params = BokehParams{ .params = .{ 1.0 / half_wf, 1.0 / half_hf, settings.dof_blur_radius * 0.5, 0 } };
+            c.SDL_PushGPUFragmentUniformData(cmd, 0, &params, @sizeOf(BokehParams));
+            drawFullscreenTriangle(pass);
+            c.SDL_EndGPURenderPass(pass);
+        }
+
+        // Pass 4: Tent post-filter — smooth bokeh noise (dof_bokeh → dof_half)
+        {
+            const pass = beginFullscreenPass(cmd, pp.dof_half.?) orelse return;
+            c.SDL_BindGPUGraphicsPipeline(pass, pp.dof_tent_pipeline.?);
+            setFullscreenViewport(pass, half_w, half_h);
+            const binding = [1]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = pp.dof_bokeh.?, .sampler = sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+            const tent_params = TentParams{ .params = .{ 1.0 / half_wf, 1.0 / half_hf, 0, 0 } };
+            c.SDL_PushGPUFragmentUniformData(cmd, 0, &tent_params, @sizeOf(TentParams));
+            drawFullscreenTriangle(pass);
+            c.SDL_EndGPURenderPass(pass);
+        }
+
+        // Pass 5: Composite DoF → hdr_texture_b (can't read+write same texture)
+        {
+            const pass = beginFullscreenPass(cmd, pp.hdr_texture_b.?) orelse return;
+            c.SDL_BindGPUGraphicsPipeline(pass, pp.dof_composite_pipeline.?);
+            setFullscreenViewport(pass, sw_w, sw_h);
+            const bindings = [3]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = pp.hdr_texture.?, .sampler = sampler },
+                .{ .texture = pp.dof_half.?, .sampler = sampler }, // post-filtered
+                .{ .texture = pp.dof_coc.?, .sampler = sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(pass, 0, &bindings, 3);
+            drawFullscreenTriangle(pass);
+            c.SDL_EndGPURenderPass(pass);
+        }
+
+        // Swap: hdr_texture_b is now the active HDR buffer
+        const tmp = pp.hdr_texture;
+        pp.hdr_texture = pp.hdr_texture_b;
+        pp.hdr_texture_b = tmp;
+    }
+
+    // === Bloom (reads from hdr_texture, which may have been swapped by DoF) ===
+    if (settings.bloom_intensity > 0 and mip_count > 0) {
         // === Downsample chain: HDR → mip0 → mip1 → ... → mipN ===
         var i: u32 = 0;
         while (i < mip_count) : (i += 1) {
@@ -526,7 +706,7 @@ pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain
         setFullscreenViewport(pass, sw_w, sw_h);
 
         // bloom source is mip0 (accumulated upsample result), or HDR if no bloom
-        const bloom_tex = if (settings.intensity > 0 and pp.mip_count > 0)
+        const bloom_tex = if (settings.bloom_intensity > 0 and pp.mip_count > 0)
             pp.mip_textures[0].?
         else
             pp.hdr_texture.?;
@@ -537,7 +717,7 @@ pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain
         };
         c.SDL_BindGPUFragmentSamplers(pass, 0, &bindings, 2);
 
-        const params = CompositeParams{ .params = .{ settings.intensity, settings.exposure, 0, 0 } };
+        const params = CompositeParams{ .params = .{ settings.bloom_intensity, settings.exposure, 0, 0 } };
         c.SDL_PushGPUFragmentUniformData(cmd, 0, &params, @sizeOf(CompositeParams));
 
         drawFullscreenTriangle(pass);

@@ -43,6 +43,11 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) 
     addShader(b, pp_mod, "downsample", "frag", .fragment);
     addShader(b, pp_mod, "upsample", "frag", .fragment);
     addShader(b, pp_mod, "composite", "frag", .fragment);
+    addShader(b, pp_mod, "dof_coc", "frag", .fragment);
+    addShader(b, pp_mod, "dof_prefilter", "frag", .fragment);
+    addShader(b, pp_mod, "dof_bokeh", "frag", .fragment);
+    addShader(b, pp_mod, "dof_composite", "frag", .fragment);
+    addShader(b, pp_mod, "dof_tent", "frag", .fragment);
 }
 
 /// Add C include paths for @cImport to a module.

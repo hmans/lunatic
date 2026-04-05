@@ -55,7 +55,9 @@ local meshes = { lunatic.mesh.cube, lunatic.mesh.sphere }
 local cam = lunatic.spawn()
 lunatic.add(cam, "position", 0, 8, 12)
 lunatic.add(cam, "rotation", 34, 0, 0)
-lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1, 1.2, 0.15)
+-- Camera args: fov, near, far, vp_x, vp_y, vp_w, vp_h, exposure, bloom_intensity,
+--              dof_focus_dist, dof_focus_range, dof_blur_radius
+lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1, 1.2, 0.15, 15, 8, 8)
 
 -- Adding a fly_camera component enables the built-in FPS camera controller.
 -- Optional args: speed, fast_speed, sensitivity (defaults: 10, 30, 0.15)
@@ -109,6 +111,13 @@ lunatic.system("debug_ui", function(dt)
     local cam_ref = lunatic.ref(cam, "camera")
     cam_ref.exposure = ui.slider_float("Exposure", cam_ref.exposure, 0.1, 5.0)
     cam_ref.bloom_intensity = ui.slider_float("Bloom Intensity", cam_ref.bloom_intensity, 0.0, 1.0)
+  end
+
+  if ui.collapsing_header("Depth of Field") then
+    local cam_ref = lunatic.ref(cam, "camera")
+    cam_ref.dof_focus_dist = ui.slider_float("Focus Distance", cam_ref.dof_focus_dist, 0, 50)
+    cam_ref.dof_focus_range = ui.slider_float("Focus Range", cam_ref.dof_focus_range, 0.5, 30)
+    cam_ref.dof_blur_radius = ui.slider_float("Blur Radius", cam_ref.dof_blur_radius, 1, 20)
   end
 
   if ui.collapsing_header("Bloom Shape") then

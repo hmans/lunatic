@@ -43,6 +43,9 @@ pub const Camera = struct {
     // Post-processing (per-camera lens settings)
     exposure: f32 = 1.0,
     bloom_intensity: f32 = 0.0, // 0 = no bloom, just tonemap
+    dof_focus_dist: f32 = 0.0, // 0 = DoF disabled. World-space focal distance.
+    dof_focus_range: f32 = 5.0, // Width of in-focus band (smaller = shallower DoF)
+    dof_blur_radius: f32 = 8.0, // Max blur radius in pixels (at half res)
     pub const lua = .{ .name = "camera" };
 };
 
@@ -61,8 +64,17 @@ pub const LookAt = struct {
     pub const lua = .{ .name = "look_at" };
 };
 
+/// FPS-style fly camera controller. Attach to a camera entity with Position + Rotation.
+/// Right-click to activate (hides cursor), WASD + Space/Ctrl to move.
+pub const FlyCamera = struct {
+    speed: f32 = 10,
+    fast_speed: f32 = 30,
+    sensitivity: f32 = 0.15,
+    pub const lua = .{ .name = "fly_camera" };
+};
+
 /// Core component tuple — engine modules reference these directly.
-pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, LookAt };
+pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, LookAt, FlyCamera };
 
 /// Concatenate core components with example-specific ones.
 /// Usage: `pub const all = core.withExtra(.{ Spin, Player });`

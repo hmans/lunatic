@@ -148,5 +148,7 @@ void main() {
     // 64x overbright is more than enough for bloom while preventing outliers.
     color = min(color, vec3(64.0));
 
-    out_color = vec4(color, 1.0);
+    // Store linear depth (distance from camera) in alpha for DoF
+    float linear_depth = length(world_pos - scene.camera_pos.xyz);
+    out_color = vec4(color, linear_depth);
 }

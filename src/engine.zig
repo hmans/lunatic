@@ -336,9 +336,12 @@ pub const Engine = struct {
                 renderer.renderCamera(self, cmd, cam_entity, hdr_tex, sw_w, sw_h, frame, cam.exposure);
 
                 // Post-process → swapchain with this camera's settings
-                const settings = postprocess.BloomSettings{
+                const settings = postprocess.CameraPostSettings{
                     .exposure = cam.exposure,
-                    .intensity = cam.bloom_intensity,
+                    .bloom_intensity = cam.bloom_intensity,
+                    .dof_focus_dist = cam.dof_focus_dist,
+                    .dof_focus_range = cam.dof_focus_range,
+                    .dof_blur_radius = cam.dof_blur_radius,
                 };
                 postprocess.executePostProcess(self, cmd, swapchain_tex.?, sw_w, sw_h, settings);
             }
