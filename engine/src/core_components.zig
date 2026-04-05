@@ -85,8 +85,11 @@ pub const Age = struct {
 };
 
 /// Rigid body physics (Jolt). body_id is managed by the physics system.
+/// prev_* fields store the previous physics step's transform for interpolation.
 pub const RigidBody = struct {
     body_id: u32 = 0,
+    prev_x: f32 = 0, prev_y: f32 = 0, prev_z: f32 = 0,
+    prev_rx: f32 = 0, prev_ry: f32 = 0, prev_rz: f32 = 0,
     pub const lua = .{ .name = "rigid_body" };
 };
 

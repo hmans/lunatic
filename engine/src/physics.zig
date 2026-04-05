@@ -73,23 +73,12 @@ const ObjPairFilter = extern struct {
 // Physics state — stored on Engine
 // ============================================================
 
-const max_interp_bodies = 16384;
-
-const Transform = struct {
-    pos: [3]f32 = .{ 0, 0, 0 },
-    rot: [3]f32 = .{ 0, 0, 0 }, // Euler degrees
-};
-
 pub const PhysicsState = struct {
     system: ?*zp.PhysicsSystem = null,
     bp_layer_iface: BPLayerInterface = .{},
     obj_vs_bp_filter: ObjVsBPFilter = .{},
     obj_pair_filter: ObjPairFilter = .{},
     initialized: bool = false,
-
-    // Interpolation state — indexed by body_id index bits
-    prev: [max_interp_bodies]Transform = .{Transform{}} ** max_interp_bodies,
-    curr: [max_interp_bodies]Transform = .{Transform{}} ** max_interp_bodies,
     alpha: f32 = 1.0,
 };
 
@@ -167,7 +156,7 @@ pub fn physicsSystem(self: *Engine, dt: f32) void {
     while (physics_accumulator >= physics_timestep and steps < 4) {
         // Save current → prev before stepping
         if (steps == 0) {
-            savePrevTransforms(self, body_iface);
+            savePrevTransforms(self);
         }
 
         phys.update(physics_timestep, .{}) catch break;
@@ -195,41 +184,49 @@ pub fn physicsSystem(self: *Engine, dt: f32) void {
     writeInterpolatedTransforms(self);
 }
 
-fn savePrevTransforms(self: *Engine, body_iface: *const zp.BodyInterface) void {
-    var view = self.registry.view(.{core.RigidBody}, .{});
+/// Save current ECS position/rotation into RigidBody.prev_* fields.
+fn savePrevTransforms(self: *Engine) void {
+    var view = self.registry.view(.{ core.Position, core.Rotation, core.RigidBody }, .{});
     var iter = view.entityIterator();
     while (iter.next()) |entity| {
-        const rb = view.getConst(entity);
-        const body_id: zp.BodyId = @enumFromInt(rb.body_id);
-        if (body_id == .invalid) continue;
-        const idx = body_id.indexBits();
-        if (idx >= max_interp_bodies) continue;
-
-        // Copy current Jolt state to prev
-        const pos = body_iface.getPosition(body_id);
-        const rot = body_iface.getRotation(body_id);
-        const euler = quatToEuler(rot);
-        self.physics.prev[idx] = .{ .pos = .{ pos[0], pos[1], pos[2] }, .rot = euler };
+        const pos = view.getConst(core.Position, entity);
+        const rot = view.getConst(core.Rotation, entity);
+        var rb = view.get(core.RigidBody, entity);
+        rb.prev_x = pos.x;
+        rb.prev_y = pos.y;
+        rb.prev_z = pos.z;
+        rb.prev_rx = rot.x;
+        rb.prev_ry = rot.y;
+        rb.prev_rz = rot.z;
     }
 }
 
+/// Sync current Jolt transforms into ECS Position/Rotation.
 fn syncCurrentTransforms(self: *Engine, body_iface: *const zp.BodyInterface) void {
-    var view = self.registry.view(.{core.RigidBody}, .{});
+    var view = self.registry.view(.{ core.Position, core.Rotation, core.RigidBody }, .{});
     var iter = view.entityIterator();
     while (iter.next()) |entity| {
-        const rb = view.getConst(entity);
+        const rb = view.getConst(core.RigidBody, entity);
         const body_id: zp.BodyId = @enumFromInt(rb.body_id);
         if (body_id == .invalid) continue;
-        const idx = body_id.indexBits();
-        if (idx >= max_interp_bodies) continue;
 
         const pos = body_iface.getPosition(body_id);
         const rot = body_iface.getRotation(body_id);
         const euler = quatToEuler(rot);
-        self.physics.curr[idx] = .{ .pos = .{ pos[0], pos[1], pos[2] }, .rot = euler };
+
+        var ecs_pos = view.get(core.Position, entity);
+        ecs_pos.x = pos[0];
+        ecs_pos.y = pos[1];
+        ecs_pos.z = pos[2];
+
+        var ecs_rot = view.get(core.Rotation, entity);
+        ecs_rot.x = euler[0];
+        ecs_rot.y = euler[1];
+        ecs_rot.z = euler[2];
     }
 }
 
+/// Write interpolated transforms: lerp(prev, curr, alpha) → ECS.
 fn writeInterpolatedTransforms(self: *Engine) void {
     const alpha = self.physics.alpha;
     const inv = 1.0 - alpha;
@@ -238,23 +235,25 @@ fn writeInterpolatedTransforms(self: *Engine) void {
     var iter = view.entityIterator();
     while (iter.next()) |entity| {
         const rb = view.getConst(core.RigidBody, entity);
-        const body_id: zp.BodyId = @enumFromInt(rb.body_id);
-        if (body_id == .invalid) continue;
-        const idx = body_id.indexBits();
-        if (idx >= max_interp_bodies) continue;
+        if (rb.body_id == 0) continue;
 
-        const prev = self.physics.prev[idx];
-        const curr = self.physics.curr[idx];
+        var pos = view.get(core.Position, entity);
+        var rot = view.get(core.Rotation, entity);
 
-        var ecs_pos = view.get(core.Position, entity);
-        ecs_pos.x = prev.pos[0] * inv + curr.pos[0] * alpha;
-        ecs_pos.y = prev.pos[1] * inv + curr.pos[1] * alpha;
-        ecs_pos.z = prev.pos[2] * inv + curr.pos[2] * alpha;
+        // Lerp between prev (stored in RigidBody) and current (in Position/Rotation)
+        const cx = pos.x;
+        const cy = pos.y;
+        const cz = pos.z;
+        pos.x = rb.prev_x * inv + cx * alpha;
+        pos.y = rb.prev_y * inv + cy * alpha;
+        pos.z = rb.prev_z * inv + cz * alpha;
 
-        var ecs_rot = view.get(core.Rotation, entity);
-        ecs_rot.x = prev.rot[0] * inv + curr.rot[0] * alpha;
-        ecs_rot.y = prev.rot[1] * inv + curr.rot[1] * alpha;
-        ecs_rot.z = prev.rot[2] * inv + curr.rot[2] * alpha;
+        const crx = rot.x;
+        const cry = rot.y;
+        const crz = rot.z;
+        rot.x = rb.prev_rx * inv + crx * alpha;
+        rot.y = rb.prev_ry * inv + cry * alpha;
+        rot.z = rb.prev_rz * inv + crz * alpha;
     }
 }
 
