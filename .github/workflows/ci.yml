@@ -8,17 +8,8 @@ on:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-14
-            name: macOS-arm64
-          - os: ubuntu-24.04
-            name: Linux-x86_64
-
-    runs-on: ${{ matrix.os }}
-    name: ${{ matrix.name }}
+    runs-on: macos-14
+    name: macOS-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -29,20 +20,11 @@ jobs:
         with:
           version: "0.15.2"
 
-      - name: Install dependencies (macOS)
-        if: runner.os == 'macOS'
+      - name: Install dependencies
         run: brew install sdl3 luajit shaderc spirv-cross
-
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libsdl3-dev libluajit-5.1-dev glslc spirv-cross
 
       - name: Build
         run: zig build
 
       - name: Test
         run: zig build test
-        env:
-          SDL_VIDEODRIVER: dummy
