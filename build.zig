@@ -53,7 +53,7 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) 
 
 /// Add all system include/lib paths from known prefixes where dependencies are found.
 fn addSystemPaths(mod: *std.Build.Module, allocator: std.mem.Allocator) void {
-    const prefixes = [_][]const u8{ "/opt/homebrew", "/usr/local", "/usr" };
+    const prefixes = [_][]const u8{ "/opt/homebrew", "/usr/local", "/tmp/setupsdl", "/usr" };
 
     for (prefixes) |prefix| {
         const inc = std.fmt.allocPrint(allocator, "{s}/include", .{prefix}) catch continue;

@@ -43,10 +43,12 @@ jobs:
 
       - name: Install SDL3 (Linux)
         if: runner.os == 'Linux'
+        id: sdl
         uses: libsdl-org/setup-sdl@v1
         with:
           version: 3-latest
           build-type: Release
+          add-to-environment: true
 
       # Other dependencies
       - name: Install dependencies (macOS)
