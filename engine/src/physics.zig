@@ -98,8 +98,8 @@ pub fn initPhysics(self: *Engine) !void {
         &self.physics.obj_pair_filter.filter,
         .{
             .max_bodies = 16384,
-            .max_body_pairs = 16384,
-            .max_contact_constraints = 8192,
+            .max_body_pairs = 65536,
+            .max_contact_constraints = 65536,
         },
     );
     self.physics.initialized = true;

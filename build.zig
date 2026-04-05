@@ -262,6 +262,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .enable_cross_platform_determinism = true,
+        .enable_asserts = false,
         .no_exceptions = true,
     });
 
