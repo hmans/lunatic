@@ -1,4 +1,4 @@
-// components.zig — Primitives example. Adds Spin and Player to core components.
+// components.zig — Game-specific components (extends core).
 
 const core = @import("core_components");
 

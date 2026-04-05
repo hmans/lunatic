@@ -40,8 +40,8 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) 
     addShader(b, mod, "default", "vert", .vertex);
     addShader(b, mod, "default", "frag", .fragment);
     addShader(b, pp_mod, "fullscreen", "vert", .vertex);
-    addShader(b, pp_mod, "threshold", "frag", .fragment);
-    addShader(b, pp_mod, "blur", "frag", .fragment);
+    addShader(b, pp_mod, "downsample", "frag", .fragment);
+    addShader(b, pp_mod, "upsample", "frag", .fragment);
     addShader(b, pp_mod, "composite", "frag", .fragment);
 }
 
@@ -84,21 +84,22 @@ fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
     compile.linkSystemLibrary("c++");
 }
 
-/// Build an example executable. If components_file is null, uses core_components.zig.
-fn addExample(
+/// Build the full engine module graph. Returns the engine module and renderer/postprocess
+/// modules (needed for shader embedding).
+const EngineModules = struct {
+    engine: *std.Build.Module,
+    renderer: *std.Build.Module,
+    postprocess: *std.Build.Module,
+    lua: *std.Build.Module,
+};
+
+fn buildEngineModules(
     b: *std.Build,
-    comptime name: []const u8,
-    comptime components_file: ?[]const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     entt: *std.Build.Dependency,
-) *std.Build.Step.Compile {
-    // Shared engine modules that need the "components" import remapped per-example.
-    // We create a module for "components" that points to the example's file,
-    // then all engine modules reference it.
-
+) EngineModules {
     const ecs_mod = entt.module("zig-ecs");
-
     const vendor_path = b.path("vendor");
 
     const lua_mod = b.createModule(.{
@@ -115,17 +116,14 @@ fn addExample(
         .optimize = optimize,
     });
 
-    const components_mod = if (components_file) |cf|
-        b.createModule(.{
-            .root_source_file = b.path(cf),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "core_components", .module = core_components_mod },
-            },
-        })
-    else
-        core_components_mod;
+    const components_mod = b.createModule(.{
+        .root_source_file = b.path("game/components.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_components", .module = core_components_mod },
+        },
+    });
 
     const geometry_mod = b.createModule(.{
         .root_source_file = b.path("src/geometry.zig"),
@@ -154,7 +152,6 @@ fn addExample(
     });
     addCIncludes(b, engine_mod, vendor_path);
 
-    // Renderer, component_ops, and lua_api modules
     const renderer_mod = b.createModule(.{
         .root_source_file = b.path("src/renderer.zig"),
         .target = target,
@@ -224,23 +221,12 @@ fn addExample(
     engine_mod.addImport("lua_api", lua_api_mod);
     engine_mod.addImport("gltf", gltf_mod);
 
-    const exe = b.addExecutable(.{
-        .name = name,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/" ++ name ++ "/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "engine", .module = engine_mod },
-            },
-        }),
-    });
-
-    addLinkDeps(b, exe);
-    addShaders(b, renderer_mod, postprocess_mod);
-
-    return exe;
+    return .{
+        .engine = engine_mod,
+        .renderer = renderer_mod,
+        .postprocess = postprocess_mod,
+        .lua = lua_mod,
+    };
 }
 
 pub fn build(b: *std.Build) void {
@@ -252,39 +238,34 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Examples
-    const Example = struct { name: []const u8, components: ?[]const u8 = null };
-    const examples = [_]Example{
-        .{ .name = "pbr_test" },
-        .{ .name = "primitives", .components = "examples/primitives/components.zig" },
-        .{ .name = "zig_primitives" },
-    };
+    // Game executable
+    const mods = buildEngineModules(b, target, optimize, entt);
+    addShaders(b, mods.renderer, mods.postprocess);
 
-    const default_run_step = b.step("run", "Run the default example (pbr_test)");
+    const exe = b.addExecutable(.{
+        .name = "lunatic",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("game/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "engine", .module = mods.engine },
+            },
+        }),
+    });
+    addLinkDeps(b, exe);
+    b.installArtifact(exe);
 
-    inline for (examples) |ex| {
-        const exe = addExample(b, ex.name, ex.components, target, optimize, entt);
-        b.installArtifact(exe);
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.setCwd(b.path("."));
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
 
-        const run_cmd = b.addRunArtifact(exe);
-        run_cmd.setCwd(b.path("."));
-        run_cmd.step.dependOn(b.getInstallStep());
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
-
-        const run_step = b.step("run-" ++ ex.name, "Run the " ++ ex.name ++ " example");
-        run_step.dependOn(&run_cmd.step);
-
-        // Default "run" step aliases pbr_test (no double build)
-        if (comptime std.mem.eql(u8, ex.name, "pbr_test")) {
-            default_run_step.dependOn(&run_cmd.step);
-        }
-    }
+    const run_step = b.step("run", "Run the game");
+    run_step.dependOn(&run_cmd.step);
 
     // Tests
-
-    // Unit tests for math3d and geometry (standalone, no engine deps)
     const math_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/math3d.zig"),
@@ -301,166 +282,26 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Integration tests (headless engine + Lua API)
-    const integration_tests = addIntegrationTests(b, target, optimize, entt);
+    // Integration tests reuse the same engine module graph
+    const test_mods = buildEngineModules(b, target, optimize, entt);
+    addShaders(b, test_mods.renderer, test_mods.postprocess);
 
-    const run_math_tests = b.addRunArtifact(math_tests);
-    const run_geometry_tests = b.addRunArtifact(geometry_tests);
-    const run_integration_tests = b.addRunArtifact(integration_tests);
-
-    const test_step = b.step("test", "Run all tests");
-    test_step.dependOn(&run_math_tests.step);
-    test_step.dependOn(&run_geometry_tests.step);
-    test_step.dependOn(&run_integration_tests.step);
-}
-
-/// Build the integration test suite (tests.zig) with the full engine module graph.
-fn addIntegrationTests(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    entt: *std.Build.Dependency,
-) *std.Build.Step.Compile {
-    const ecs_mod = entt.module("zig-ecs");
-    const vendor_path = b.path("vendor");
-
-    const lua_mod = b.createModule(.{
-        .root_source_file = b.path("src/lua.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    addCIncludes(b, lua_mod, vendor_path);
-
-    const core_components_mod = b.createModule(.{
-        .root_source_file = b.path("src/core_components.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Integration tests use primitives components (includes Spin, Player for tag tests)
-    const components_mod = b.createModule(.{
-        .root_source_file = b.path("examples/primitives/components.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_components", .module = core_components_mod },
-        },
-    });
-
-    const geometry_mod = b.createModule(.{
-        .root_source_file = b.path("src/geometry.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const math3d_mod = b.createModule(.{
-        .root_source_file = b.path("src/math3d.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const engine_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "zig-ecs", .module = ecs_mod },
-            .{ .name = "core_components", .module = core_components_mod },
-            .{ .name = "lua", .module = lua_mod },
-            .{ .name = "geometry", .module = geometry_mod },
-            .{ .name = "math3d", .module = math3d_mod },
-        },
-    });
-    addCIncludes(b, engine_mod, vendor_path);
-
-    const renderer_mod = b.createModule(.{
-        .root_source_file = b.path("src/renderer.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "zig-ecs", .module = ecs_mod },
-            .{ .name = "core_components", .module = core_components_mod },
-            .{ .name = "engine", .module = engine_mod },
-            .{ .name = "geometry", .module = geometry_mod },
-            .{ .name = "math3d", .module = math3d_mod },
-        },
-    });
-
-    const component_ops_mod = b.createModule(.{
-        .root_source_file = b.path("src/component_ops.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "zig-ecs", .module = ecs_mod },
-            .{ .name = "engine", .module = engine_mod },
-            .{ .name = "lua", .module = lua_mod },
-        },
-    });
-    addCIncludes(b, component_ops_mod, vendor_path);
-
-    const lua_api_mod = b.createModule(.{
-        .root_source_file = b.path("src/lua_api.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "zig-ecs", .module = ecs_mod },
-            .{ .name = "components", .module = components_mod },
-            .{ .name = "component_ops", .module = component_ops_mod },
-            .{ .name = "engine", .module = engine_mod },
-            .{ .name = "lua", .module = lua_mod },
-        },
-    });
-
-    const gltf_mod = b.createModule(.{
-        .root_source_file = b.path("src/gltf.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "engine", .module = engine_mod },
-            .{ .name = "geometry", .module = geometry_mod },
-        },
-    });
-    addCIncludes(b, gltf_mod, vendor_path);
-
-    const postprocess_mod = b.createModule(.{
-        .root_source_file = b.path("src/postprocess.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "engine", .module = engine_mod },
-        },
-    });
-
-    // Wire cross-module deps (same as addExample)
-    engine_mod.addImport("renderer", renderer_mod);
-    engine_mod.addImport("postprocess", postprocess_mod);
-    engine_mod.addImport("lua_api", lua_api_mod);
-    engine_mod.addImport("gltf", gltf_mod);
-
-    // Renderer needs shader embeds even for tests (module is compiled but not executed in headless)
-    addShaders(b, renderer_mod, postprocess_mod);
-
-    const tests = b.addTest(.{
+    const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tests.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
             .imports = &.{
-                .{ .name = "engine", .module = engine_mod },
-                .{ .name = "lua", .module = lua_mod },
+                .{ .name = "engine", .module = test_mods.engine },
+                .{ .name = "lua", .module = test_mods.lua },
             },
         }),
     });
+    addLinkDeps(b, integration_tests);
 
-    addLinkDeps(b, tests);
-
-    return tests;
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(&b.addRunArtifact(math_tests).step);
+    test_step.dependOn(&b.addRunArtifact(geometry_tests).step);
+    test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 }

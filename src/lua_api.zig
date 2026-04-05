@@ -662,7 +662,7 @@ fn luaSetAmbient(L: ?*lc.lua_State) callconv(.c) c_int {
     return 0;
 }
 
-/// lunatic.set_bloom(entity, threshold, intensity, exposure)
+/// lunatic.set_bloom(entity, intensity, exposure)
 /// Sets bloom parameters on a camera entity's Camera component.
 /// intensity = 0 disables bloom (just tonemapping).
 fn luaSetBloom(L: ?*lc.lua_State) callconv(.c) c_int {
@@ -673,9 +673,8 @@ fn luaSetBloom(L: ?*lc.lua_State) callconv(.c) c_int {
         unreachable;
     };
     const nargs = lc.lua_gettop(L);
-    if (nargs >= 2) cam.bloom_threshold = checkFloat(L, 2);
-    if (nargs >= 3) cam.bloom_intensity = checkFloat(L, 3);
-    if (nargs >= 4) cam.exposure = checkFloat(L, 4);
+    if (nargs >= 2) cam.bloom_intensity = checkFloat(L, 2);
+    if (nargs >= 3) cam.exposure = checkFloat(L, 3);
     return 0;
 }
 

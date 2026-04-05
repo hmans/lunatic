@@ -42,10 +42,7 @@ pub const Camera = struct {
     viewport_h: f32 = 1.0,
     // Post-processing (per-camera lens settings)
     exposure: f32 = 1.0,
-    bloom_threshold: f32 = 1.0,
     bloom_intensity: f32 = 0.0, // 0 = no bloom, just tonemap
-    bloom_soft_knee: f32 = 0.5,
-    bloom_blur_passes: f32 = 1,
     pub const lua = .{ .name = "camera" };
 };
 

@@ -1,5 +1,7 @@
-// postprocess.zig — Bloom post-processing: HDR render target, threshold extraction,
-// separable Gaussian blur, and final composite with tone mapping.
+// postprocess.zig — UE-style bloom: progressive mip-chain downsample/upsample
+// with Karis average (firefly suppression) and per-level tinting.
+// Based on Jorge Jimenez, "Next Generation Post Processing in Call of Duty:
+// Advanced Warfare", SIGGRAPH 2014.
 
 const std = @import("std");
 const engine_mod = @import("engine");
@@ -12,10 +14,10 @@ const c = engine_mod.c;
 
 const fullscreen_vert_spv = @embedFile("shader_fullscreen_vert_spv");
 const fullscreen_vert_msl = @embedFile("shader_fullscreen_vert_msl");
-const threshold_frag_spv = @embedFile("shader_threshold_frag_spv");
-const threshold_frag_msl = @embedFile("shader_threshold_frag_msl");
-const blur_frag_spv = @embedFile("shader_blur_frag_spv");
-const blur_frag_msl = @embedFile("shader_blur_frag_msl");
+const downsample_frag_spv = @embedFile("shader_downsample_frag_spv");
+const downsample_frag_msl = @embedFile("shader_downsample_frag_msl");
+const upsample_frag_spv = @embedFile("shader_upsample_frag_spv");
+const upsample_frag_msl = @embedFile("shader_upsample_frag_msl");
 const composite_frag_spv = @embedFile("shader_composite_frag_spv");
 const composite_frag_msl = @embedFile("shader_composite_frag_msl");
 
@@ -23,12 +25,12 @@ const composite_frag_msl = @embedFile("shader_composite_frag_msl");
 // Uniform structs (must match GLSL layouts)
 // ============================================================
 
-const BloomParams = extern struct {
-    params: [4]f32, // .x = threshold, .y = soft_knee, .z = intensity
+const DownsampleParams = extern struct {
+    params: [4]f32, // .xy = texel size, .z = is_first_pass
 };
 
-const BlurParams = extern struct {
-    direction: [4]f32, // .xy = blur direction in texel space
+const UpsampleParams = extern struct {
+    params: [4]f32, // .xy = texel size of lower mip, .z = tint/weight
 };
 
 const CompositeParams = extern struct {
@@ -36,27 +38,34 @@ const CompositeParams = extern struct {
 };
 
 // ============================================================
-// HDR format
+// Constants
 // ============================================================
 
 const hdr_format: c.SDL_GPUTextureFormat = c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+pub const max_mip_levels = 6;
+
+// Default per-level tints (UE4-inspired, sum ≈ 1.0)
+const default_tints = [max_mip_levels]f32{ 0.5, 0.3, 0.2, 0.15, 0.1, 0.08 };
 
 // ============================================================
-// PostProcess state — stored as fields on Engine
+// PostProcess state — GPU handles only, no settings
 // ============================================================
 
 pub const PostProcessState = struct {
     // HDR scene render target (full resolution)
     hdr_texture: ?*c.SDL_GPUTexture = null,
-    // Bloom ping-pong textures (half resolution)
-    bloom_a: ?*c.SDL_GPUTexture = null,
-    bloom_b: ?*c.SDL_GPUTexture = null,
-    bloom_w: u32 = 0,
-    bloom_h: u32 = 0,
+
+    // Mip chain textures for bloom (downsample targets / upsample sources)
+    mip_textures: [max_mip_levels]?*c.SDL_GPUTexture = .{null} ** max_mip_levels,
+    mip_widths: [max_mip_levels]u32 = .{0} ** max_mip_levels,
+    mip_heights: [max_mip_levels]u32 = .{0} ** max_mip_levels,
+    mip_count: u32 = 0,
+    cached_w: u32 = 0,
+    cached_h: u32 = 0,
 
     // Pipelines
-    threshold_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
-    blur_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    downsample_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    upsample_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
     composite_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
 
     // Sampler for post-process texture reads (linear, clamp-to-edge)
@@ -66,14 +75,11 @@ pub const PostProcessState = struct {
 /// Per-camera bloom settings, read from Camera component fields.
 pub const BloomSettings = struct {
     exposure: f32,
-    threshold: f32,
     intensity: f32,
-    soft_knee: f32,
-    blur_passes: u32,
 };
 
 // ============================================================
-// Shader helper (same pattern as renderer.zig)
+// Shader helper
 // ============================================================
 
 fn createShader(device: *c.SDL_GPUDevice, spv: []const u8, msl: []const u8, stage: c.SDL_GPUShaderStage, num_uniform_buffers: u32, num_samplers: u32) ?*c.SDL_GPUShader {
@@ -196,6 +202,83 @@ fn createPostProcessPipeline(
     });
 }
 
+/// Like createPostProcessPipeline but with additive blending (src + dst).
+fn createAdditivePipeline(
+    device: *c.SDL_GPUDevice,
+    frag_spv: []const u8,
+    frag_msl: []const u8,
+    target_format: c.SDL_GPUTextureFormat,
+    num_frag_uniforms: u32,
+    num_frag_samplers: u32,
+) ?*c.SDL_GPUGraphicsPipeline {
+    const vert_shader = createShader(device, fullscreen_vert_spv, fullscreen_vert_msl, c.SDL_GPU_SHADERSTAGE_VERTEX, 0, 0) orelse return null;
+    defer c.SDL_ReleaseGPUShader(device, vert_shader);
+
+    const frag_shader = createShader(device, frag_spv, frag_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, num_frag_uniforms, num_frag_samplers) orelse return null;
+    defer c.SDL_ReleaseGPUShader(device, frag_shader);
+
+    const blend_state = c.SDL_GPUColorTargetBlendState{
+        .src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE,
+        .dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE,
+        .color_blend_op = c.SDL_GPU_BLENDOP_ADD,
+        .src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE,
+        .dst_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE,
+        .alpha_blend_op = c.SDL_GPU_BLENDOP_ADD,
+        .color_write_mask = c.SDL_GPU_COLORCOMPONENT_R | c.SDL_GPU_COLORCOMPONENT_G | c.SDL_GPU_COLORCOMPONENT_B | c.SDL_GPU_COLORCOMPONENT_A,
+        .enable_blend = true,
+        .enable_color_write_mask = false,
+        .padding1 = 0,
+        .padding2 = 0,
+    };
+
+    const color_target_desc = [_]c.SDL_GPUColorTargetDescription{
+        .{ .format = target_format, .blend_state = blend_state },
+    };
+
+    return c.SDL_CreateGPUGraphicsPipeline(device, &c.SDL_GPUGraphicsPipelineCreateInfo{
+        .vertex_shader = vert_shader,
+        .fragment_shader = frag_shader,
+        .vertex_input_state = .{
+            .vertex_buffer_descriptions = null,
+            .num_vertex_buffers = 0,
+            .vertex_attributes = null,
+            .num_vertex_attributes = 0,
+        },
+        .primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+        .rasterizer_state = .{
+            .fill_mode = c.SDL_GPU_FILLMODE_FILL,
+            .cull_mode = c.SDL_GPU_CULLMODE_NONE,
+            .front_face = c.SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE,
+            .depth_bias_constant_factor = 0,
+            .depth_bias_clamp = 0,
+            .depth_bias_slope_factor = 0,
+            .enable_depth_bias = false,
+            .enable_depth_clip = false,
+            .padding1 = 0,
+            .padding2 = 0,
+        },
+        .multisample_state = .{
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .sample_mask = 0,
+            .enable_mask = false,
+            .enable_alpha_to_coverage = false,
+            .padding2 = 0,
+            .padding3 = 0,
+        },
+        .depth_stencil_state = std.mem.zeroes(c.SDL_GPUDepthStencilState),
+        .target_info = .{
+            .color_target_descriptions = &color_target_desc,
+            .num_color_targets = 1,
+            .depth_stencil_format = c.SDL_GPU_TEXTUREFORMAT_INVALID,
+            .has_depth_stencil_target = false,
+            .padding1 = 0,
+            .padding2 = 0,
+            .padding3 = 0,
+        },
+        .props = 0,
+    });
+}
+
 // ============================================================
 // Initialization
 // ============================================================
@@ -223,23 +306,23 @@ pub fn initPostProcess(self: *Engine) !void {
         .props = 0,
     }) orelse return error.SamplerFailed;
 
-    // Pipelines: threshold → HDR, blur → HDR, composite → swapchain
-    self.postprocess.threshold_pipeline = createPostProcessPipeline(
+    // Pipelines
+    self.postprocess.downsample_pipeline = createPostProcessPipeline(
         device,
-        threshold_frag_spv,
-        threshold_frag_msl,
+        downsample_frag_spv,
+        downsample_frag_msl,
         hdr_format,
-        1,
-        1,
+        1, // uniforms
+        1, // samplers
     ) orelse return error.PipelineFailed;
 
-    self.postprocess.blur_pipeline = createPostProcessPipeline(
+    self.postprocess.upsample_pipeline = createAdditivePipeline(
         device,
-        blur_frag_spv,
-        blur_frag_msl,
+        upsample_frag_spv,
+        upsample_frag_msl,
         hdr_format,
-        1,
-        1,
+        1, // uniforms
+        1, // samplers (lower_mip only)
     ) orelse return error.PipelineFailed;
 
     self.postprocess.composite_pipeline = createPostProcessPipeline(
@@ -251,29 +334,41 @@ pub fn initPostProcess(self: *Engine) !void {
         2,
     ) orelse return error.PipelineFailed;
 
-    // HDR + bloom textures at initial resolution
+    // Textures at initial resolution
     try ensureTextures(self, self.rt_w, self.rt_h);
 }
 
-/// (Re)create HDR and bloom textures if resolution changed.
+/// (Re)create HDR and mip chain textures if resolution changed.
 pub fn ensureTextures(self: *Engine, w: u32, h: u32) !void {
     const device = self.gpu_device.?;
-    const bloom_w = @max(w / 2, 1);
-    const bloom_h = @max(h / 2, 1);
+    const pp = &self.postprocess;
 
-    // Only recreate if size actually changed
-    if (self.postprocess.bloom_w == bloom_w and self.postprocess.bloom_h == bloom_h and self.postprocess.hdr_texture != null) return;
+    if (pp.cached_w == w and pp.cached_h == h and pp.hdr_texture != null) return;
 
     // Release old textures
-    if (self.postprocess.hdr_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
-    if (self.postprocess.bloom_a) |t| c.SDL_ReleaseGPUTexture(device, t);
-    if (self.postprocess.bloom_b) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.hdr_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
+    for (&pp.mip_textures) |*mt| {
+        if (mt.*) |t| c.SDL_ReleaseGPUTexture(device, t);
+        mt.* = null;
+    }
 
-    self.postprocess.hdr_texture = createRenderTexture(device, hdr_format, w, h) orelse return error.TextureFailed;
-    self.postprocess.bloom_a = createRenderTexture(device, hdr_format, bloom_w, bloom_h) orelse return error.TextureFailed;
-    self.postprocess.bloom_b = createRenderTexture(device, hdr_format, bloom_w, bloom_h) orelse return error.TextureFailed;
-    self.postprocess.bloom_w = bloom_w;
-    self.postprocess.bloom_h = bloom_h;
+    pp.hdr_texture = createRenderTexture(device, hdr_format, w, h) orelse return error.TextureFailed;
+
+    // Build mip chain: each level is half the previous, starting from full res
+    var mw = w;
+    var mh = h;
+    var count: u32 = 0;
+    while (count < max_mip_levels and mw > 1 and mh > 1) {
+        mw = @max(mw / 2, 1);
+        mh = @max(mh / 2, 1);
+        pp.mip_textures[count] = createRenderTexture(device, hdr_format, mw, mh) orelse return error.TextureFailed;
+        pp.mip_widths[count] = mw;
+        pp.mip_heights[count] = mh;
+        count += 1;
+    }
+    pp.mip_count = count;
+    pp.cached_w = w;
+    pp.cached_h = h;
 }
 
 // ============================================================
@@ -284,10 +379,11 @@ pub fn deinitPostProcess(self: *Engine) void {
     const device = self.gpu_device orelse return;
     const pp = &self.postprocess;
     if (pp.hdr_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
-    if (pp.bloom_a) |t| c.SDL_ReleaseGPUTexture(device, t);
-    if (pp.bloom_b) |t| c.SDL_ReleaseGPUTexture(device, t);
-    if (pp.threshold_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
-    if (pp.blur_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+    for (pp.mip_textures) |mt| {
+        if (mt) |t| c.SDL_ReleaseGPUTexture(device, t);
+    }
+    if (pp.downsample_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+    if (pp.upsample_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.composite_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.sampler) |s| c.SDL_ReleaseGPUSampler(device, s);
 }
@@ -327,73 +423,90 @@ fn drawFullscreenTriangle(pass: *c.SDL_GPURenderPass) void {
 }
 
 // ============================================================
-// Bloom execution — called after the scene has been rendered to hdr_texture
+// Post-processing execution
 // ============================================================
 
-/// Run post-processing for a single camera. Always runs composite (tone mapping + gamma).
-/// When bloom intensity > 0, also runs threshold extraction + blur.
+/// Run post-processing for a single camera.
+/// Progressive downsample → upsample bloom + composite with tone mapping.
 pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain_tex: *c.SDL_GPUTexture, sw_w: u32, sw_h: u32, settings: BloomSettings) void {
     const pp = &self.postprocess;
     const sampler = pp.sampler orelse return;
-    const bloom_w = pp.bloom_w;
-    const bloom_h = pp.bloom_h;
+    const mip_count = pp.mip_count;
 
-    if (settings.intensity > 0) {
-        // Pass 1: Threshold extraction — HDR scene → bloom_a (half res)
-        {
-            const pass = beginFullscreenPass(cmd, pp.bloom_a.?) orelse return;
-            c.SDL_BindGPUGraphicsPipeline(pass, pp.threshold_pipeline.?);
-            setFullscreenViewport(pass, bloom_w, bloom_h);
+    if (settings.intensity > 0 and mip_count > 0) {
+        // === Downsample chain: HDR → mip0 → mip1 → ... → mipN ===
+        var i: u32 = 0;
+        while (i < mip_count) : (i += 1) {
+            const target = pp.mip_textures[i].?;
+            const tw = pp.mip_widths[i];
+            const th = pp.mip_heights[i];
+
+            // Source is either HDR texture (for first pass) or previous mip
+            const source = if (i == 0) pp.hdr_texture.? else pp.mip_textures[i - 1].?;
+            const src_w: f32 = if (i == 0) @floatFromInt(sw_w) else @floatFromInt(pp.mip_widths[i - 1]);
+            const src_h: f32 = if (i == 0) @floatFromInt(sw_h) else @floatFromInt(pp.mip_heights[i - 1]);
+
+            const pass = beginFullscreenPass(cmd, target) orelse return;
+            c.SDL_BindGPUGraphicsPipeline(pass, pp.downsample_pipeline.?);
+            setFullscreenViewport(pass, tw, th);
 
             const binding = [1]c.SDL_GPUTextureSamplerBinding{
-                .{ .texture = pp.hdr_texture.?, .sampler = sampler },
+                .{ .texture = source, .sampler = sampler },
             };
             c.SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
 
-            const params = BloomParams{ .params = .{ settings.threshold, settings.soft_knee, settings.intensity, 0 } };
-            c.SDL_PushGPUFragmentUniformData(cmd, 0, &params, @sizeOf(BloomParams));
+            const is_first: f32 = if (i == 0) 1.0 else 0.0;
+            const params = DownsampleParams{ .params = .{ 1.0 / src_w, 1.0 / src_h, is_first, 0 } };
+            c.SDL_PushGPUFragmentUniformData(cmd, 0, &params, @sizeOf(DownsampleParams));
 
             drawFullscreenTriangle(pass);
             c.SDL_EndGPURenderPass(pass);
         }
 
-        // Pass 2+3: Separable Gaussian blur (repeat blur_passes times)
-        const texel_w: f32 = 1.0 / @as(f32, @floatFromInt(bloom_w));
-        const texel_h: f32 = 1.0 / @as(f32, @floatFromInt(bloom_h));
+        // === Upsample chain: mipN → mipN-1 → ... → mip0 ===
+        // Work bottom-up. At each level, the mip texture gets overwritten with
+        // its original downsample + the tinted upsampled result from the level below.
+        if (mip_count >= 2) {
+            var j: u32 = mip_count - 1;
+            while (j > 0) {
+                j -= 1;
+                const target_w = pp.mip_widths[j];
+                const target_h = pp.mip_heights[j];
 
-        var i: u32 = 0;
-        while (i < settings.blur_passes) : (i += 1) {
-            // Horizontal: bloom_a → bloom_b
-            {
-                const pass = beginFullscreenPass(cmd, pp.bloom_b.?) orelse return;
-                c.SDL_BindGPUGraphicsPipeline(pass, pp.blur_pipeline.?);
-                setFullscreenViewport(pass, bloom_w, bloom_h);
+                const lower = pp.mip_textures[j + 1].?;
+                const lower_w: f32 = @floatFromInt(pp.mip_widths[j + 1]);
+                const lower_h: f32 = @floatFromInt(pp.mip_heights[j + 1]);
 
+                // LOADOP_LOAD preserves the downsample content; additive blend
+                // pipeline adds the tent-filtered lower mip on top.
+                const color_target = c.SDL_GPUColorTargetInfo{
+                    .texture = pp.mip_textures[j].?,
+                    .mip_level = 0,
+                    .layer_or_depth_plane = 0,
+                    .clear_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+                    .load_op = c.SDL_GPU_LOADOP_LOAD, // preserve downsample content
+                    .store_op = c.SDL_GPU_STOREOP_STORE,
+                    .resolve_texture = null,
+                    .resolve_mip_level = 0,
+                    .resolve_layer = 0,
+                    .cycle = false,
+                    .cycle_resolve_texture = false,
+                    .padding1 = 0,
+                    .padding2 = 0,
+                };
+                const pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, null) orelse return;
+                c.SDL_BindGPUGraphicsPipeline(pass, pp.upsample_pipeline.?);
+                setFullscreenViewport(pass, target_w, target_h);
+
+                // Only bind the lower mip — current mip is preserved via LOADOP_LOAD
                 const binding = [1]c.SDL_GPUTextureSamplerBinding{
-                    .{ .texture = pp.bloom_a.?, .sampler = sampler },
+                    .{ .texture = lower, .sampler = sampler },
                 };
                 c.SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
 
-                const params = BlurParams{ .direction = .{ texel_w, 0, 0, 0 } };
-                c.SDL_PushGPUFragmentUniformData(cmd, 0, &params, @sizeOf(BlurParams));
-
-                drawFullscreenTriangle(pass);
-                c.SDL_EndGPURenderPass(pass);
-            }
-
-            // Vertical: bloom_b → bloom_a
-            {
-                const pass = beginFullscreenPass(cmd, pp.bloom_a.?) orelse return;
-                c.SDL_BindGPUGraphicsPipeline(pass, pp.blur_pipeline.?);
-                setFullscreenViewport(pass, bloom_w, bloom_h);
-
-                const binding = [1]c.SDL_GPUTextureSamplerBinding{
-                    .{ .texture = pp.bloom_b.?, .sampler = sampler },
-                };
-                c.SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
-
-                const params = BlurParams{ .direction = .{ 0, texel_h, 0, 0 } };
-                c.SDL_PushGPUFragmentUniformData(cmd, 0, &params, @sizeOf(BlurParams));
+                const tint = if (j + 1 < max_mip_levels) default_tints[j + 1] else 0.1;
+                const params = UpsampleParams{ .params = .{ 1.0 / lower_w, 1.0 / lower_h, tint, 0 } };
+                c.SDL_PushGPUFragmentUniformData(cmd, 0, &params, @sizeOf(UpsampleParams));
 
                 drawFullscreenTriangle(pass);
                 c.SDL_EndGPURenderPass(pass);
@@ -401,16 +514,21 @@ pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain
         }
     }
 
-    // Final: Composite — HDR scene + bloom → swapchain (with tone mapping)
-    // Always runs for tone mapping + gamma, even when bloom is disabled.
+    // === Composite: HDR scene + bloom (mip0) → swapchain ===
     {
         const pass = beginFullscreenPass(cmd, swapchain_tex) orelse return;
         c.SDL_BindGPUGraphicsPipeline(pass, pp.composite_pipeline.?);
         setFullscreenViewport(pass, sw_w, sw_h);
 
+        // bloom source is mip0 (accumulated upsample result), or HDR if no bloom
+        const bloom_tex = if (settings.intensity > 0 and pp.mip_count > 0)
+            pp.mip_textures[0].?
+        else
+            pp.hdr_texture.?;
+
         const bindings = [2]c.SDL_GPUTextureSamplerBinding{
             .{ .texture = pp.hdr_texture.?, .sampler = sampler },
-            .{ .texture = pp.bloom_a.?, .sampler = sampler },
+            .{ .texture = bloom_tex, .sampler = sampler },
         };
         c.SDL_BindGPUFragmentSamplers(pass, 0, &bindings, 2);
 

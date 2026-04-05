@@ -338,10 +338,7 @@ pub const Engine = struct {
                 // Post-process → swapchain with this camera's settings
                 const settings = postprocess.BloomSettings{
                     .exposure = cam.exposure,
-                    .threshold = cam.bloom_threshold,
                     .intensity = cam.bloom_intensity,
-                    .soft_knee = cam.bloom_soft_knee,
-                    .blur_passes = @intFromFloat(@max(cam.bloom_blur_passes, 0)),
                 };
                 postprocess.executePostProcess(self, cmd, swapchain_tex.?, sw_w, sw_h, settings);
             }
