@@ -99,12 +99,31 @@ end)
 -- ui.slider_float() takes the current value and returns the (possibly modified)
 -- value — a functional style that works naturally with Lua.
 lunatic.system("debug_ui", function(dt)
+  ui.set_next_window_pos(16, 16, "first_use")
+  ui.set_next_window_size(280, 0, "first_use")
   ui.begin_window("Debug")
-  ui.separator_text("Post-Processing")
 
-  local cam_ref = lunatic.ref(cam, "camera")
-  cam_ref.exposure = ui.slider_float("Exposure", cam_ref.exposure, 0.1, 5.0)
-  cam_ref.bloom_intensity = ui.slider_float("Bloom Intensity", cam_ref.bloom_intensity, 0.0, 1.0)
+  ui.text(string.format("%.0f fps", ui.fps()))
+
+  if ui.collapsing_header("Post-Processing") then
+    local cam_ref = lunatic.ref(cam, "camera")
+    cam_ref.exposure = ui.slider_float("Exposure", cam_ref.exposure, 0.1, 5.0)
+    cam_ref.bloom_intensity = ui.slider_float("Bloom Intensity", cam_ref.bloom_intensity, 0.0, 1.0)
+  end
+
+  if ui.collapsing_header("Bloom Shape") then
+    local r = lunatic.get_bloom_radius()
+    lunatic.set_bloom_radius(ui.slider_float("Radius", r, 0.5, 3.0))
+
+    local t1, t2, t3, t4, t5, t6 = lunatic.get_bloom_tints()
+    t1 = ui.slider_float("1/2 (core)", t1, 0, 1)
+    t2 = ui.slider_float("1/4", t2, 0, 1)
+    t3 = ui.slider_float("1/8", t3, 0, 1)
+    t4 = ui.slider_float("1/16", t4, 0, 1)
+    t5 = ui.slider_float("1/32", t5, 0, 1)
+    t6 = ui.slider_float("1/64 (haze)", t6, 0, 1)
+    lunatic.set_bloom_tints(t1, t2, t3, t4, t5, t6)
+  end
 
   ui.end_window()
 end)

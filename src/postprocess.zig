@@ -70,6 +70,11 @@ pub const PostProcessState = struct {
 
     // Sampler for post-process texture reads (linear, clamp-to-edge)
     sampler: ?*c.SDL_GPUSampler = null,
+
+    // Bloom shape — per-level tint weights (mutable, tweak via debug UI)
+    tints: [max_mip_levels]f32 = default_tints,
+    // Upsample filter radius multiplier (1.0 = standard, >1 = wider bloom)
+    radius: f32 = 1.0,
 };
 
 /// Per-camera bloom settings, read from Camera component fields.
@@ -504,8 +509,8 @@ pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain
                 };
                 c.SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
 
-                const tint = if (j + 1 < max_mip_levels) default_tints[j + 1] else 0.1;
-                const params = UpsampleParams{ .params = .{ 1.0 / lower_w, 1.0 / lower_h, tint, 0 } };
+                const tint = if (j + 1 < max_mip_levels) pp.tints[j + 1] else 0.1;
+                const params = UpsampleParams{ .params = .{ pp.radius / lower_w, pp.radius / lower_h, tint, 0 } };
                 c.SDL_PushGPUFragmentUniformData(cmd, 0, &params, @sizeOf(UpsampleParams));
 
                 drawFullscreenTriangle(pass);

@@ -7,7 +7,7 @@ const Mat4 = math3d.Mat4;
 const ecs = @import("zig-ecs");
 const geometry = @import("geometry");
 const renderer = @import("renderer");
-const postprocess = @import("postprocess");
+pub const postprocess = @import("postprocess");
 const lua_api = @import("lua_api");
 pub const gltf = @import("gltf");
 
@@ -389,7 +389,7 @@ pub const Engine = struct {
             return error.GPUDeviceFailed;
         }
 
-        self.sdl_window = c.SDL_CreateWindow(config.title, @intCast(config.width), @intCast(config.height), c.SDL_WINDOW_RESIZABLE);
+        self.sdl_window = c.SDL_CreateWindow(config.title, @intCast(config.width), @intCast(config.height), c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY);
         if (self.sdl_window == null) {
             std.debug.print("SDL_CreateWindow failed: {s}\n", .{c.SDL_GetError()});
             return error.SDLWindowFailed;
@@ -437,14 +437,20 @@ pub const Engine = struct {
         _ = c.igCreateContext(null);
         styleImGui();
 
-        // Load custom font (falls back to default if file not found)
+        // Load custom font at display-native resolution (HiDPI-aware).
+        // Rasterize at physical pixels, then tell ImGui the DPI scale so it
+        // uses the high-res glyphs at logical size.
+        const dpi_scale = c.SDL_GetWindowDisplayScale(self.sdl_window);
+        const font_size: f32 = 16.0 * dpi_scale;
         const io = c.igGetIO();
         if (io) |imgui_io| {
-            const font = c.ImFontAtlas_AddFontFromFileTTF(imgui_io.*.Fonts, "assets/fonts/IBMPlexSans-Regular.ttf", 16, null, null);
+            const font = c.ImFontAtlas_AddFontFromFileTTF(imgui_io.*.Fonts, "assets/fonts/IBMPlexSans-Regular.ttf", font_size, null, null);
             if (font == null) {
                 std.debug.print("ImGui: custom font not found, using default\n", .{});
             }
         }
+        const style = c.igGetStyle();
+        style.*.FontScaleDpi = 1.0 / dpi_scale;
 
         if (!c.cImGui_ImplSDL3_InitForSDLGPU(self.sdl_window)) {
             std.debug.print("ImGui SDL3 init failed\n", .{});
@@ -909,7 +915,7 @@ fn styleImGui() void {
     colors[@intCast(c.ImGuiCol_WindowBg)] = .{ .x = 0.08, .y = 0.08, .z = 0.12, .w = 0.92 };
     colors[@intCast(c.ImGuiCol_ChildBg)] = .{ .x = 0.07, .y = 0.07, .z = 0.10, .w = 0.50 };
     colors[@intCast(c.ImGuiCol_PopupBg)] = .{ .x = 0.08, .y = 0.08, .z = 0.12, .w = 0.95 };
-    colors[@intCast(c.ImGuiCol_Border)] = .{ .x = 0.25, .y = 0.26, .z = 0.32, .w = 0.50 };
+    colors[@intCast(c.ImGuiCol_Border)] = .{ .x = 0.20, .y = 0.20, .z = 0.25, .w = 0.0 };
 
     colors[@intCast(c.ImGuiCol_FrameBg)] = .{ .x = 0.14, .y = 0.14, .z = 0.20, .w = 1.0 };
     colors[@intCast(c.ImGuiCol_FrameBgHovered)] = .{ .x = 0.22, .y = 0.22, .z = 0.30, .w = 1.0 };

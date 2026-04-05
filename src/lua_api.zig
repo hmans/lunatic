@@ -62,6 +62,10 @@ pub fn registerLuaApi(self: *Engine) void {
         .{ "set_fog", &luaSetFog },
         .{ "set_ambient", &luaSetAmbient },
         .{ "set_bloom", &luaSetBloom },
+        .{ "get_bloom_tints", &luaGetBloomTints },
+        .{ "set_bloom_tints", &luaSetBloomTints },
+        .{ "get_bloom_radius", &luaGetBloomRadius },
+        .{ "set_bloom_radius", &luaSetBloomRadius },
         .{ "spawn", &luaSpawn },
         .{ "destroy", &luaDestroy },
         .{ "add", &luaAdd },
@@ -97,6 +101,10 @@ pub fn registerLuaApi(self: *Engine) void {
         .{ "slider_float", &luaUiSliderFloat },
         .{ "checkbox", &luaUiCheckbox },
         .{ "button", &luaUiButton },
+        .{ "collapsing_header", &luaUiCollapsingHeader },
+        .{ "set_next_window_pos", &luaUiSetNextWindowPos },
+        .{ "set_next_window_size", &luaUiSetNextWindowSize },
+        .{ "fps", &luaUiFps },
     };
     inline for (ui_fns) |entry| {
         lc.lua_pushcclosure(L, entry[1], 0);
@@ -695,6 +703,42 @@ fn luaSetBloom(L: ?*lc.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+const postprocess = engine_mod.postprocess;
+
+/// lunatic.get_bloom_tints() → t1, t2, t3, t4, t5, t6
+fn luaGetBloomTints(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    for (self.postprocess.tints[0..postprocess.max_mip_levels]) |t| {
+        lc.lua_pushnumber(L, t);
+    }
+    return postprocess.max_mip_levels;
+}
+
+/// lunatic.set_bloom_tints(t1, t2, t3, t4, t5, t6)
+fn luaSetBloomTints(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const nargs = lc.lua_gettop(L);
+    var i: u32 = 0;
+    while (i < postprocess.max_mip_levels and i < nargs) : (i += 1) {
+        self.postprocess.tints[i] = @floatCast(lc.luaL_checknumber(L, @intCast(i + 1)));
+    }
+    return 0;
+}
+
+/// lunatic.get_bloom_radius() → radius
+fn luaGetBloomRadius(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    lc.lua_pushnumber(L, self.postprocess.radius);
+    return 1;
+}
+
+/// lunatic.set_bloom_radius(radius)
+fn luaSetBloomRadius(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    self.postprocess.radius = checkFloat(L, 1);
+    return 0;
+}
+
 // ============================================================
 // ImGui UI callbacks (no engine upvalue — pure ImGui wrappers)
 // ============================================================
@@ -750,6 +794,48 @@ fn luaUiButton(L: ?*lc.lua_State) callconv(.c) c_int {
     const clicked = ig.igButton(label);
     lc.lua_pushboolean(L, if (clicked) 1 else 0);
     return 1;
+}
+
+/// ui.collapsing_header(label) → is_open
+fn luaUiCollapsingHeader(L: ?*lc.lua_State) callconv(.c) c_int {
+    const label = lc.luaL_checklstring(L, 1, null);
+    const open = ig.igCollapsingHeader(label, 0);
+    lc.lua_pushboolean(L, if (open) 1 else 0);
+    return 1;
+}
+
+/// ui.set_next_window_pos(x, y, cond) — cond: "always", "once", "first_use"
+fn luaUiSetNextWindowPos(L: ?*lc.lua_State) callconv(.c) c_int {
+    const x: f32 = @floatCast(lc.luaL_checknumber(L, 1));
+    const y: f32 = @floatCast(lc.luaL_checknumber(L, 2));
+    const cond = luaUiCond(L, 3);
+    ig.igSetNextWindowPos(.{ .x = x, .y = y }, cond);
+    return 0;
+}
+
+/// ui.set_next_window_size(w, h, cond)
+fn luaUiSetNextWindowSize(L: ?*lc.lua_State) callconv(.c) c_int {
+    const w: f32 = @floatCast(lc.luaL_checknumber(L, 1));
+    const h: f32 = @floatCast(lc.luaL_checknumber(L, 2));
+    const cond = luaUiCond(L, 3);
+    ig.igSetNextWindowSize(.{ .x = w, .y = h }, cond);
+    return 0;
+}
+
+/// ui.fps() → current framerate
+fn luaUiFps(L: ?*lc.lua_State) callconv(.c) c_int {
+    const io = ig.igGetIO();
+    lc.lua_pushnumber(L, if (io) |i| i.*.Framerate else 0);
+    return 1;
+}
+
+fn luaUiCond(L: ?*lc.lua_State, idx: c_int) c_int {
+    if (lc.lua_type(L, idx) != lc.LUA_TSTRING) return 0;
+    const s = std.mem.span(lc.luaL_checklstring(L, idx, null));
+    if (std.mem.eql(u8, s, "always")) return ig.ImGuiCond_Always;
+    if (std.mem.eql(u8, s, "once")) return ig.ImGuiCond_Once;
+    if (std.mem.eql(u8, s, "first_use")) return ig.ImGuiCond_FirstUseEver;
+    return 0;
 }
 
 // ============================================================
