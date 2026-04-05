@@ -24,10 +24,19 @@ fn flyCameraSystem(engine: *Engine, dt: f32) void {
     const move_speed: f32 = if (isKeyDown(c.SDL_SCANCODE_LSHIFT)) 30 else 10;
     const mouse_sensitivity: f32 = 0.15;
 
-    // Mouse look
+    // Mouse look (right mouse button held)
     var dx: f32 = 0;
     var dy: f32 = 0;
-    _ = c.SDL_GetRelativeMouseState(&dx, &dy);
+    const buttons = c.SDL_GetRelativeMouseState(&dx, &dy);
+    const rmb_held = (buttons & c.SDL_BUTTON_RMASK) != 0;
+    if (rmb_held) {
+        _ = c.SDL_HideCursor();
+    } else {
+        _ = c.SDL_ShowCursor();
+        return;
+    }
+
+    // Mouse look
     rot.y += dx * mouse_sensitivity;
     rot.x += dy * mouse_sensitivity;
     rot.x = std.math.clamp(rot.x, -89, 89);
@@ -151,8 +160,6 @@ pub fn main() !void {
         .bloom_intensity = 0.15,
     });
 
-    // Grab mouse for FPS-style look
-    engine.setMouseGrab(true);
 
     // Grid of shapes
     var prng = std.Random.DefaultPrng.init(42);
