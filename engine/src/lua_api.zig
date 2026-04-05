@@ -167,14 +167,24 @@ fn getEngine(L: ?*lc.lua_State) *Engine {
     return @ptrCast(@alignCast(ptr));
 }
 
-fn entityFromLua(self: *Engine, L: ?*lc.lua_State, idx: c_int) ecs.Entity {
+const EntityResult = struct { entity: ecs.Entity, valid: bool };
+
+fn entityFromLua(self: *Engine, L: ?*lc.lua_State, idx: c_int) EntityResult {
     const id: u32 = @intCast(lc.luaL_checkinteger(L, idx));
     const entity: ecs.Entity = @bitCast(id);
     if (!self.registry.valid(entity)) {
-        _ = lc.luaL_error(L, "invalid entity %d", @as(c_int, @intCast(id)));
-        unreachable; // luaL_error longjmps, never returns
+        _ = lc.lua_pushfstring(L, "invalid entity %d", @as(c_int, @intCast(id)));
+        return .{ .entity = entity, .valid = false };
     }
-    return entity;
+    return .{ .entity = entity, .valid = true };
+}
+
+/// Helper: get entity or return Lua error. Use at the start of Lua callbacks.
+/// Returns null if entity is invalid (error already pushed, caller should return lc.lua_error(L)).
+fn getEntityOrError(self: *Engine, L: ?*lc.lua_State, idx: c_int) ?ecs.Entity {
+    const result = entityFromLua(self, L, idx);
+    if (!result.valid) return null;
+    return result.entity;
 }
 
 fn componentName(L: ?*lc.lua_State, idx: c_int) []const u8 {
@@ -225,7 +235,7 @@ fn luaSpawn(L: ?*lc.lua_State) callconv(.c) c_int {
 
 fn luaDestroy(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lc.lua_error(L);
     // Clean up physics body if present
     if (self.registry.tryGet(core_comp.RigidBody, entity)) |rb| {
         const body_id: phys.BodyId = @enumFromInt(rb.body_id);
@@ -240,7 +250,7 @@ fn luaDestroy(L: ?*lc.lua_State) callconv(.c) c_int {
 
 fn luaAdd(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lc.lua_error(L);
     const name = componentName(L, 2);
     if (findOps(name)) |found| {
         found.ops.addFn(self, entity, L, 3);
@@ -253,7 +263,7 @@ fn luaAdd(L: ?*lc.lua_State) callconv(.c) c_int {
 
 fn luaGet(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lc.lua_error(L);
     const name = componentName(L, 2);
     if (findOps(name)) |found| {
         return found.ops.getFn(self, entity, L);
@@ -264,7 +274,7 @@ fn luaGet(L: ?*lc.lua_State) callconv(.c) c_int {
 
 fn luaRemove(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lc.lua_error(L);
     const name = componentName(L, 2);
     if (findOps(name)) |found| {
         found.ops.removeFn(&self.registry, entity);
@@ -576,7 +586,7 @@ fn luaEachQuery(L: ?*lc.lua_State) callconv(.c) c_int {
 
 fn luaRef(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lc.lua_error(L);
     const entity_id: u32 = @bitCast(entity);
     const name = componentName(L, 2);
 
@@ -705,7 +715,7 @@ fn luaSetAmbient(L: ?*lc.lua_State) callconv(.c) c_int {
 /// intensity = 0 disables bloom (just tonemapping).
 fn luaSetBloom(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lc.lua_error(L);
     const cam = self.registry.tryGet(engine_mod.core_components.Camera, entity) orelse {
         _ = lc.luaL_error(L, "set_bloom: entity has no camera component");
         unreachable;
@@ -785,7 +795,7 @@ const phys = engine_mod.physics;
 /// Creates a Jolt box body and sets the entity's rigid_body component.
 fn luaPhysicsAddBox(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lc.lua_error(L);
     const hx = checkFloat(L, 2);
     const hy = checkFloat(L, 3);
     const hz = checkFloat(L, 4);
@@ -819,7 +829,7 @@ fn luaPhysicsAddBox(L: ?*lc.lua_State) callconv(.c) c_int {
 /// lunatic.physics_add_sphere(entity, radius, motion_type, restitution, friction)
 fn luaPhysicsAddSphere(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lc.lua_error(L);
     const radius = checkFloat(L, 2);
     const motion = luaMotionType(L, 3);
     const nargs = lc.lua_gettop(L);
