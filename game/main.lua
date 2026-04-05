@@ -53,7 +53,18 @@ local meshes = { lunatic.mesh.cube, lunatic.mesh.sphere }
 local cam = lunatic.spawn()
 lunatic.add(cam, "position", 0, 8, 12)
 lunatic.add(cam, "rotation", 34, 0, 0)
-lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1, 1.2, 0.15, 15, 8, 8, 0.4, 0.5)
+lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1,
+  1.2,   -- exposure
+  0.15,  -- bloom_intensity
+  15,    -- dof_focus_dist
+  8,     -- dof_focus_range
+  8,     -- dof_blur_radius
+  0.4,   -- vignette
+  0.5,   -- vignette_smoothness
+  0.3,   -- chromatic_aberration
+  0.03,  -- grain
+  0.0    -- color_temp
+)
 
 -- Adding a fly_camera component enables the built-in FPS camera controller.
 -- Optional args: speed, fast_speed, sensitivity (defaults: 10, 30, 0.15)
@@ -116,10 +127,13 @@ lunatic.system("debug_ui", function(dt)
     cam_ref.dof_blur_radius = ui.slider_float("Blur Radius", cam_ref.dof_blur_radius, 1, 20)
   end
 
-  if ui.collapsing_header("Vignette") then
+  if ui.collapsing_header("Lens Effects") then
     local cam_ref = lunatic.ref(cam, "camera")
-    cam_ref.vignette = ui.slider_float("Intensity", cam_ref.vignette, 0, 1)
-    cam_ref.vignette_smoothness = ui.slider_float("Smoothness", cam_ref.vignette_smoothness, 0.2, 0.8)
+    cam_ref.vignette = ui.slider_float("Vignette", cam_ref.vignette, 0, 1)
+    cam_ref.vignette_smoothness = ui.slider_float("Vignette Smoothness", cam_ref.vignette_smoothness, 0.2, 0.8)
+    cam_ref.chromatic_aberration = ui.slider_float("Chromatic Aberration", cam_ref.chromatic_aberration, 0, 3)
+    cam_ref.grain = ui.slider_float("Film Grain", cam_ref.grain, 0, 0.2)
+    cam_ref.color_temp = ui.slider_float("Color Temperature", cam_ref.color_temp, -3, 3)
   end
 
   if ui.collapsing_header("Bloom Shape") then

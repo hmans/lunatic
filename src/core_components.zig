@@ -48,6 +48,9 @@ pub const Camera = struct {
     dof_blur_radius: f32 = 8.0, // Max blur radius in pixels (at half res)
     vignette: f32 = 0.0, // 0 = off, 0.3-0.8 = subtle to strong
     vignette_smoothness: f32 = 0.5, // How gradual the falloff is (higher = larger bright center)
+    chromatic_aberration: f32 = 0.0, // 0 = off, 0.5-2.0 = subtle to strong RGB fringing
+    grain: f32 = 0.0, // 0 = off, 0.02-0.1 = subtle film grain
+    color_temp: f32 = 0.0, // negative = cool/blue, positive = warm/orange
     pub const lua = .{ .name = "camera" };
 };
 

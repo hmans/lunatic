@@ -344,6 +344,9 @@ pub const Engine = struct {
                     .dof_blur_radius = cam.dof_blur_radius,
                     .vignette_intensity = cam.vignette,
                     .vignette_smoothness = cam.vignette_smoothness,
+                    .chromatic_aberration = cam.chromatic_aberration,
+                    .grain_intensity = cam.grain,
+                    .color_temp = cam.color_temp,
                 };
                 postprocess.executePostProcess(self, cmd, swapchain_tex.?, sw_w, sw_h, settings);
             }

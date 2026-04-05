@@ -62,6 +62,8 @@ const UpsampleParams = extern struct {
 const CompositeParams = extern struct {
     params: [4]f32, // .x = bloom_intensity, .y = exposure
     params2: [4]f32, // .x = vignette_intensity, .y = vignette_smoothness
+    params3: [4]f32, // .x = chromatic_aberration, .y = grain_intensity, .z = grain_time
+    params4: [4]f32, // .x = color_temp
 };
 
 // ============================================================
@@ -126,6 +128,9 @@ pub const CameraPostSettings = struct {
     dof_blur_radius: f32,
     vignette_intensity: f32,
     vignette_smoothness: f32,
+    chromatic_aberration: f32,
+    grain_intensity: f32,
+    color_temp: f32,
 };
 
 // ============================================================
@@ -720,9 +725,12 @@ pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain
         };
         c.SDL_BindGPUFragmentSamplers(pass, 0, &bindings, 2);
 
+        const grain_time: f32 = @floatFromInt(self.current_frame);
         const params = CompositeParams{
             .params = .{ settings.bloom_intensity, settings.exposure, 0, 0 },
             .params2 = .{ settings.vignette_intensity, settings.vignette_smoothness, 0, 0 },
+            .params3 = .{ settings.chromatic_aberration, settings.grain_intensity, grain_time, 0 },
+            .params4 = .{ settings.color_temp, 0, 0, 0 },
         };
         c.SDL_PushGPUFragmentUniformData(cmd, 0, &params, @sizeOf(CompositeParams));
 
