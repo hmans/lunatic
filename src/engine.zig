@@ -342,6 +342,8 @@ pub const Engine = struct {
                     .dof_focus_dist = cam.dof_focus_dist,
                     .dof_focus_range = cam.dof_focus_range,
                     .dof_blur_radius = cam.dof_blur_radius,
+                    .vignette_intensity = cam.vignette,
+                    .vignette_smoothness = cam.vignette_smoothness,
                 };
                 postprocess.executePostProcess(self, cmd, swapchain_tex.?, sw_w, sw_h, settings);
             }

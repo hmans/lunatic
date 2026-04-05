@@ -46,6 +46,8 @@ pub const Camera = struct {
     dof_focus_dist: f32 = 0.0, // 0 = DoF disabled. World-space focal distance.
     dof_focus_range: f32 = 5.0, // Width of in-focus band (smaller = shallower DoF)
     dof_blur_radius: f32 = 8.0, // Max blur radius in pixels (at half res)
+    vignette: f32 = 0.0, // 0 = off, 0.3-0.8 = subtle to strong
+    vignette_smoothness: f32 = 0.5, // How gradual the falloff is (higher = larger bright center)
     pub const lua = .{ .name = "camera" };
 };
 

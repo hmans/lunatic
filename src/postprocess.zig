@@ -61,6 +61,7 @@ const UpsampleParams = extern struct {
 
 const CompositeParams = extern struct {
     params: [4]f32, // .x = bloom_intensity, .y = exposure
+    params2: [4]f32, // .x = vignette_intensity, .y = vignette_smoothness
 };
 
 // ============================================================
@@ -123,6 +124,8 @@ pub const CameraPostSettings = struct {
     dof_focus_dist: f32,
     dof_focus_range: f32,
     dof_blur_radius: f32,
+    vignette_intensity: f32,
+    vignette_smoothness: f32,
 };
 
 // ============================================================
@@ -717,7 +720,10 @@ pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain
         };
         c.SDL_BindGPUFragmentSamplers(pass, 0, &bindings, 2);
 
-        const params = CompositeParams{ .params = .{ settings.bloom_intensity, settings.exposure, 0, 0 } };
+        const params = CompositeParams{
+            .params = .{ settings.bloom_intensity, settings.exposure, 0, 0 },
+            .params2 = .{ settings.vignette_intensity, settings.vignette_smoothness, 0, 0 },
+        };
         c.SDL_PushGPUFragmentUniformData(cmd, 0, &params, @sizeOf(CompositeParams));
 
         drawFullscreenTriangle(pass);
