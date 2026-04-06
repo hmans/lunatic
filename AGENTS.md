@@ -107,6 +107,7 @@ The engine must handle tens of thousands to hundreds of thousands of entities ef
 
 ## Conventions
 
+- **Document all code thoroughly.** Shader code (GLSL), Zig engine code, and Lua scripts must include clear, helpful comments that explain the *why* and *how* — not just the *what*. Assume the reader is a human or AI agent who understands programming but may not know the engine's specific conventions, GPU pipeline details, or rendering math. Include references to techniques and papers where applicable. This codebase should be learnable by reading it.
 - Use Conventional Commit formatting for commit messages
 - `lc` = Lua C namespace (from `lua.zig`), `c` = SDL C namespace (from `engine.zig`). Both are `pub const` exports — other files must import these rather than doing their own `@cImport`.
 - Any new APIs must be made available to Zig first, and then (optionally, where it makes sense) to Lua.
@@ -125,7 +126,7 @@ The engine must handle tens of thousands to hundreds of thousands of entities ef
 ## Gotchas
 
 - **Shared `@cImport`**: Each `@cImport` in Zig creates distinct opaque types. If two files each `@cImport("SDL3/SDL.h")`, their `SDL_GPUDevice` types are incompatible. Always import `c` from `engine.zig` and `lc` from `lua.zig`.
-- **Shader cache staleness**: The zig build cache doesn't always invalidate spirv-cross MSL output when GLSL sources change. Run `rm -rf .zig-cache` after modifying shaders if you see stale behavior.
+- **Shader cache staleness**: GLSL sources are tracked as build dependencies via `addFileArg(b.path(...))` in `build.zig`, so `glslc` and `spirv-cross` should re-run automatically when shaders change. If you still see stale behavior, run `rm -rf .zig-cache` as a last resort.
 - **MSAA + multiple render passes**: Use `STOREOP_RESOLVE_AND_STORE` (not `STOREOP_RESOLVE`) when subsequent render passes need to load from the MSAA color texture. Plain RESOLVE discards MSAA contents.
 - **Shared module graph**: `buildEngineModules()` in `build.zig` creates the full engine module graph. It's called twice (game executable + integration tests). When adding a new `.zig` engine module, add it there.
 - **HDR specular fireflies**: The fragment shader clamps output to 64.0 and uses specular anti-aliasing (`fwidth(N)`) to prevent GGX peaks from flickering. If you see flashing bright pixels, check these.
