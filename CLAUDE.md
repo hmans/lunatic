@@ -55,6 +55,18 @@ Auto-registered at engine init:
 - Custom dark theme with IBM Plex Sans font (HiDPI-aware, rasterized at native resolution)
 - Exposed to Lua via `ui` global table: `begin_window`, `end_window`, `text`, `separator_text`, `slider_float`, `checkbox`, `button`, `collapsing_header`, `set_next_window_pos`, `set_next_window_size`, `fps`. Slider/checkbox use functional style (take current value, return new value).
 
+### Screenshots
+
+The engine has a file-based screenshot capture mechanism designed for agent use. All files live in `tmp/` (gitignored). To take a screenshot:
+
+1. `mkdir -p tmp && touch tmp/<name>.request`
+2. The engine detects and deletes the trigger on the next frame
+3. The rendered frame (including ImGui overlay) is saved to `tmp/<name>.png`
+
+Example: `touch tmp/before_fix.request` → produces `tmp/before_fix.png`. Multiple screenshots can be taken sequentially — wait for the `.request` file to be deleted before creating the next one.
+
+On Metal, the swapchain texture is framebufferOnly, so the engine renders to an intermediate texture, blits to the swapchain, and downloads from the intermediate. This adds one frame of GPU sync (fence wait) only on screenshot frames.
+
 ## Scale Target
 
 The engine must handle tens of thousands to hundreds of thousands of entities efficiently, even if current demos are small. Design all per-entity paths (queries, iteration, rendering) with this scale in mind. Avoid per-entity allocations, per-entity `pcall`, or O(n²) patterns in hot loops.

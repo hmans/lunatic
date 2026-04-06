@@ -37,6 +37,14 @@ pub const Vec3 = struct {
     pub fn negate(v: Vec3) Vec3 {
         return .{ .x = -v.x, .y = -v.y, .z = -v.z };
     }
+
+    pub fn add(a: Vec3, b: Vec3) Vec3 {
+        return .{ .x = a.x + b.x, .y = a.y + b.y, .z = a.z + b.z };
+    }
+
+    pub fn scaleVec(v: Vec3, s: f32) Vec3 {
+        return .{ .x = v.x * s, .y = v.y * s, .z = v.z * s };
+    }
 };
 
 /// Column-major 4x4 matrix. m[col][row] — matches GPU layout directly.
@@ -68,6 +76,25 @@ pub const Mat4 = struct {
         result.m[2][2] = far * range_inv;
         result.m[2][3] = -1.0;
         result.m[3][2] = near * far * range_inv;
+        return result;
+    }
+
+    /// Orthographic projection. Maps the box [left,right]×[bottom,top]×[near,far]
+    /// to NDC with Vulkan depth convention [0,1].
+    pub fn ortho(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) Mat4 {
+        var result = Mat4{ .m = .{
+            .{ 0, 0, 0, 0 },
+            .{ 0, 0, 0, 0 },
+            .{ 0, 0, 0, 0 },
+            .{ 0, 0, 0, 0 },
+        } };
+        result.m[0][0] = 2.0 / (right - left);
+        result.m[1][1] = 2.0 / (top - bottom);
+        result.m[2][2] = -1.0 / (far - near);
+        result.m[3][0] = -(right + left) / (right - left);
+        result.m[3][1] = -(top + bottom) / (top - bottom);
+        result.m[3][2] = -near / (far - near);
+        result.m[3][3] = 1.0;
         return result;
     }
 

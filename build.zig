@@ -40,6 +40,8 @@ fn addShader(
 fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) void {
     addShader(b, mod, "scene", "default", "vert", .vertex);
     addShader(b, mod, "scene", "default", "frag", .fragment);
+    addShader(b, mod, "shadow", "shadow", "vert", .vertex);
+    addShader(b, mod, "shadow", "shadow", "frag", .fragment);
     addShader(b, pp_mod, "postprocess", "fullscreen", "vert", .vertex);
     addShader(b, pp_mod, "postprocess", "downsample", "frag", .fragment);
     addShader(b, pp_mod, "postprocess", "upsample", "frag", .fragment);
@@ -49,6 +51,7 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) 
     addShader(b, pp_mod, "postprocess", "dof_bokeh", "frag", .fragment);
     addShader(b, pp_mod, "postprocess", "dof_composite", "frag", .fragment);
     addShader(b, pp_mod, "postprocess", "dof_tent", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "lensflare", "frag", .fragment);
 }
 
 /// Add all system include/lib paths from known prefixes where dependencies are found.
@@ -102,6 +105,7 @@ fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
     compile.linkSystemLibrary("SDL3");
     compile.linkSystemLibrary("luajit-5.1");
     compile.addCSourceFile(.{ .file = b.path("engine/vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
+    compile.addCSourceFile(.{ .file = b.path("engine/vendor/stb_image_write_impl.c"), .flags = &.{"-std=c99"} });
     compile.addCSourceFile(.{ .file = b.path("engine/vendor/cgltf_impl.c"), .flags = &.{"-std=c99"} });
     compile.addCSourceFile(.{ .file = b.path("engine/vendor/lua_error_helper.c"), .flags = &.{"-std=c99"} });
 

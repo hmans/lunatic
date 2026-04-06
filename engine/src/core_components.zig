@@ -51,6 +51,11 @@ pub const Camera = struct {
     chromatic_aberration: f32 = 0.0, // 0 = off, 0.5-2.0 = subtle to strong RGB fringing
     grain: f32 = 0.0, // 0 = off, 0.02-0.1 = subtle film grain
     color_temp: f32 = 0.0, // negative = cool/blue, positive = warm/orange
+    flare_intensity: f32 = 0.0, // 0 = off, 0.5-2.0 = lens flare ghost strength
+    flare_ghost_dispersal: f32 = 0.37, // Spacing between ghost copies (0.1-1.0)
+    flare_halo_width: f32 = 0.5, // Halo ring radius (0.1-0.9)
+    flare_chroma_distortion: f32 = 0.005, // Per-ghost chromatic shift (0.0-0.02)
+    flare_dirt_intensity: f32 = 0.5, // Lens dirt overlay (0=off, 1=full)
     pub const lua = .{ .name = "camera" };
 };
 
@@ -62,6 +67,29 @@ pub const DirectionalLight = struct {
     g: f32 = 1.0,
     b: f32 = 1.0,
     pub const lua = .{ .name = "directional_light" };
+};
+
+pub const PointLight = struct {
+    radius: f32 = 10.0,
+    r: f32 = 1.0,
+    g: f32 = 1.0,
+    b: f32 = 1.0,
+    intensity: f32 = 1.0,
+    pub const lua = .{ .name = "point_light" };
+};
+
+pub const SpotLight = struct {
+    radius: f32 = 10.0,
+    r: f32 = 1.0,
+    g: f32 = 1.0,
+    b: f32 = 1.0,
+    intensity: f32 = 1.0,
+    dir_x: f32 = 0.0,
+    dir_y: f32 = -1.0,
+    dir_z: f32 = 0.0,
+    inner_cone: f32 = 30.0,
+    outer_cone: f32 = 45.0,
+    pub const lua = .{ .name = "spot_light" };
 };
 
 pub const LookAt = struct {
@@ -94,7 +122,7 @@ pub const RigidBody = struct {
 };
 
 /// Core component tuple — engine modules reference these directly.
-pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, LookAt, FlyCamera, Age, RigidBody };
+pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, PointLight, SpotLight, LookAt, FlyCamera, Age, RigidBody };
 
 /// Concatenate core components with example-specific ones.
 /// Usage: `pub const all = core.withExtra(.{ Spin, Player });`

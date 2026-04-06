@@ -1,161 +1,86 @@
--- Lunatic game — spinning shapes with bloom and fly camera
---
--- This file is the game entry point. The engine loads it at startup and
--- executes it once; any lunatic.system() calls register per-frame callbacks
--- that run every tick after that.
+-- Lunatic — scene manager and shared debug UI
 --
 -- Right-click + drag to look around, WASD to move, Space/Ctrl for up/down.
--- Shift for fast movement. The Debug window lets you tweak post-processing.
+-- Shift for fast movement. Use the Debug window to switch scenes and tweak
+-- post-processing settings.
 
 --------------------------------------------------------------------------------
--- Scene settings
+-- Scenes
 --------------------------------------------------------------------------------
 
--- Dark background to make emissive bloom pop
-lunatic.set_clear_color(0.08, 0.08, 0.12)
-lunatic.set_ambient(0.15, 0.15, 0.25)
+local scenes = {
+  require("scenes.physics_rain"),
+  require("scenes.lighting_gallery"),
+  require("scenes.material_showcase"),
+}
 
--- Fog fades distant objects into the background color
--- Args: start distance, end distance, r, g, b
-lunatic.set_fog(15, 60, 0.08, 0.08, 0.12)
-
---------------------------------------------------------------------------------
--- Light
---------------------------------------------------------------------------------
-
--- A single directional light (sun). Args: direction x, y, z
-local light = lunatic.spawn()
-lunatic.add(light, "directional_light", 0.3, 0.8, 0.5)
+local current_scene = 0  -- 0 = none loaded yet
+local scene_cleanup = nil
 
 --------------------------------------------------------------------------------
--- Materials
+-- Camera (shared across all scenes)
 --------------------------------------------------------------------------------
 
-local white  = lunatic.create_material({ albedo = { 0.85, 0.85, 0.85 } })
-local ember  = lunatic.create_material({ albedo = { 1, 0.4, 0.05 }, emissive = { 40, 12, 1 } })
-local matte  = lunatic.create_material({ albedo = { 0.05, 0.05, 0.05 }, roughness = 1.0 })
-local silver = lunatic.create_material({ albedo = { 0.9, 0.9, 0.92 }, metallic = 1.0, roughness = 0.15 })
-
-local materials = { white, ember, matte, silver }
-local meshes = { lunatic.mesh.cube, lunatic.mesh.sphere }
-
---------------------------------------------------------------------------------
--- Camera
---------------------------------------------------------------------------------
-
--- Trailing camera args use struct defaults if omitted (see core_components.zig).
 local cam = lunatic.spawn()
 lunatic.add(cam, "position", 0, 8, 12)
 lunatic.add(cam, "rotation", 34, 0, 0)
 lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1,
-  1.2,   -- exposure
-  0.8,   -- bloom_intensity
-  15,    -- dof_focus_dist
+  0.8,   -- exposure
+  0.5,   -- bloom_intensity
+  0,     -- dof_focus_dist (0 = disabled)
   8,     -- dof_focus_range
   8,     -- dof_blur_radius
   0.4,   -- vignette
   0.5,   -- vignette_smoothness
   0.08,  -- chromatic_aberration
   0.03,  -- grain
-  0.0    -- color_temp
+  0.0,   -- color_temp
+  0.15,  -- flare_intensity
+  0.37,  -- flare_ghost_dispersal
+  0.5,   -- flare_halo_width
+  0.005, -- flare_chroma_distortion
+  0.5    -- flare_dirt_intensity
 )
-
--- Adding a fly_camera component enables the built-in FPS camera controller.
--- Optional args: speed, fast_speed, sensitivity (defaults: 10, 30, 0.15)
 lunatic.add(cam, "fly_camera")
 
 --------------------------------------------------------------------------------
--- Physics
+-- Scene switching
 --------------------------------------------------------------------------------
 
--- Visible floor
-local floor_mat = lunatic.create_material({ albedo = { 0.25, 0.25, 0.28 }, roughness = 0.9 })
-local floor = lunatic.spawn()
-lunatic.add(floor, "position", 0, -0.25, 0)
-lunatic.add(floor, "mesh", "cube")
-lunatic.add(floor, "material", floor_mat)
-lunatic.add(floor, "scale", 20, 0.5, 20)
-lunatic.add(floor, "rotation", 0, 0, 0)
-lunatic.physics_add_box(floor, 10, 0.25, 10, "static")
-lunatic.physics_optimize()
-
--- Spawner state
-local spawn_timer = 0
-local spawn_interval = 0.005 -- seconds between spawns (~200/sec)
-local max_bodies = 5000
-local bodies = {}            -- sequential list of live entity IDs
-
-local function spawn_physics_object()
-  -- Kill oldest if at capacity
-  while #bodies >= max_bodies do
-    lunatic.destroy(bodies[1])
-    bodies[1] = bodies[#bodies]
-    bodies[#bodies] = nil
+local function load_scene(index)
+  -- Cleanup previous scene
+  if scene_cleanup then
+    scene_cleanup()
+    scene_cleanup = nil
   end
 
-  local e = lunatic.spawn()
-  local x = (math.random() - 0.5) * 2
-  local z = (math.random() - 0.5) * 2
-  local y = 12 + math.random() * 8
-  lunatic.add(e, "position", x, y, z)
-  lunatic.add(e, "rotation", math.random() * 360, math.random() * 360, 0)
-
-  -- Bias toward small spheres: square the random for exponential falloff
-  local r = math.random() * math.random() -- products cluster near 0
-  local scale = 0.15 + r * 1.2
-  lunatic.add(e, "scale", scale, scale, scale)
-  lunatic.add(e, "mesh", "sphere")
-  -- Ember balls are rare (10% chance), otherwise pick from white/matte/silver
-  local mat
-  if math.random() < 0.1 then
-    mat = ember
-  else
-    local common = { white, matte, silver }
-    mat = common[math.random(#common)]
-  end
-  lunatic.add(e, "material", mat)
-  lunatic.physics_add_sphere(e, scale * 0.5, "dynamic", 0.0, 0.8)
-
-  bodies[#bodies + 1] = e
+  current_scene = index
+  scene_cleanup = scenes[index].setup(cam)
 end
 
+-- Load the first scene
+load_scene(1)
+
 --------------------------------------------------------------------------------
--- Systems
+-- Debug UI (shared)
 --------------------------------------------------------------------------------
 
--- Spawn new objects and kill fallen ones
-lunatic.system("spawner", function(dt)
-  spawn_timer = spawn_timer + dt
-  while spawn_timer >= spawn_interval do
-    spawn_physics_object()
-    spawn_timer = spawn_timer - spawn_interval
-  end
-
-  -- Kill bodies that fell off the world
-  local i = 1
-  while i <= #bodies do
-    local ok, pos = pcall(lunatic.ref, bodies[i], "position")
-    if ok and pos.y < -20 then
-      lunatic.destroy(bodies[i])
-      bodies[i] = bodies[#bodies]
-      bodies[#bodies] = nil
-    else
-      i = i + 1
-    end
-  end
-end)
-
--- Debug UI using the ImGui bindings exposed via the `ui` global table.
--- ui.slider_float() takes the current value and returns the (possibly modified)
--- value — a functional style that works naturally with Lua.
 lunatic.system("debug_ui", function(dt)
   ui.set_next_window_pos(16, 16, "first_use")
   ui.set_next_window_size(280, 0, "first_use")
   ui.begin_window("Debug")
 
-  local s = lunatic.get_stats()
-  ui.text(string.format("queue %d | jolt bodies %d", #bodies, s.physics_total))
+  -- Scene selector
+  ui.separator_text("Scene")
+  for i, scene in ipairs(scenes) do
+    local label = scene.name
+    if i == current_scene then label = "> " .. label end
+    if ui.button(label .. "##scene" .. i) and i ~= current_scene then
+      load_scene(i)
+    end
+  end
 
+  -- Post-processing
   if ui.collapsing_header("Post-Processing") then
     local cam_ref = lunatic.ref(cam, "camera")
     cam_ref.exposure = ui.slider_float("Exposure", cam_ref.exposure, 0.1, 5.0)
@@ -176,6 +101,15 @@ lunatic.system("debug_ui", function(dt)
     cam_ref.chromatic_aberration = ui.slider_float("Chromatic Aberration", cam_ref.chromatic_aberration, 0, 3)
     cam_ref.grain = ui.slider_float("Film Grain", cam_ref.grain, 0, 0.2)
     cam_ref.color_temp = ui.slider_float("Color Temperature", cam_ref.color_temp, -3, 3)
+  end
+
+  if ui.collapsing_header("Lens Flare") then
+    local cam_ref = lunatic.ref(cam, "camera")
+    cam_ref.flare_intensity = ui.slider_float("Flare Intensity", cam_ref.flare_intensity, 0, 3)
+    cam_ref.flare_ghost_dispersal = ui.slider_float("Ghost Dispersal", cam_ref.flare_ghost_dispersal, 0.1, 1.0)
+    cam_ref.flare_halo_width = ui.slider_float("Halo Width", cam_ref.flare_halo_width, 0.1, 0.9)
+    cam_ref.flare_chroma_distortion = ui.slider_float("Chroma Distortion", cam_ref.flare_chroma_distortion, 0, 0.02)
+    cam_ref.flare_dirt_intensity = ui.slider_float("Lens Dirt", cam_ref.flare_dirt_intensity, 0, 1)
   end
 
   if ui.collapsing_header("Bloom Shape") then

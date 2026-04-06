@@ -87,8 +87,10 @@ pub fn registerLuaApi(self: *Engine) void {
         .{ "each_query", &luaEachQuery },
         .{ "ref", &luaRef },
         .{ "create_material", &luaCreateMaterial },
+        .{ "destroy_material", &luaDestroyMaterial },
         .{ "create_cube_mesh", &luaCreateCubeMesh },
         .{ "create_sphere_mesh", &luaCreateSphereMesh },
+        .{ "destroy_mesh", &luaDestroyMesh },
         .{ "load_gltf", &luaLoadGltf },
         .{ "system", &luaSystemRegister },
         .{ "get_stats", &luaGetStats },
@@ -1094,6 +1096,20 @@ fn luaCreateMaterial(L: ?*lc.lua_State) callconv(.c) c_int {
     };
     lc.lua_pushinteger(L, @intCast(id));
     return 1;
+}
+
+fn luaDestroyMaterial(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const id: u32 = @intCast(lc.luaL_checkinteger(L, 1));
+    self.destroyMaterial(id);
+    return 0;
+}
+
+fn luaDestroyMesh(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    const id: u32 = @intCast(lc.luaL_checkinteger(L, 1));
+    self.destroyMesh(id);
+    return 0;
 }
 
 fn luaLoadGltf(L: ?*lc.lua_State) callconv(.c) c_int {

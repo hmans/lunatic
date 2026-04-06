@@ -24,6 +24,9 @@ pub const c = @cImport({
 const stbi = @cImport({
     @cInclude("stb_image.h");
 });
+const stbiw = @cImport({
+    @cInclude("stb_image_write.h");
+});
 
 const Vertex = geometry.Vertex;
 
@@ -248,6 +251,12 @@ pub const Engine = struct {
     rt_w: u32 = 0,
     rt_h: u32 = 0,
 
+    // Cascaded shadow maps
+    shadow_atlas: ?*c.SDL_GPUTexture = null, // R32_FLOAT color target (stores depth)
+    shadow_depth: ?*c.SDL_GPUTexture = null, // D32_FLOAT depth target (for z-testing)
+    shadow_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    shadow_sampler: ?*c.SDL_GPUSampler = null,
+
     // Scene
     clear_color: [4]f32 = .{ 0.08, 0.08, 0.12, 1.0 },
     ambient_color: [4]f32 = .{ 0.15, 0.15, 0.2, 0.0 },
@@ -268,6 +277,19 @@ pub const Engine = struct {
     // Draw sorting scratch buffer
     draw_list: [renderer.max_renderables]renderer.DrawEntry = undefined,
 
+    // Clustered lighting GPU buffers
+    cluster_light_buffer: ?*c.SDL_GPUBuffer = null,
+    cluster_info_buffer: ?*c.SDL_GPUBuffer = null,
+    cluster_index_buffer: ?*c.SDL_GPUBuffer = null,
+    cluster_transfer: ?*c.SDL_GPUTransferBuffer = null,
+
+    // Clustered lighting CPU scratch
+    cluster_lights: [renderer.max_lights]renderer.GPULight = undefined,
+    cluster_light_count: u32 = 0,
+    cluster_infos: [renderer.num_clusters]renderer.ClusterInfo = undefined,
+    cluster_indices: [renderer.max_light_indices]u32 = undefined,
+    cluster_index_count: u32 = 0,
+
     // Frame counter + stats
     current_frame: u64 = 0,
     stats: FrameStats = .{},
@@ -286,6 +308,12 @@ pub const Engine = struct {
     // State
     headless: bool = false,
     debug_stats: bool = false,
+    screenshot_requested: bool = false,
+    screenshot_path_buf: [256]u8 = undefined,
+    screenshot_path_len: u8 = 0,
+    screenshot_texture: ?*c.SDL_GPUTexture = null,
+    screenshot_tex_w: u32 = 0,
+    screenshot_tex_h: u32 = 0,
 
     // ---- Lifecycle ----
 
@@ -329,10 +357,19 @@ pub const Engine = struct {
             postprocess.deinitPostProcess(self);
             const device = self.gpu_device.?;
             self.assets.deinit(device);
+            if (self.screenshot_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
             if (self.msaa_color_texture) |mt| c.SDL_ReleaseGPUTexture(device, mt);
             if (self.depth_texture) |dt| c.SDL_ReleaseGPUTexture(device, dt);
             if (self.instance_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
             if (self.instance_transfer) |t| c.SDL_ReleaseGPUTransferBuffer(device, t);
+            if (self.cluster_light_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
+            if (self.cluster_info_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
+            if (self.cluster_index_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
+            if (self.cluster_transfer) |t| c.SDL_ReleaseGPUTransferBuffer(device, t);
+            if (self.shadow_atlas) |t| c.SDL_ReleaseGPUTexture(device, t);
+            if (self.shadow_depth) |t| c.SDL_ReleaseGPUTexture(device, t);
+            if (self.shadow_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+            if (self.shadow_sampler) |s| c.SDL_ReleaseGPUSampler(device, s);
             if (self.pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
             if (self.sdl_window) |w| c.SDL_DestroyWindow(w);
             c.SDL_DestroyGPUDevice(device);
@@ -378,6 +415,9 @@ pub const Engine = struct {
                 if (event.type == c.SDL_EVENT_QUIT) running = false;
                 if (event.type == c.SDL_EVENT_KEY_DOWN and event.key.scancode == c.SDL_SCANCODE_ESCAPE) running = false;
             }
+
+            // Check for screenshot request (file-based trigger)
+            self.checkScreenshotRequest();
 
             // ImGui new frame (before systems so user code can draw UI)
             c.cImGui_ImplSDLGPU3_NewFrame();
@@ -433,15 +473,21 @@ pub const Engine = struct {
             while (cam_iter.next()) |cam_entity| {
                 const cam = cam_view.getConst(core_components.Camera, cam_entity);
 
-                // Phase 2: Instance data (matrix computation + GPU upload)
+                // Phase 2: Shadow map rendering (uploads its own instance data per cascade)
+                const shadow_uniforms = renderer.executeShadowPass(self, cmd, cam_entity, sw_w, sw_h, frame);
+
+                // Phase 2.5: Instance data for scene (re-upload after shadow pass overwrote buffer)
                 const ti0 = c.SDL_GetPerformanceCounter();
                 renderer.uploadInstanceData(self, cmd, cam_entity, sw_w, sw_h, frame);
                 const ti1 = c.SDL_GetPerformanceCounter();
                 self.stats.time_instances_us = (ti1 - ti0) * 1_000_000 / pf;
 
+                // Phase 2.7: Cluster assignment + upload (per-camera)
+                renderer.updateClusters(self, cmd, cam_entity);
+
                 // Phase 3: Scene render pass
                 const ts0 = c.SDL_GetPerformanceCounter();
-                renderer.executeScenePass(self, cmd, cam_entity, hdr_tex, sw_w, sw_h, frame, cam.exposure);
+                renderer.executeScenePass(self, cmd, cam_entity, hdr_tex, sw_w, sw_h, frame, cam.exposure, shadow_uniforms);
                 const ts1 = c.SDL_GetPerformanceCounter();
                 self.stats.time_scene_us = (ts1 - ts0) * 1_000_000 / pf;
 
@@ -458,8 +504,20 @@ pub const Engine = struct {
                     .chromatic_aberration = cam.chromatic_aberration,
                     .grain_intensity = cam.grain,
                     .color_temp = cam.color_temp,
+                    .flare_intensity = cam.flare_intensity,
+                    .flare_ghost_dispersal = cam.flare_ghost_dispersal,
+                    .flare_halo_width = cam.flare_halo_width,
+                    .flare_chroma_distortion = cam.flare_chroma_distortion,
+                    .flare_dirt_intensity = cam.flare_dirt_intensity,
                 };
-                postprocess.executePostProcess(self, cmd, swapchain_tex.?, sw_w, sw_h, settings);
+                // When capturing a screenshot, render to an intermediate texture
+                // instead of the swapchain (Metal swapchain is framebufferOnly).
+                const render_target = if (self.screenshot_requested)
+                    self.ensureScreenshotTexture(device, sw_w, sw_h) orelse swapchain_tex.?
+                else
+                    swapchain_tex.?;
+
+                postprocess.executePostProcess(self, cmd, render_target, sw_w, sw_h, settings);
                 const tpp1 = c.SDL_GetPerformanceCounter();
                 self.stats.time_postprocess_us = (tpp1 - tpp0) * 1_000_000 / pf;
             }
@@ -471,8 +529,13 @@ pub const Engine = struct {
             if (draw_data != null) {
                 c.cImGui_ImplSDLGPU3_PrepareDrawData(draw_data, cmd);
 
+                const imgui_target = if (self.screenshot_requested and self.screenshot_texture != null)
+                    self.screenshot_texture.?
+                else
+                    swapchain_tex.?;
+
                 const imgui_color_target = c.SDL_GPUColorTargetInfo{
-                    .texture = swapchain_tex,
+                    .texture = imgui_target,
                     .mip_level = 0,
                     .layer_or_depth_plane = 0,
                     .clear_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
@@ -497,7 +560,44 @@ pub const Engine = struct {
 
             self.stats.accumulate();
 
-            _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+            // Screenshot: blit to swapchain + download from intermediate texture
+            if (self.screenshot_requested and self.screenshot_texture != null) {
+                // Blit intermediate → swapchain so the frame is still displayed
+                const blit_info = c.SDL_GPUBlitInfo{
+                    .source = .{
+                        .texture = self.screenshot_texture.?,
+                        .mip_level = 0,
+                        .layer_or_depth_plane = 0,
+                        .x = 0,
+                        .y = 0,
+                        .w = sw_w,
+                        .h = sw_h,
+                    },
+                    .destination = .{
+                        .texture = swapchain_tex.?,
+                        .mip_level = 0,
+                        .layer_or_depth_plane = 0,
+                        .x = 0,
+                        .y = 0,
+                        .w = sw_w,
+                        .h = sw_h,
+                    },
+                    .load_op = c.SDL_GPU_LOADOP_DONT_CARE,
+                    .clear_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+                    .flip_mode = c.SDL_FLIP_NONE,
+                    .filter = c.SDL_GPU_FILTER_NEAREST,
+                    .cycle = false,
+                    .padding1 = 0,
+                    .padding2 = 0,
+                    .padding3 = 0,
+                };
+                c.SDL_BlitGPUTexture(cmd, &blit_info);
+
+                self.downloadScreenshot(device, cmd, sw_w, sw_h);
+                self.screenshot_requested = false;
+            } else {
+                _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+            }
 
             // Debug stats to console (once per second)
             if (self.debug_stats and self.stats.acc_frames == 0 and self.current_frame > 0) {
@@ -608,8 +708,80 @@ pub const Engine = struct {
         }) orelse return error.BufferFailed;
         self.instance_capacity = renderer.max_renderables;
 
+        // Clustered lighting buffers
+        const light_buf_size: u32 = renderer.max_lights * @sizeOf(renderer.GPULight);
+        const info_buf_size: u32 = renderer.num_clusters * @sizeOf(renderer.ClusterInfo);
+        const index_buf_size: u32 = renderer.max_light_indices * @sizeOf(u32);
+        const cluster_transfer_size: u32 = light_buf_size + info_buf_size + index_buf_size;
+
+        self.cluster_light_buffer = c.SDL_CreateGPUBuffer(self.gpu_device.?, &c.SDL_GPUBufferCreateInfo{
+            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+            .size = light_buf_size,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        self.cluster_info_buffer = c.SDL_CreateGPUBuffer(self.gpu_device.?, &c.SDL_GPUBufferCreateInfo{
+            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+            .size = info_buf_size,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        self.cluster_index_buffer = c.SDL_CreateGPUBuffer(self.gpu_device.?, &c.SDL_GPUBufferCreateInfo{
+            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+            .size = index_buf_size,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        self.cluster_transfer = c.SDL_CreateGPUTransferBuffer(self.gpu_device.?, &c.SDL_GPUTransferBufferCreateInfo{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = cluster_transfer_size,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+
         // Post-processing (bloom)
         try postprocess.initPostProcess(self);
+
+        // Cascaded shadow maps
+        // Shadow atlas: R32_FLOAT color target (stores depth values, sampleable)
+        self.shadow_atlas = c.SDL_CreateGPUTexture(self.gpu_device.?, &c.SDL_GPUTextureCreateInfo{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = c.SDL_GPU_TEXTUREFORMAT_R32_FLOAT,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = renderer.shadow_atlas_size,
+            .height = renderer.shadow_atlas_size,
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        // Shadow depth: D32_FLOAT for z-testing during shadow pass
+        self.shadow_depth = c.SDL_CreateGPUTexture(self.gpu_device.?, &c.SDL_GPUTextureCreateInfo{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = c.SDL_GPU_TEXTUREFORMAT_D32_FLOAT,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET,
+            .width = renderer.shadow_atlas_size,
+            .height = renderer.shadow_atlas_size,
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        self.shadow_sampler = c.SDL_CreateGPUSampler(self.gpu_device.?, &c.SDL_GPUSamplerCreateInfo{
+            .min_filter = c.SDL_GPU_FILTER_NEAREST,
+            .mag_filter = c.SDL_GPU_FILTER_NEAREST,
+            .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+            .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .mip_lod_bias = 0,
+            .max_anisotropy = 1,
+            .compare_op = 0,
+            .min_lod = 0,
+            .max_lod = 0,
+            .enable_anisotropy = false,
+            .enable_compare = false,
+            .padding1 = 0,
+            .padding2 = 0,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        try renderer.initShadowPipeline(self);
 
         // Dear ImGui
         _ = c.igCreateContext(null);
@@ -675,7 +847,6 @@ pub const Engine = struct {
     /// Upload vertex (and optional index) data to the GPU. Returns a mesh handle.
     /// Pass a name for built-in meshes (accessible via `lunatic.mesh.*` in Lua), or null.
     pub fn createMesh(self: *Engine, name: ?[*:0]const u8, vertices: []const Vertex, indices: ?[]const u32) !u32 {
-        if (self.assets.mesh_count >= max_meshes) return error.TooManyMeshes;
         const device = self.gpu_device orelse return error.NotInitialized;
         const vbuf = uploadGPUBuffer(device, std.mem.sliceAsBytes(vertices), c.SDL_GPU_BUFFERUSAGE_VERTEX) orelse return error.BufferFailed;
 
@@ -689,7 +860,23 @@ pub const Engine = struct {
             icount = @intCast(idx.len);
         }
 
-        const id = self.assets.mesh_count;
+        // Try to reuse a freed slot
+        var id: u32 = self.assets.mesh_count;
+        for (0..self.assets.mesh_count) |i| {
+            if (self.assets.mesh_registry[i] == null) {
+                id = @intCast(i);
+                break;
+            }
+        }
+        if (id == self.assets.mesh_count) {
+            if (self.assets.mesh_count >= max_meshes) {
+                c.SDL_ReleaseGPUBuffer(device, vbuf);
+                if (ibuf) |ib| c.SDL_ReleaseGPUBuffer(device, ib);
+                return error.TooManyMeshes;
+            }
+            self.assets.mesh_count += 1;
+        }
+
         self.assets.mesh_registry[id] = .{
             .vertex_buffer = vbuf,
             .vertex_count = @intCast(vertices.len),
@@ -697,8 +884,19 @@ pub const Engine = struct {
             .index_count = icount,
         };
         self.assets.mesh_names[id] = name;
-        self.assets.mesh_count += 1;
         return id;
+    }
+
+    /// Destroy a mesh, releasing its GPU buffers and freeing the registry slot.
+    pub fn destroyMesh(self: *Engine, id: u32) void {
+        if (id >= self.assets.mesh_count) return;
+        if (self.assets.mesh_registry[id]) |mesh| {
+            const device = self.gpu_device orelse return;
+            c.SDL_ReleaseGPUBuffer(device, mesh.vertex_buffer);
+            if (mesh.index_buffer) |ib| c.SDL_ReleaseGPUBuffer(device, ib);
+        }
+        self.assets.mesh_registry[id] = null;
+        self.assets.mesh_names[id] = null;
     }
 
     /// Generate and upload a unit cube mesh. Returns a mesh handle.
@@ -733,12 +931,28 @@ pub const Engine = struct {
 
     /// Create a material with an optional name (accessible via `lunatic.material.*` in Lua).
     pub fn createNamedMaterial(self: *Engine, name: ?[*:0]const u8, data: MaterialData) !u32 {
+        // First try to reuse a freed slot
+        for (0..self.assets.material_count) |i| {
+            if (self.assets.material_registry[i] == null) {
+                self.assets.material_registry[i] = data;
+                self.assets.material_names[i] = name;
+                return @intCast(i);
+            }
+        }
+        // Otherwise append
         if (self.assets.material_count >= max_materials) return error.TooManyMaterials;
         const id = self.assets.material_count;
         self.assets.material_registry[id] = data;
         self.assets.material_names[id] = name;
         self.assets.material_count += 1;
         return id;
+    }
+
+    /// Destroy a material, freeing its registry slot for reuse.
+    pub fn destroyMaterial(self: *Engine, id: u32) void {
+        if (id >= self.assets.material_count) return;
+        self.assets.material_registry[id] = null;
+        self.assets.material_names[id] = null;
     }
 
     /// Look up a named material by string. Returns the handle or null.
@@ -860,6 +1074,159 @@ pub const Engine = struct {
         const pixels = stbi.stbi_load(path, &w, &h, &channels, 4) orelse return error.ImageLoadFailed;
         defer stbi.stbi_image_free(pixels);
         return self.createTextureFromMemory(@ptrCast(pixels), @intCast(w), @intCast(h));
+    }
+
+    // ---- Screenshot ----
+
+    /// Scan `tmp/` for any `*.request` file. If found, derive the output path by
+    /// replacing `.request` with `.png`, delete the trigger, and set the screenshot flag.
+    /// Example: `tmp/shot1.request` → `tmp/shot1.png`.
+    fn checkScreenshotRequest(self: *Engine) void {
+        const cwd = std.fs.cwd();
+        var dir = cwd.openDir("tmp", .{ .iterate = true }) catch return;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        const entry = (iter.next() catch return) orelse return;
+        // Keep iterating until we find a .request file
+        var name = entry.name;
+        var found = std.mem.endsWith(u8, name, ".request");
+        while (!found) {
+            const next = (iter.next() catch return) orelse return;
+            name = next.name;
+            found = std.mem.endsWith(u8, name, ".request");
+        }
+        if (!found) return;
+
+        // Build output path: tmp/<basename>.png
+        const stem_len = name.len - ".request".len;
+        const prefix = "tmp/";
+        const suffix = ".png";
+        const total = prefix.len + stem_len + suffix.len;
+        if (total > self.screenshot_path_buf.len) return;
+
+        @memcpy(self.screenshot_path_buf[0..prefix.len], prefix);
+        @memcpy(self.screenshot_path_buf[prefix.len..][0..stem_len], name[0..stem_len]);
+        @memcpy(self.screenshot_path_buf[prefix.len + stem_len ..][0..suffix.len], suffix);
+        self.screenshot_path_len = @intCast(total);
+
+        // Delete the trigger file
+        dir.deleteFile(name) catch {};
+        self.screenshot_requested = true;
+    }
+
+    /// Ensure the screenshot intermediate texture exists at the right size.
+    fn ensureScreenshotTexture(self: *Engine, device: *c.SDL_GPUDevice, w: u32, h: u32) ?*c.SDL_GPUTexture {
+        if (self.screenshot_texture != null and self.screenshot_tex_w == w and self.screenshot_tex_h == h) {
+            return self.screenshot_texture;
+        }
+        if (self.screenshot_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
+
+        self.screenshot_texture = c.SDL_CreateGPUTexture(device, &c.SDL_GPUTextureCreateInfo{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = self.swapchain_format,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = w,
+            .height = h,
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .props = 0,
+        });
+        self.screenshot_tex_w = w;
+        self.screenshot_tex_h = h;
+        return self.screenshot_texture;
+    }
+
+    /// Download the screenshot texture to a PNG file.
+    fn downloadScreenshot(self: *Engine, device: *c.SDL_GPUDevice, cmd: *c.SDL_GPUCommandBuffer, w: u32, h: u32) void {
+        const screenshot_tex = self.screenshot_texture orelse {
+            _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+            return;
+        };
+        const data_size = w * h * 4;
+
+        const transfer = c.SDL_CreateGPUTransferBuffer(device, &c.SDL_GPUTransferBufferCreateInfo{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD,
+            .size = data_size,
+            .props = 0,
+        }) orelse {
+            std.debug.print("[screenshot] failed to create transfer buffer\n", .{});
+            _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+            return;
+        };
+
+        const copy_pass = c.SDL_BeginGPUCopyPass(cmd) orelse {
+            std.debug.print("[screenshot] failed to begin copy pass\n", .{});
+            c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+            _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+            return;
+        };
+
+        c.SDL_DownloadFromGPUTexture(copy_pass, &c.SDL_GPUTextureRegion{
+            .texture = screenshot_tex,
+            .mip_level = 0,
+            .layer = 0,
+            .x = 0,
+            .y = 0,
+            .z = 0,
+            .w = w,
+            .h = h,
+            .d = 1,
+        }, &c.SDL_GPUTextureTransferInfo{
+            .transfer_buffer = transfer,
+            .offset = 0,
+            .pixels_per_row = w,
+            .rows_per_layer = h,
+        });
+        c.SDL_EndGPUCopyPass(copy_pass);
+
+        const fence = c.SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+        if (fence == null) {
+            std.debug.print("[screenshot] failed to acquire fence\n", .{});
+            c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+            return;
+        }
+        _ = c.SDL_WaitForGPUFences(device, true, @ptrCast(&fence), 1);
+        c.SDL_ReleaseGPUFence(device, fence);
+
+        const ptr = c.SDL_MapGPUTransferBuffer(device, transfer, false) orelse {
+            std.debug.print("[screenshot] failed to map transfer buffer\n", .{});
+            c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+            return;
+        };
+        const pixels: [*]u8 = @ptrCast(ptr);
+
+        // Swizzle BGRA → RGBA in-place
+        var i: u32 = 0;
+        while (i < data_size) : (i += 4) {
+            const tmp = pixels[i];
+            pixels[i] = pixels[i + 2];
+            pixels[i + 2] = tmp;
+        }
+
+        // Null-terminate the path for C
+        const path_len = self.screenshot_path_len;
+        self.screenshot_path_buf[path_len] = 0;
+        const path: [*:0]const u8 = @ptrCast(self.screenshot_path_buf[0..path_len :0]);
+
+        const result = stbiw.stbi_write_png(
+            path,
+            @intCast(w),
+            @intCast(h),
+            4,
+            pixels,
+            @intCast(w * 4),
+        );
+
+        c.SDL_UnmapGPUTransferBuffer(device, transfer);
+        c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+
+        if (result != 0) {
+            std.debug.print("[screenshot] saved {s} ({}x{})\n", .{ path, w, h });
+        } else {
+            std.debug.print("[screenshot] failed to write {s}\n", .{path});
+        }
     }
 
     // ---- Lua systems ----

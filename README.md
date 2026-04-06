@@ -1,11 +1,14 @@
 # Lunatic Engine
 
-A highly experimental toy 3D game engine written in Zig.
+A highly experimental toy 3D game engine designed for agentic engineering.
 
-- Written in Zig
-- ECS-first architecture (using `zig-ecs`)
-- Systems can be authored in Zig or Lua (hot-reloadable)
+## Features
+
+- Core engine written in Zig
+- Fully ECS-driven architecture
+- Games can be authored in Zig, hot-reloadable Lua, or a mix of both
 - Builds on top of SDL3 for windowing, input, rendering, and more
+- 3D physics simulation powered by [Jolt Physics](https://github.com/jrouwe/JoltPhysics)
 
 ## Dependencies
 
