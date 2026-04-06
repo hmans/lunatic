@@ -23,9 +23,38 @@ lunatic.set_fog(15, 60, 0.08, 0.08, 0.12)
 -- Light
 --------------------------------------------------------------------------------
 
--- A single directional light (sun). Args: direction x, y, z
+-- A single directional light (sun). Args: direction x, y, z, r, g, b
 local light = lunatic.spawn()
-lunatic.add(light, "directional_light", 0.3, 0.8, 0.5)
+lunatic.add(light, "directional_light", 0.3, 0.8, 0.5, 1.0, 0.95, 0.9)
+
+--------------------------------------------------------------------------------
+-- Point & Spot Lights
+--------------------------------------------------------------------------------
+
+-- A ring of colored point lights around the scene
+local light_colors = {
+  {1.0, 0.3, 0.1},  -- orange
+  {0.1, 0.5, 1.0},  -- blue
+  {0.1, 1.0, 0.3},  -- green
+  {1.0, 0.1, 0.8},  -- magenta
+}
+
+local point_lights = {}
+for i = 1, 8 do
+  local angle = (i - 1) * math.pi * 2 / 8
+  local x = math.cos(angle) * 8
+  local z = math.sin(angle) * 8
+  local col = light_colors[((i - 1) % #light_colors) + 1]
+  local pl = lunatic.spawn()
+  lunatic.add(pl, "position", x, 3, z)
+  lunatic.add(pl, "point_light", 12, col[1], col[2], col[3], 3.0)
+  point_lights[i] = pl
+end
+
+-- A spot light pointing down at the center
+local spot = lunatic.spawn()
+lunatic.add(spot, "position", 0, 12, 0)
+lunatic.add(spot, "spot_light", 18, 1.0, 0.9, 0.7, 5.0, 0, -1, 0, 20, 35)
 
 --------------------------------------------------------------------------------
 -- Materials
@@ -48,9 +77,9 @@ local cam = lunatic.spawn()
 lunatic.add(cam, "position", 0, 8, 12)
 lunatic.add(cam, "rotation", 34, 0, 0)
 lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1,
-  1.2,   -- exposure
-  0.8,   -- bloom_intensity
-  15,    -- dof_focus_dist
+  0.8,   -- exposure
+  0.5,   -- bloom_intensity
+  0,     -- dof_focus_dist (0 = disabled)
   8,     -- dof_focus_range
   8,     -- dof_blur_radius
   0.4,   -- vignette
@@ -86,8 +115,9 @@ lunatic.physics_optimize()
 
 -- Spawner state
 local spawn_timer = 0
-local spawn_interval = 0.005 -- seconds between spawns (~200/sec)
-local max_bodies = 5000
+local spawn_interval = 0.05 -- seconds between spawns (~20/sec)
+local max_bodies = 500
+local spawning_enabled = true
 local body_ring = {}         -- circular buffer of entity IDs
 local ring_head = 1          -- next slot to write
 local ring_count = 0         -- current number of live entities
@@ -136,6 +166,7 @@ end
 
 -- Spawn new objects and kill fallen ones
 lunatic.system("spawner", function(dt)
+  if not spawning_enabled then return end
   spawn_timer = spawn_timer + dt
   while spawn_timer >= spawn_interval do
     spawn_physics_object()
@@ -167,6 +198,14 @@ lunatic.system("debug_ui", function(dt)
   local s = lunatic.get_stats()
   ui.text(string.format("queue %d | jolt bodies %d", ring_count, s.physics_total))
 
+  if ui.collapsing_header("Spawner") then
+    spawning_enabled = ui.checkbox("Enabled", spawning_enabled)
+    local rate = 1.0 / spawn_interval
+    rate = ui.slider_float("Rate (per sec)", rate, 1, 200)
+    spawn_interval = 1.0 / rate
+    max_bodies = math.floor(ui.slider_float("Max Bodies", max_bodies, 10, 5000))
+  end
+
   if ui.collapsing_header("Post-Processing") then
     local cam_ref = lunatic.ref(cam, "camera")
     cam_ref.exposure = ui.slider_float("Exposure", cam_ref.exposure, 0.1, 5.0)
@@ -196,6 +235,15 @@ lunatic.system("debug_ui", function(dt)
     cam_ref.flare_halo_width = ui.slider_float("Halo Width", cam_ref.flare_halo_width, 0.1, 0.9)
     cam_ref.flare_chroma_distortion = ui.slider_float("Chroma Distortion", cam_ref.flare_chroma_distortion, 0, 0.02)
     cam_ref.flare_dirt_intensity = ui.slider_float("Lens Dirt", cam_ref.flare_dirt_intensity, 0, 1)
+  end
+
+  if ui.collapsing_header("Point Lights") then
+    for i = 1, #point_lights do
+      local ref = lunatic.ref(point_lights[i], "point_light")
+      ui.text("Light " .. i)
+      ref.intensity = ui.slider_float("Intensity##pl" .. i, ref.intensity, 0, 20)
+      ref.radius = ui.slider_float("Radius##pl" .. i, ref.radius, 1, 30)
+    end
   end
 
   if ui.collapsing_header("Bloom Shape") then
