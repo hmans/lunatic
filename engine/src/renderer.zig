@@ -4,7 +4,8 @@ const std = @import("std");
 const math3d = @import("math3d");
 const components = @import("core_components");
 const geometry = @import("geometry");
-const ecs = @import("zig-ecs");
+const ecs = @import("zflecs");
+const queryInit = engine_mod.queryInit;
 const engine_mod = @import("engine");
 const Engine = engine_mod.Engine;
 const c = engine_mod.c;
@@ -115,7 +116,7 @@ pub const max_renderables = 16384;
 
 pub const DrawEntry = struct {
     sort_key: u64, // mesh_id << 32 | material_id
-    entity: ecs.Entity,
+    entity: ecs.entity_t,
 };
 
 // ============================================================
@@ -439,20 +440,25 @@ pub const DirLightData = struct {
 };
 
 /// Query the ECS for the first directional light, or return defaults.
-fn gatherDirectionalLight(registry: *ecs.Registry) DirLightData {
+fn gatherDirectionalLight(world: *ecs.world_t) DirLightData {
     var result = DirLightData{
         .dir = .{ 0.4, 0.8, 0.4, 0.0 },
         .color = .{ 1.0, 1.0, 1.0, 0.0 },
     };
-    var view = registry.view(.{DirectionalLight}, .{});
-    var iter = view.entityIterator();
-    if (iter.next()) |entity| {
-        const dl = view.getConst(entity);
-        const len_sq = dl.dir_x * dl.dir_x + dl.dir_y * dl.dir_y + dl.dir_z * dl.dir_z;
-        if (len_sq > 1e-8) {
-            result.dir = .{ dl.dir_x, dl.dir_y, dl.dir_z, 0.0 };
+    const q = queryInit(world, &.{ecs.id(DirectionalLight)}, &.{});
+    defer ecs.query_fini(q);
+    var it = ecs.query_iter(world, q);
+
+    if (ecs.query_next(&it)) {
+        if (it.count() > 0) {
+            const entity = it.entities()[0];
+            const dl = ecs.get(world, entity, DirectionalLight) orelse return result;
+            const len_sq = dl.dir_x * dl.dir_x + dl.dir_y * dl.dir_y + dl.dir_z * dl.dir_z;
+            if (len_sq > 1e-8) {
+                result.dir = .{ dl.dir_x, dl.dir_y, dl.dir_z, 0.0 };
+            }
+            result.color = .{ dl.r, dl.g, dl.b, 0.0 };
         }
-        result.color = .{ dl.r, dl.g, dl.b, 0.0 };
     }
     return result;
 }
@@ -462,12 +468,14 @@ fn gatherClusterLights(self: *Engine) u32 {
     var count: u32 = 0;
 
     // Point lights
-    var pl_view = self.registry.view(.{ Position, PointLight }, .{});
-    var pl_iter = pl_view.entityIterator();
-    while (pl_iter.next()) |entity| {
+    const pl_q = queryInit(self.world, &.{ ecs.id(Position), ecs.id(PointLight) }, &.{});
+    defer ecs.query_fini(pl_q);
+    var pl_it = ecs.query_iter(self.world, pl_q);
+
+    while (ecs.query_next(&pl_it)) for (pl_it.entities()) |entity| {
         if (count >= max_lights) break;
-        const pos = pl_view.getConst(Position, entity);
-        const pl = pl_view.getConst(PointLight, entity);
+        const pos = ecs.get(self.world, entity, Position) orelse continue;
+        const pl = ecs.get(self.world, entity, PointLight) orelse continue;
         self.cluster_lights[count] = .{
             .pos_radius = .{ pos.x, pos.y, pos.z, pl.radius },
             .color_type = .{ pl.r * pl.intensity, pl.g * pl.intensity, pl.b * pl.intensity, 0.0 },
@@ -475,15 +483,17 @@ fn gatherClusterLights(self: *Engine) u32 {
             .cone_params = .{ 0, 0, 0, 0 },
         };
         count += 1;
-    }
+    };
 
     // Spot lights
-    var sl_view = self.registry.view(.{ Position, SpotLight }, .{});
-    var sl_iter = sl_view.entityIterator();
-    while (sl_iter.next()) |entity| {
+    const sl_q = queryInit(self.world, &.{ ecs.id(Position), ecs.id(SpotLight) }, &.{});
+    defer ecs.query_fini(sl_q);
+    var sl_it = ecs.query_iter(self.world, sl_q);
+
+    while (ecs.query_next(&sl_it)) for (sl_it.entities()) |entity| {
         if (count >= max_lights) break;
-        const pos = sl_view.getConst(Position, entity);
-        const sl = sl_view.getConst(SpotLight, entity);
+        const pos = ecs.get(self.world, entity, Position) orelse continue;
+        const sl = ecs.get(self.world, entity, SpotLight) orelse continue;
         const inner_rad = sl.inner_cone * (std.math.pi / 180.0);
         const outer_rad = sl.outer_cone * (std.math.pi / 180.0);
         const len_sq = sl.dir_x * sl.dir_x + sl.dir_y * sl.dir_y + sl.dir_z * sl.dir_z;
@@ -495,7 +505,7 @@ fn gatherClusterLights(self: *Engine) u32 {
             .cone_params = .{ @cos(inner_rad), @cos(outer_rad), 0, 0 },
         };
         count += 1;
-    }
+    };
 
     self.cluster_light_count = count;
     return count;
@@ -506,19 +516,22 @@ fn gatherClusterLights(self: *Engine) u32 {
 /// set maintenance — no per-frame filtering needed. Returns the number of entries.
 fn buildDrawList(self: *Engine) u32 {
     var draw_count: u32 = 0;
-    // Non-owning group: zig-ecs maintains this entity set automatically via
-    // signals on component add/remove. Calling group() is a cached hash lookup.
-    var group = self.registry.group(.{}, .{ Position, Rotation, MeshHandle }, .{});
-    for (group.data()) |entity| {
+    // Flecs query replaces the zig-ecs group — flecs queries are automatically
+    // cached and maintained by the archetype storage.
+    const q = queryInit(self.world, &.{ ecs.id(Position), ecs.id(Rotation), ecs.id(MeshHandle) }, &.{});
+    defer ecs.query_fini(q);
+    var it = ecs.query_iter(self.world, q);
+
+    while (ecs.query_next(&it)) for (it.entities()) |entity| {
         if (draw_count >= max_renderables) break;
-        const mesh_id: u64 = self.registry.getConst(MeshHandle, entity).id;
-        const mat_id: u64 = if (self.registry.tryGet(MaterialHandle, entity)) |mh| mh.id else 0;
+        const mesh_id: u64 = (ecs.get(self.world, entity, MeshHandle) orelse continue).id;
+        const mat_id: u64 = if (ecs.get(self.world, entity, MaterialHandle)) |mh| mh.id else 0;
         self.draw_list[draw_count] = .{
             .sort_key = (mesh_id << 32) | mat_id,
             .entity = entity,
         };
         draw_count += 1;
-    }
+    };
 
     std.mem.sort(DrawEntry, self.draw_list[0..draw_count], {}, struct {
         fn lessThan(_: void, a: DrawEntry, b: DrawEntry) bool {
@@ -552,16 +565,16 @@ fn uploadInstances(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, vp: Mat4, draw_c
     const instances: [*]InstanceData = @ptrCast(@alignCast(ptr));
 
     for (self.draw_list[0..draw_count], 0..) |entry, i| {
-        const pos = self.registry.getConst(Position, entry.entity);
-        const rot = self.registry.getConst(Rotation, entry.entity);
+        const pos = ecs.get(self.world, entry.entity, Position) orelse continue;
+        const rot = ecs.get(self.world, entry.entity, Rotation) orelse continue;
         const rotation = Mat4.mul(Mat4.mul(Mat4.rotateZ(rot.z), Mat4.rotateY(rot.y)), Mat4.rotateX(rot.x));
-        const scl = if (self.registry.tryGet(Scale, entry.entity)) |s|
+        const scl = if (ecs.get(self.world, entry.entity, Scale)) |s|
             Mat4.scale(s.x, s.y, s.z)
         else
             Mat4.identity();
         const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), Mat4.mul(rotation, scl));
         const mvp = Mat4.mul(vp, model);
-        const receives = if (self.registry.has(ShadowReceiver, entry.entity)) @as(f32, 1.0) else @as(f32, 0.0);
+        const receives = if (ecs.has_id(self.world, entry.entity, ecs.id(ShadowReceiver))) @as(f32, 1.0) else @as(f32, 0.0);
         instances[i] = .{ .mvp = mvp.m, .model = model.m, .flags = .{ receives, 0, 0, 0 } };
     }
 
@@ -695,32 +708,33 @@ pub fn prepareFrame(self: *Engine, w: u32, h: u32) FrameContext {
     }
 
     return .{
-        .dir_light = gatherDirectionalLight(&self.registry),
+        .dir_light = gatherDirectionalLight(self.world),
         .draw_count = buildDrawList(self),
         .light_count = gatherClusterLights(self),
     };
 }
 
 /// Compute the view matrix for a camera entity.
-fn computeView(self: *Engine, cam_entity: ecs.Entity) Mat4 {
-    const cam_pos = self.registry.getConst(Position, cam_entity);
+fn computeView(self: *Engine, cam_entity: ecs.entity_t) Mat4 {
+    const cam_pos = ecs.get(self.world, cam_entity, Position) orelse
+        return Mat4.viewFromTransform(0, 0, 0, 0, 0, 0);
     const eye = Vec3.new(cam_pos.x, cam_pos.y, cam_pos.z);
-    return if (self.registry.tryGet(LookAt, cam_entity)) |look_at| blk: {
-        const target_entity: ecs.Entity = @bitCast(look_at.target);
-        if (self.registry.valid(target_entity)) {
-            if (self.registry.tryGet(Position, target_entity)) |target_pos| {
+    return if (ecs.get(self.world, cam_entity, LookAt)) |look_at| blk: {
+        const target_entity: ecs.entity_t = @intCast(look_at.target);
+        if (ecs.is_alive(self.world, target_entity)) {
+            if (ecs.get(self.world, target_entity, Position)) |target_pos| {
                 break :blk Mat4.lookAt(eye, Vec3.new(target_pos.x, target_pos.y, target_pos.z), Vec3.new(0, 1, 0));
             }
         }
         break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
-    } else if (self.registry.tryGet(Rotation, cam_entity)) |cam_rot| blk: {
+    } else if (ecs.get(self.world, cam_entity, Rotation)) |cam_rot| blk: {
         break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, cam_rot.x, cam_rot.y, cam_rot.z);
     } else Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
 }
 
 /// Compute the view-projection matrix for a camera entity.
-fn computeVP(self: *Engine, cam_entity: ecs.Entity, w: u32, h: u32) Mat4 {
-    const cam = self.registry.getConst(Camera, cam_entity);
+fn computeVP(self: *Engine, cam_entity: ecs.entity_t, w: u32, h: u32) Mat4 {
+    const cam = ecs.get(self.world, cam_entity, Camera) orelse return Mat4.identity();
     const w_f: f32 = @floatFromInt(w);
     const h_f: f32 = @floatFromInt(h);
     const vp_w = cam.viewport_w * w_f;
@@ -915,9 +929,9 @@ fn uploadClusterData(self: *Engine, cmd: *c.SDL_GPUCommandBuffer) void {
 }
 
 /// Assign lights to clusters and upload cluster data for a specific camera.
-pub fn updateClusters(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, cam_entity: ecs.Entity) void {
-    const cam = self.registry.getConst(Camera, cam_entity);
-    const cam_pos = self.registry.getConst(Position, cam_entity);
+pub fn updateClusters(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, cam_entity: ecs.entity_t) void {
+    const cam = ecs.get(self.world, cam_entity, Camera) orelse return;
+    const cam_pos = ecs.get(self.world, cam_entity, Position) orelse return;
     assignLightsToClusters(self, .{ cam_pos.x, cam_pos.y, cam_pos.z }, cam.near, cam.far);
     uploadClusterData(self, cmd);
 }
@@ -985,8 +999,8 @@ const CascadeData = struct {
     splits: [cascade_count]f32,
 };
 
-fn computeCascades(self: *Engine, cam_entity: ecs.Entity, w: u32, h: u32, light_dir: [4]f32) CascadeData {
-    const cam = self.registry.getConst(Camera, cam_entity);
+fn computeCascades(self: *Engine, cam_entity: ecs.entity_t, w: u32, h: u32, light_dir: [4]f32) CascadeData {
+    const cam = ecs.get(self.world, cam_entity, Camera) orelse return std.mem.zeroes(CascadeData);
     const near = cam.near;
     const far = @min(cam.far, 80.0);
     const splits = computeCascadeSplits(near, far);
@@ -1115,7 +1129,7 @@ fn submitShadowDrawCalls(self: *Engine, render_pass: *c.SDL_GPURenderPass, draw_
 pub fn executeShadowPass(
     self: *Engine,
     cmd: *c.SDL_GPUCommandBuffer,
-    cam_entity: ecs.Entity,
+    cam_entity: ecs.entity_t,
     w: u32,
     h: u32,
     frame: FrameContext,
@@ -1147,16 +1161,16 @@ pub fn executeShadowPass(
             const instances: [*]InstanceData = @ptrCast(@alignCast(ptr));
 
             for (self.draw_list[0..frame.draw_count], 0..) |entry, i| {
-                const is_caster = self.registry.has(ShadowCaster, entry.entity);
+                const is_caster = ecs.has_id(self.world, entry.entity, ecs.id(ShadowCaster));
                 if (!is_caster) {
                     // Zero-scale MVP: all vertices collapse to a point, degenerate triangles produce no fragments
                     instances[i] = .{ .mvp = .{.{ 0, 0, 0, 0 }} ** 4, .model = .{.{ 0, 0, 0, 0 }} ** 4, .flags = .{ 0, 0, 0, 0 } };
                     continue;
                 }
-                const pos = self.registry.getConst(Position, entry.entity);
-                const rot = self.registry.getConst(Rotation, entry.entity);
+                const pos = ecs.get(self.world, entry.entity, Position) orelse continue;
+                const rot = ecs.get(self.world, entry.entity, Rotation) orelse continue;
                 const rotation = Mat4.mul(Mat4.mul(Mat4.rotateZ(rot.z), Mat4.rotateY(rot.y)), Mat4.rotateX(rot.x));
-                const scl = if (self.registry.tryGet(Scale, entry.entity)) |s|
+                const scl = if (ecs.get(self.world, entry.entity, Scale)) |s|
                     Mat4.scale(s.x, s.y, s.z)
                 else
                     Mat4.identity();
@@ -1249,7 +1263,7 @@ pub fn executeShadowPass(
 }
 
 /// Compute per-instance matrices and upload to GPU. Must be called before executeScenePass.
-pub fn uploadInstanceData(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, cam_entity: ecs.Entity, w: u32, h: u32, frame: FrameContext) void {
+pub fn uploadInstanceData(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, cam_entity: ecs.entity_t, w: u32, h: u32, frame: FrameContext) void {
     const vp = computeVP(self, cam_entity, w, h);
     uploadInstances(self, cmd, vp, frame.draw_count);
 }
@@ -1258,7 +1272,7 @@ pub fn uploadInstanceData(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, cam_entit
 pub fn executeScenePass(
     self: *Engine,
     cmd: *c.SDL_GPUCommandBuffer,
-    cam_entity: ecs.Entity,
+    cam_entity: ecs.entity_t,
     color_target_tex: *c.SDL_GPUTexture,
     w: u32,
     h: u32,
@@ -1268,8 +1282,8 @@ pub fn executeScenePass(
 ) void {
     if (self.depth_texture == null) return;
 
-    const cam_pos = self.registry.getConst(Position, cam_entity);
-    const cam = self.registry.getConst(Camera, cam_entity);
+    const cam_pos = ecs.get(self.world, cam_entity, Position) orelse return;
+    const cam = ecs.get(self.world, cam_entity, Camera) orelse return;
     const is_msaa = self.sample_count.isMultisample();
 
     const hdr_clear = srgbToHdr4(self.clear_color, exposure);

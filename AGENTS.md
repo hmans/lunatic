@@ -1,6 +1,6 @@
 # Lunatic Engine
 
-A 3D game engine: Zig core + SDL3 GPU + LuaJIT scripting + zig-ecs. Please refer to the repository's [README.md](README.md) for an overview of the project.
+A 3D game engine: Zig core + SDL3 GPU + LuaJIT scripting + flecs ECS. Please refer to the repository's [README.md](README.md) for an overview of the project.
 
 ## Goals
 
@@ -64,6 +64,22 @@ Auto-registered at engine init:
 - Custom dark theme with IBM Plex Sans font (HiDPI-aware, rasterized at native resolution)
 - Exposed to Lua via `ui` global table: `begin_window`, `end_window`, `text`, `separator_text`, `slider_float`, `checkbox`, `button`, `collapsing_header`, `set_next_window_pos`, `set_next_window_size`, `fps`. Slider/checkbox use functional style (take current value, return new value).
 
+### Flecs Explorer (ECS inspection)
+
+The engine exposes a flecs REST API on `localhost:27750` for real-time ECS inspection via the [Flecs Explorer](https://www.flecs.dev/explorer). Open the Explorer in a browser while the engine is running to:
+
+- Browse all entities and their component values
+- Edit component fields live (positions, camera settings, light colors, etc.)
+- Run queries using the flecs query DSL (use fully qualified names, e.g. `core_components.Position`)
+- View archetype statistics and world structure
+
+The REST API can also be queried directly:
+```sh
+curl http://localhost:27750/world                              # All entities + components
+curl "http://localhost:27750/query?expr=core_components.Camera" # Query entities
+curl http://localhost:27750/entity/flecs                        # Specific entity
+```
+
 ### Debug Server (HTTP API + MCP)
 
 The engine runs an embedded HTTP debug server on `localhost:19840` (background thread, started automatically in `Engine.run()`). This is the primary interface for agent-driven inspection and control.
@@ -118,10 +134,14 @@ The engine must handle tens of thousands to hundreds of thousands of entities ef
 - When adding a new binary file type, run `git lfs track "*.ext"` before committing.
 - Font: IBM Plex Sans (SIL Open Font License) in `assets/fonts/`, loaded by engine at init.
 
-### zig-ecs patterns
-- `registry.view()` for multi-component queries: iterate with `.entityIterator()` + `.get()`/`.getConst()`. Typed `.iterator()` and `.each()` are **group-only** — not available on views.
-- `registry.group()` for persistent, signal-maintained entity sets. Use non-owning groups (`group(.{}, .{includes...}, .{})`) unless you need cache-friendly owned storage.
-- Use `registry.add()` when you know the component isn't present. Use `addOrReplace()` only when it might already exist.
+### flecs (ECS) patterns
+- The ECS world is `Engine.world: *ecs.world_t`. Import `ecs` as `@import("zflecs")`.
+- Components must be registered at init: `ecs.COMPONENT(world, T)` for data components, `ecs.TAG(world, T)` for zero-sized tags. This happens in `Engine.init()`.
+- Entity IDs are `ecs.entity_t` (u64). Create with `ecs.new_id(world)`, destroy with `ecs.delete(world, entity)`.
+- Component access: `ecs.get(world, entity, T)` returns `?*const T`, `ecs.get_mut(world, entity, T)` returns `?*T`, `ecs.set(world, entity, T, value)` adds or replaces.
+- Queries: use `queryInit(world, &.{id1, id2}, &.{exclude_id})` helper from `engine.zig`, iterate with `while (ecs.query_next(&it)) for (it.entities()) |entity| { ... };`, finalize with `ecs.query_fini(q)`.
+- **Important**: `ecs.query_next` calls `ecs.iter_fini` internally when returning false. Do NOT call `ecs.iter_fini` on a fully-consumed iterator — it causes a double-free crash. Only call it when breaking out of iteration early.
+- `ecs.id(T)` returns the runtime component ID — cannot be used at comptime (use `idFn` closures instead).
 
 ## Gotchas
 

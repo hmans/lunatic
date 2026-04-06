@@ -4,9 +4,11 @@
 
 const std = @import("std");
 const zp = @import("zphysics");
+const ecs = @import("zflecs");
 const engine_mod = @import("engine");
 const Engine = engine_mod.Engine;
 const core = engine_mod.core_components;
+const queryInit = engine_mod.queryInit;
 
 // ============================================================
 // Object layers (Jolt requires at least 2 for broad phase)
@@ -184,46 +186,57 @@ pub fn physicsSystem(self: *Engine, dt: f32) void {
     writeInterpolatedTransforms(self);
 }
 
+/// Build component IDs for the physics query at runtime.
+fn physicsQueryIds() [3]ecs.id_t {
+    return .{ ecs.id(core.Position), ecs.id(core.Rotation), ecs.id(core.RigidBody) };
+}
+
 /// Save current ECS position/rotation into RigidBody.prev_* fields.
 fn savePrevTransforms(self: *Engine) void {
-    var view = self.registry.view(.{ core.Position, core.Rotation, core.RigidBody }, .{});
-    var iter = view.entityIterator();
-    while (iter.next()) |entity| {
-        const pos = view.getConst(core.Position, entity);
-        const rot = view.getConst(core.Rotation, entity);
-        var rb = view.get(core.RigidBody, entity);
+    const ids = physicsQueryIds();
+    const q = queryInit(self.world, &ids, &.{});
+    defer ecs.query_fini(q);
+    var it = ecs.query_iter(self.world, q);
+
+    while (ecs.query_next(&it)) for (it.entities()) |entity| {
+        const pos = ecs.get(self.world, entity, core.Position) orelse continue;
+        const rot = ecs.get(self.world, entity, core.Rotation) orelse continue;
+        var rb = ecs.get_mut(self.world, entity, core.RigidBody) orelse continue;
         rb.prev_x = pos.x;
         rb.prev_y = pos.y;
         rb.prev_z = pos.z;
         rb.prev_rx = rot.x;
         rb.prev_ry = rot.y;
         rb.prev_rz = rot.z;
-    }
+    };
 }
 
 /// Sync current Jolt transforms into ECS Position/Rotation.
 fn syncCurrentTransforms(self: *Engine, body_iface: *const zp.BodyInterface) void {
-    var view = self.registry.view(.{ core.Position, core.Rotation, core.RigidBody }, .{});
-    var iter = view.entityIterator();
-    while (iter.next()) |entity| {
-        const rb = view.getConst(core.RigidBody, entity);
+    const ids = physicsQueryIds();
+    const q = queryInit(self.world, &ids, &.{});
+    defer ecs.query_fini(q);
+    var it = ecs.query_iter(self.world, q);
+
+    while (ecs.query_next(&it)) for (it.entities()) |entity| {
+        const rb = ecs.get(self.world, entity, core.RigidBody) orelse continue;
         const body_id: zp.BodyId = @enumFromInt(rb.body_id);
         if (body_id == .invalid) continue;
 
-        const pos = body_iface.getPosition(body_id);
-        const rot = body_iface.getRotation(body_id);
-        const euler = quatToEuler(rot);
+        const jolt_pos = body_iface.getPosition(body_id);
+        const jolt_rot = body_iface.getRotation(body_id);
+        const euler = quatToEuler(jolt_rot);
 
-        var ecs_pos = view.get(core.Position, entity);
-        ecs_pos.x = pos[0];
-        ecs_pos.y = pos[1];
-        ecs_pos.z = pos[2];
+        var ecs_pos = ecs.get_mut(self.world, entity, core.Position) orelse continue;
+        ecs_pos.x = jolt_pos[0];
+        ecs_pos.y = jolt_pos[1];
+        ecs_pos.z = jolt_pos[2];
 
-        var ecs_rot = view.get(core.Rotation, entity);
+        var ecs_rot = ecs.get_mut(self.world, entity, core.Rotation) orelse continue;
         ecs_rot.x = euler[0];
         ecs_rot.y = euler[1];
         ecs_rot.z = euler[2];
-    }
+    };
 }
 
 /// Write interpolated transforms: lerp(prev, curr, alpha) → ECS.
@@ -231,14 +244,17 @@ fn writeInterpolatedTransforms(self: *Engine) void {
     const alpha = self.physics.alpha;
     const inv = 1.0 - alpha;
 
-    var view = self.registry.view(.{ core.Position, core.Rotation, core.RigidBody }, .{});
-    var iter = view.entityIterator();
-    while (iter.next()) |entity| {
-        const rb = view.getConst(core.RigidBody, entity);
+    const ids = physicsQueryIds();
+    const q = queryInit(self.world, &ids, &.{});
+    defer ecs.query_fini(q);
+    var it = ecs.query_iter(self.world, q);
+
+    while (ecs.query_next(&it)) for (it.entities()) |entity| {
+        const rb = ecs.get(self.world, entity, core.RigidBody) orelse continue;
         if (rb.body_id == 0) continue;
 
-        var pos = view.get(core.Position, entity);
-        var rot = view.get(core.Rotation, entity);
+        var pos = ecs.get_mut(self.world, entity, core.Position) orelse continue;
+        var rot = ecs.get_mut(self.world, entity, core.Rotation) orelse continue;
 
         // Lerp between prev (stored in RigidBody) and current (in Position/Rotation)
         const cx = pos.x;
@@ -254,7 +270,7 @@ fn writeInterpolatedTransforms(self: *Engine) void {
         rot.x = rb.prev_rx * inv + crx * alpha;
         rot.y = rb.prev_ry * inv + cry * alpha;
         rot.z = rb.prev_rz * inv + crz * alpha;
-    }
+    };
 }
 
 // ============================================================

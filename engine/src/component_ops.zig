@@ -3,9 +3,12 @@
 // Each component type in `components.all` gets a `ComponentOps` entry with
 // function pointers for add/get/remove/query/ref operations. This replaces
 // the repeated `inline for (components.all)` dispatch loops in lua_api.zig.
+//
+// With flecs, component access goes through the world pointer (stored on Engine)
+// rather than a separate Registry object. Entity IDs are u64 (flecs entity_t).
 
 const std = @import("std");
-const ecs = @import("zig-ecs");
+const ecs = @import("zflecs");
 const engine_mod = @import("engine");
 const Engine = engine_mod.Engine;
 const lua = @import("lua");
@@ -14,20 +17,20 @@ const lc = lua.c;
 /// Runtime vtable for one component type's Lua bridge operations.
 pub const ComponentOps = struct {
     name: []const u8,
+    idFn: *const fn () ecs.id_t,
 
     // ECS query operations
-    hasFn: *const fn (*ecs.Registry, ecs.Entity) bool,
-    lenFn: *const fn (*ecs.Registry) usize,
-    dataFn: *const fn (*ecs.Registry) []ecs.Entity,
+    hasFn: *const fn (*Engine, ecs.entity_t) bool,
+    countFn: *const fn (*Engine) usize,
 
     // Lua bridge operations
-    addFn: *const fn (*Engine, ecs.Entity, ?*lc.lua_State, c_int) void,
-    getFn: *const fn (*Engine, ecs.Entity, ?*lc.lua_State) c_int,
-    removeFn: *const fn (*ecs.Registry, ecs.Entity) void,
+    addFn: *const fn (*Engine, ecs.entity_t, ?*lc.lua_State, c_int) void,
+    getFn: *const fn (*Engine, ecs.entity_t, ?*lc.lua_State) c_int,
+    removeFn: *const fn (*Engine, ecs.entity_t) void,
 
     // Component ref field access (null for tag components)
-    refReadFn: ?*const fn (*Engine, ecs.Entity, []const u8, ?*lc.lua_State) c_int,
-    refWriteFn: ?*const fn (*Engine, ecs.Entity, []const u8, ?*lc.lua_State) void,
+    refReadFn: ?*const fn (*Engine, ecs.entity_t, []const u8, ?*lc.lua_State) c_int,
+    refWriteFn: ?*const fn (*Engine, ecs.entity_t, []const u8, ?*lc.lua_State) void,
 };
 
 /// Generate a ComponentOps vtable entry for each type in the tuple.
@@ -45,43 +48,43 @@ fn makeOpsForType(comptime T: type) ComponentOps {
 
     return .{
         .name = T.lua.name,
+        .idFn = &struct {
+            fn f() ecs.id_t {
+                return ecs.id(T);
+            }
+        }.f,
 
         .hasFn = &struct {
-            fn f(reg: *ecs.Registry, entity: ecs.Entity) bool {
-                return reg.has(T, entity);
+            fn f(engine: *Engine, entity: ecs.entity_t) bool {
+                return ecs.has_id(engine.world, entity, ecs.id(T));
             }
         }.f,
-        .lenFn = &struct {
-            fn f(reg: *ecs.Registry) usize {
-                return reg.len(T);
-            }
-        }.f,
-        .dataFn = &struct {
-            fn f(reg: *ecs.Registry) []ecs.Entity {
-                return reg.data(T);
+        .countFn = &struct {
+            fn f(engine: *Engine) usize {
+                return @intCast(ecs.count_id(engine.world, ecs.id(T)));
             }
         }.f,
 
         .addFn = &struct {
-            fn f(engine: *Engine, entity: ecs.Entity, L: ?*lc.lua_State, base: c_int) void {
+            fn f(engine: *Engine, entity: ecs.entity_t, L: ?*lc.lua_State, base: c_int) void {
                 if (comptime is_tag) {
-                    engine.registry.addOrReplace(entity, T{});
+                    ecs.add(engine.world, entity, T);
                 } else if (comptime has_resolve) {
                     const id = engine.resolveHandle(L, base, T.lua.resolve);
-                    engine.registry.addOrReplace(entity, T{ .id = id });
+                    _ = ecs.set(engine.world, entity, T, T{ .id = id });
                 } else {
-                    engine.registry.addOrReplace(entity, fromLua(T, L, base));
+                    _ = ecs.set(engine.world, entity, T, fromLua(T, L, base));
                 }
             }
         }.f,
 
         .getFn = &struct {
-            fn f(engine: *Engine, entity: ecs.Entity, L: ?*lc.lua_State) c_int {
+            fn f(engine: *Engine, entity: ecs.entity_t, L: ?*lc.lua_State) c_int {
                 if (comptime is_tag) {
-                    lc.lua_pushboolean(L, if (engine.registry.has(T, entity)) 1 else 0);
+                    lc.lua_pushboolean(L, if (ecs.has_id(engine.world, entity, ecs.id(T))) 1 else 0);
                     return 1;
                 } else {
-                    if (engine.registry.tryGet(T, entity)) |val| {
+                    if (ecs.get(engine.world, entity, T)) |val| {
                         return toLua(T, val.*, L);
                     }
                     return 0;
@@ -90,14 +93,14 @@ fn makeOpsForType(comptime T: type) ComponentOps {
         }.f,
 
         .removeFn = &struct {
-            fn f(reg: *ecs.Registry, entity: ecs.Entity) void {
-                reg.remove(T, entity);
+            fn f(engine: *Engine, entity: ecs.entity_t) void {
+                ecs.remove(engine.world, entity, T);
             }
         }.f,
 
         .refReadFn = if (is_tag) null else &struct {
-            fn f(engine: *Engine, entity: ecs.Entity, field_name: []const u8, L: ?*lc.lua_State) c_int {
-                if (engine.registry.tryGet(T, entity)) |val| {
+            fn f(engine: *Engine, entity: ecs.entity_t, field_name: []const u8, L: ?*lc.lua_State) c_int {
+                if (ecs.get(engine.world, entity, T)) |val| {
                     inline for (std.meta.fields(T)) |field| {
                         if (std.mem.eql(u8, field_name, field.name)) {
                             const fval = @field(val.*, field.name);
@@ -116,8 +119,8 @@ fn makeOpsForType(comptime T: type) ComponentOps {
         }.f,
 
         .refWriteFn = if (is_tag) null else &struct {
-            fn f(engine: *Engine, entity: ecs.Entity, field_name: []const u8, L: ?*lc.lua_State) void {
-                if (engine.registry.tryGet(T, entity)) |comp| {
+            fn f(engine: *Engine, entity: ecs.entity_t, field_name: []const u8, L: ?*lc.lua_State) void {
+                if (ecs.get_mut(engine.world, entity, T)) |comp| {
                     inline for (std.meta.fields(T)) |field| {
                         if (std.mem.eql(u8, field_name, field.name)) {
                             if (comptime field.type == f32) {

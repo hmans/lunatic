@@ -4,7 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const math3d = @import("math3d");
 const Mat4 = math3d.Mat4;
-const ecs = @import("zig-ecs");
+const ecs = @import("zflecs");
 const geometry = @import("geometry");
 const renderer = @import("renderer");
 pub const postprocess = @import("postprocess");
@@ -234,9 +234,52 @@ pub const FrameStats = struct {
     }
 };
 
+// ============================================================
+// Flecs query helpers
+// ============================================================
+
+/// Flecs meta type IDs for f32 and u32, resolved at runtime from C externs.
+const flecs_f32_id = @extern(*const ecs.entity_t, .{ .name = "FLECS_IDecs_f32_tID_" });
+const flecs_u32_id = @extern(*const ecs.entity_t, .{ .name = "FLECS_IDecs_u32_tID_" });
+
+/// Register struct metadata with flecs so the Explorer can display and
+/// edit component fields. Maps Zig struct fields to flecs member descriptors.
+/// Only handles f32 and u32 fields (matching the Lua bridge constraint).
+fn registerStructMeta(world: *ecs.world_t, comptime T: type) void {
+    const fields = std.meta.fields(T);
+    var desc = std.mem.zeroes(ecs.struct_desc_t);
+    desc.entity = ecs.id(T);
+    inline for (fields, 0..) |field, i| {
+        if (i >= ecs.ECS_MEMBER_DESC_CACHE_SIZE) break;
+        desc.members[i].name = @ptrCast(field.name.ptr);
+        desc.members[i].type = if (field.type == f32)
+            flecs_f32_id.*
+        else if (field.type == u32)
+            flecs_u32_id.*
+        else
+            0;
+    }
+    _ = ecs.struct_init(world, &desc);
+}
+
+/// Build a flecs query from slices of include/exclude component IDs.
+/// Simpler than filling out query_desc_t manually each time.
+pub fn queryInit(world: *ecs.world_t, includes: []const ecs.id_t, excludes: []const ecs.id_t) *ecs.query_t {
+    var desc = std.mem.zeroes(ecs.query_desc_t);
+    for (includes, 0..) |comp_id, i| {
+        desc.terms[i].id = comp_id;
+    }
+    for (excludes, 0..) |comp_id, j| {
+        desc.terms[includes.len + j].id = comp_id;
+        desc.terms[includes.len + j].oper = .Not;
+    }
+    return ecs.query_init(world, &desc) catch
+        std.debug.panic("Failed to create flecs query", .{});
+}
+
 pub const Engine = struct {
-    // ECS
-    registry: ecs.Registry,
+    // ECS (flecs world — replaces zig-ecs Registry)
+    world: *ecs.world_t,
 
     // GPU (null when headless)
     gpu_device: ?*c.SDL_GPUDevice = null,
@@ -324,12 +367,34 @@ pub const Engine = struct {
     /// Initialize the engine: ECS, Lua, GPU device, pipeline, built-in resources.
     /// Must be called on a pointer-stable location (e.g. `var engine: Engine = undefined;`).
     pub fn init(self: *Engine, config: Config) !void {
+        const world = ecs.init();
         self.* = Engine{
-            .registry = ecs.Registry.init(std.heap.c_allocator),
+            .world = world,
             .headless = config.headless,
             .debug_stats = config.debug_stats,
         };
-        errdefer self.registry.deinit();
+        errdefer _ = ecs.fini(world);
+
+        // Register all component types with flecs (required before use),
+        // then register their struct metadata for the Explorer's reflection UI.
+        inline for (lua_api.componentTypes()) |T| {
+            if (@sizeOf(T) == 0) {
+                ecs.TAG(world, T);
+            } else {
+                ecs.COMPONENT(world, T);
+                registerStructMeta(world, T);
+            }
+        }
+
+        // Enable flecs REST API for the Explorer debug UI.
+        // Connect at https://www.flecs.dev/explorer to inspect entities,
+        // components, and queries in real-time. Requires ecs.progress()
+        // to be called each frame (done in the main loop).
+        // EcsRest is a C-level flecs component — both entity and component IDs
+        // come from C externs, bypassing the Zig COMPONENT() registration path.
+        const rest_comp_id = @as(ecs.id_t, @extern(*const ecs.entity_t, .{ .name = "FLECS_IDEcsRestID_" }).*);
+        const rest_val = ecs.EcsRest{ .port = 27750 };
+        _ = ecs.set_id(world, rest_comp_id, rest_comp_id, @sizeOf(ecs.EcsRest), @ptrCast(&rest_val));
 
         // Lua
         const L = lc.luaL_newstate() orelse return error.LuaInitFailed;
@@ -380,7 +445,12 @@ pub const Engine = struct {
             c.SDL_Quit();
         }
 
-        self.registry.deinit();
+        // Signal orderly shutdown to flecs and run one final tick so the
+        // REST server and other internal systems can clean up their iterators.
+        // Without this, ecs_fini asserts on leaked stack allocator cursors.
+        ecs.quit(self.world);
+        _ = ecs.progress(self.world, 0);
+        _ = ecs.fini(self.world);
     }
 
     /// Load and execute a Lua script file. Sets the Lua package path to the
@@ -451,6 +521,9 @@ pub const Engine = struct {
             // Process debug server requests (after systems, before rendering)
             self.dbg_server.drainRequests();
 
+            // Tick flecs internal systems (REST API, stats, etc.)
+            _ = ecs.progress(self.world, dt);
+
             // Physics stats
             if (self.physics.system) |phys_sys| {
                 self.stats.physics_active = phys_sys.getNumActiveBodies();
@@ -493,10 +566,13 @@ pub const Engine = struct {
             const hdr_tex = self.postprocess.hdr_texture.?;
 
             // Per-camera rendering
-            var cam_view = self.registry.view(.{ core_components.Position, core_components.Camera }, .{});
-            var cam_iter = cam_view.entityIterator();
-            while (cam_iter.next()) |cam_entity| {
-                const cam = cam_view.getConst(core_components.Camera, cam_entity);
+            const cam_q = queryInit(self.world, &.{ecs.id(core_components.Position), ecs.id(core_components.Camera)}, &.{});
+            defer ecs.query_fini(cam_q);
+            var cam_qit = ecs.query_iter(self.world, cam_q);
+
+            while (ecs.query_next(&cam_qit)) {
+                for (cam_qit.entities()) |cam_entity| {
+                    const cam = ecs.get(self.world, cam_entity, core_components.Camera) orelse continue;
 
                 // Phase 2: Shadow map rendering (uploads its own instance data per cascade)
                 const shadow_uniforms = renderer.executeShadowPass(self, cmd, cam_entity, sw_w, sw_h, frame);
@@ -545,6 +621,7 @@ pub const Engine = struct {
                 postprocess.executePostProcess(self, cmd, render_target, sw_w, sw_h, settings);
                 const tpp1 = c.SDL_GetPerformanceCounter();
                 self.stats.time_postprocess_us = (tpp1 - tpp0) * 1_000_000 / pf;
+                }
             }
 
             // Phase 5: ImGui overlay
@@ -1422,11 +1499,16 @@ pub const Engine = struct {
 
     /// Increment Age.seconds for all entities with the Age component.
     pub fn ageSystem(self: *Engine, dt: f32) void {
-        var view = self.registry.view(.{core_components.Age}, .{});
-        var iter = view.entityIterator();
-        while (iter.next()) |entity| {
-            var age = view.get(entity);
-            age.seconds += dt;
+        const q = queryInit(self.world, &.{ecs.id(core_components.Age)}, &.{});
+        defer ecs.query_fini(q);
+        var it = ecs.query_iter(self.world, q);
+
+        while (ecs.query_next(&it)) {
+            if (ecs.field(&it, core_components.Age, 0)) |ages| {
+                for (ages) |*age| {
+                    age.seconds += dt;
+                }
+            }
         }
     }
 
@@ -1447,12 +1529,14 @@ pub const Engine = struct {
             _ = c.SDL_ShowCursor();
         }
 
-        var view = self.registry.view(.{ core_components.Position, core_components.Rotation, core_components.FlyCamera }, .{});
-        var iter = view.entityIterator();
-        while (iter.next()) |entity| {
-            var pos = view.get(core_components.Position, entity);
-            var rot = view.get(core_components.Rotation, entity);
-            const fly = view.getConst(core_components.FlyCamera, entity);
+        const q = queryInit(self.world, &.{ ecs.id(core_components.Position), ecs.id(core_components.Rotation), ecs.id(core_components.FlyCamera) }, &.{});
+        defer ecs.query_fini(q);
+        var it = ecs.query_iter(self.world, q);
+
+        while (ecs.query_next(&it)) for (it.entities()) |entity| {
+            var pos = ecs.get_mut(self.world, entity, core_components.Position) orelse continue;
+            var rot = ecs.get_mut(self.world, entity, core_components.Rotation) orelse continue;
+            const fly = ecs.get(self.world, entity, core_components.FlyCamera) orelse continue;
 
             if (!rmb_held) continue;
 
@@ -1484,7 +1568,7 @@ pub const Engine = struct {
             if (self.isKeyDown(c.SDL_SCANCODE_D)) { pos.x += rx * speed * dt; pos.y += ry * speed * dt; pos.z += rz * speed * dt; }
             if (self.isKeyDown(c.SDL_SCANCODE_SPACE)) pos.y += speed * dt;
             if (self.isKeyDown(c.SDL_SCANCODE_LCTRL)) pos.y -= speed * dt;
-        }
+        };
     }
 
     /// Unregister all systems and free Lua registry references.

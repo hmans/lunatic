@@ -137,17 +137,18 @@ const EngineModules = struct {
     postprocess: *std.Build.Module,
     lua: *std.Build.Module,
     joltc: *std.Build.Step.Compile,
+    flecs: *std.Build.Step.Compile,
 };
 
 fn buildEngineModules(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    entt: *std.Build.Dependency,
+    zflecs_dep: *std.Build.Dependency,
     zphysics_dep: *std.Build.Dependency,
     components_path: []const u8,
 ) EngineModules {
-    const ecs_mod = entt.module("zig-ecs");
+    const ecs_mod = zflecs_dep.module("root");
     const zphysics_mod = zphysics_dep.module("root");
     const vendor_path = b.path("engine/vendor");
 
@@ -192,7 +193,7 @@ fn buildEngineModules(
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "zig-ecs", .module = ecs_mod },
+            .{ .name = "zflecs", .module = ecs_mod },
             .{ .name = "core_components", .module = core_components_mod },
             .{ .name = "lua", .module = lua_mod },
             .{ .name = "geometry", .module = geometry_mod },
@@ -207,7 +208,7 @@ fn buildEngineModules(
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "zig-ecs", .module = ecs_mod },
+            .{ .name = "zflecs", .module = ecs_mod },
             .{ .name = "core_components", .module = core_components_mod },
             .{ .name = "engine", .module = engine_mod },
             .{ .name = "geometry", .module = geometry_mod },
@@ -221,7 +222,7 @@ fn buildEngineModules(
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "zig-ecs", .module = ecs_mod },
+            .{ .name = "zflecs", .module = ecs_mod },
             .{ .name = "engine", .module = engine_mod },
             .{ .name = "lua", .module = lua_mod },
         },
@@ -234,7 +235,7 @@ fn buildEngineModules(
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "zig-ecs", .module = ecs_mod },
+            .{ .name = "zflecs", .module = ecs_mod },
             .{ .name = "components", .module = components_mod },
             .{ .name = "component_ops", .module = component_ops_mod },
             .{ .name = "engine", .module = engine_mod },
@@ -270,6 +271,7 @@ fn buildEngineModules(
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
+            .{ .name = "zflecs", .module = ecs_mod },
             .{ .name = "zphysics", .module = zphysics_mod },
             .{ .name = "engine", .module = engine_mod },
         },
@@ -300,6 +302,7 @@ fn buildEngineModules(
         .postprocess = postprocess_mod,
         .lua = lua_mod,
         .joltc = zphysics_dep.artifact("joltc"),
+        .flecs = zflecs_dep.artifact("flecs"),
     };
 }
 
@@ -307,7 +310,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const entt = b.dependency("entt", .{
+    const zflecs_dep = b.dependency("zflecs", .{
         .target = target,
         .optimize = optimize,
     });
@@ -320,7 +323,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Game executable
-    const game_mods = buildEngineModules(b, target, optimize, entt, zphysics_dep, "game/components.zig");
+    const game_mods = buildEngineModules(b, target, optimize, zflecs_dep, zphysics_dep, "game/components.zig");
     addShaders(b, game_mods.renderer, game_mods.postprocess);
 
     const game_exe = b.addExecutable(.{
@@ -336,6 +339,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     game_exe.linkLibrary(game_mods.joltc);
+    game_exe.linkLibrary(game_mods.flecs);
     addLinkDeps(b, game_exe);
     b.installArtifact(game_exe);
 
@@ -348,7 +352,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&game_run.step);
 
     // Examples executable
-    const examples_mods = buildEngineModules(b, target, optimize, entt, zphysics_dep, "examples/components.zig");
+    const examples_mods = buildEngineModules(b, target, optimize, zflecs_dep, zphysics_dep, "examples/components.zig");
     addShaders(b, examples_mods.renderer, examples_mods.postprocess);
 
     const examples_exe = b.addExecutable(.{
@@ -364,6 +368,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     examples_exe.linkLibrary(examples_mods.joltc);
+    examples_exe.linkLibrary(examples_mods.flecs);
     addLinkDeps(b, examples_exe);
     b.installArtifact(examples_exe);
 
@@ -392,7 +397,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const test_mods = buildEngineModules(b, target, optimize, entt, zphysics_dep, "examples/components.zig");
+    const test_mods = buildEngineModules(b, target, optimize, zflecs_dep, zphysics_dep, "examples/components.zig");
     addShaders(b, test_mods.renderer, test_mods.postprocess);
 
     const integration_tests = b.addTest(.{
@@ -408,6 +413,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     integration_tests.linkLibrary(test_mods.joltc);
+    integration_tests.linkLibrary(test_mods.flecs);
     addLinkDeps(b, integration_tests);
 
     const test_step = b.step("test", "Run all tests");

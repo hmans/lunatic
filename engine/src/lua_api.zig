@@ -6,8 +6,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const components = @import("components");
-const ecs = @import("zig-ecs");
+const ecs = @import("zflecs");
 const engine_mod = @import("engine");
+const queryInit = engine_mod.queryInit;
 const Engine = engine_mod.Engine;
 const c = engine_mod.c;
 const gltf_mod = engine_mod.gltf;
@@ -33,6 +34,11 @@ const ComponentOps = component_ops.ComponentOps;
 
 const ops_table = component_ops.makeComponentOps(components.all);
 
+/// Expose the component type tuple so engine.zig can register them with flecs.
+pub fn componentTypes() @TypeOf(components.all) {
+    return components.all;
+}
+
 const OpsResult = struct { ops: ComponentOps, index: u8 };
 
 fn findOps(name: []const u8) ?OpsResult {
@@ -47,7 +53,7 @@ fn findOps(name: []const u8) ?OpsResult {
 // ============================================================
 
 const ComponentRef = extern struct {
-    entity_id: u32,
+    entity_id: ecs.entity_t,
     ops_index: u8,
 };
 
@@ -179,21 +185,20 @@ fn getEngine(L: ?*lc.lua_State) *Engine {
     return @ptrCast(@alignCast(ptr));
 }
 
-const EntityResult = struct { entity: ecs.Entity, valid: bool };
+const EntityResult = struct { entity: ecs.entity_t, valid: bool };
 
 fn entityFromLua(self: *Engine, L: ?*lc.lua_State, idx: c_int) EntityResult {
-    const id: u32 = @intCast(lc.luaL_checkinteger(L, idx));
-    const entity: ecs.Entity = @bitCast(id);
-    if (!self.registry.valid(entity)) {
+    const id: ecs.entity_t = @intCast(lc.luaL_checkinteger(L, idx));
+    if (!ecs.is_alive(self.world, id)) {
         _ = lc.lua_pushfstring(L, "invalid entity %d", @as(c_int, @intCast(id)));
-        return .{ .entity = entity, .valid = false };
+        return .{ .entity = id, .valid = false };
     }
-    return .{ .entity = entity, .valid = true };
+    return .{ .entity = id, .valid = true };
 }
 
 /// Helper: get entity or raise Lua error safely via C helper.
 /// Returns null if entity is invalid (Lua error raised, caller must return immediately).
-fn getEntityOrError(self: *Engine, L: ?*lc.lua_State, idx: c_int) ?ecs.Entity {
+fn getEntityOrError(self: *Engine, L: ?*lc.lua_State, idx: c_int) ?ecs.entity_t {
     const result = entityFromLua(self, L, idx);
     if (!result.valid) return null; // error string already pushed
     return result.entity;
@@ -239,9 +244,8 @@ fn checkFloat(L: ?*lc.lua_State, idx: c_int) f32 {
 
 fn luaSpawn(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = self.registry.create();
-    const entity_int: u32 = @bitCast(entity);
-    lc.lua_pushinteger(L, @intCast(entity_int));
+    const entity = ecs.new_id(self.world);
+    lc.lua_pushinteger(L, @intCast(entity));
     return 1;
 }
 
@@ -249,14 +253,14 @@ fn luaDestroy(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const entity = getEntityOrError(self, L, 1) orelse return lunatic_lua_error(L);
     // Clean up physics body if present
-    if (self.registry.tryGet(core_comp.RigidBody, entity)) |rb| {
+    if (ecs.get(self.world, entity, core_comp.RigidBody)) |rb| {
         const body_id: phys.BodyId = @enumFromInt(rb.body_id);
         if (body_id != .invalid) {
             phys.getBodyInterface(self).removeAndDestroyBody(body_id);
         }
     }
-    removeFromAllLiveQueries(self, @bitCast(entity));
-    self.registry.destroy(entity);
+    removeFromAllLiveQueries(self, entity);
+    ecs.delete(self.world, entity);
     return 0;
 }
 
@@ -289,7 +293,7 @@ fn luaRemove(L: ?*lc.lua_State) callconv(.c) c_int {
     const entity = getEntityOrError(self, L, 1) orelse return lunatic_lua_error(L);
     const name = componentName(L, 2);
     if (findOps(name)) |found| {
-        found.ops.removeFn(&self.registry, entity);
+        found.ops.removeFn(self, entity);
         updateLiveQueries(self, entity);
         return 0;
     }
@@ -308,26 +312,26 @@ const allocator = std.heap.c_allocator;
 /// Updated incrementally when components are added/removed/destroyed.
 pub const LiveQuery = struct {
     mask: u32 = 0, // bitmask over ops_table indices
-    entities: std.ArrayListUnmanaged(u32) = .{},
-    index_of: std.AutoHashMapUnmanaged(u32, u32) = .{}, // entity_id → dense index
+    entities: std.ArrayListUnmanaged(ecs.entity_t) = .{},
+    index_of: std.AutoHashMapUnmanaged(ecs.entity_t, u32) = .{}, // entity_id → dense index
 
     pub fn deinit(self: *LiveQuery) void {
         self.entities.deinit(allocator);
         self.index_of.deinit(allocator);
     }
 
-    pub fn contains(self: *const LiveQuery, entity_id: u32) bool {
+    pub fn contains(self: *const LiveQuery, entity_id: ecs.entity_t) bool {
         return self.index_of.contains(entity_id);
     }
 
-    pub fn add(self: *LiveQuery, entity_id: u32) void {
+    pub fn add(self: *LiveQuery, entity_id: ecs.entity_t) void {
         if (self.index_of.contains(entity_id)) return;
         const idx: u32 = @intCast(self.entities.items.len);
         self.entities.append(allocator, entity_id) catch return;
         self.index_of.put(allocator, entity_id, idx) catch return;
     }
 
-    pub fn remove(self: *LiveQuery, entity_id: u32) void {
+    pub fn remove(self: *LiveQuery, entity_id: ecs.entity_t) void {
         const idx = self.index_of.get(entity_id) orelse return;
         const last: u32 = @intCast(self.entities.items.len - 1);
         if (idx != last) {
@@ -339,38 +343,37 @@ pub const LiveQuery = struct {
         _ = self.index_of.remove(entity_id);
     }
 
-    pub fn data(self: *const LiveQuery) []const u32 {
+    pub fn data(self: *const LiveQuery) []const ecs.entity_t {
         return self.entities.items;
     }
 };
 
 /// Check whether an entity has all components indicated by the mask.
-fn entityMatchesMask(registry: *ecs.Registry, entity: ecs.Entity, mask: u32) bool {
+fn entityMatchesMask(engine: *Engine, entity: ecs.entity_t, mask: u32) bool {
     var m = mask;
     while (m != 0) {
         const bit: u5 = @intCast(@ctz(m));
-        if (!ops_table[bit].hasFn(registry, entity)) return false;
+        if (!ops_table[bit].hasFn(engine, entity)) return false;
         m &= m - 1;
     }
     return true;
 }
 
 /// After a component is added or removed, update all live queries for this entity.
-fn updateLiveQueries(self: *Engine, entity: ecs.Entity) void {
-    const entity_id: u32 = @bitCast(entity);
+fn updateLiveQueries(self: *Engine, entity: ecs.entity_t) void {
     for (self.live_queries[0..self.live_query_count]) |*lq| {
-        const matches = entityMatchesMask(&self.registry, entity, lq.mask);
-        const present = lq.contains(entity_id);
+        const matches = entityMatchesMask(self, entity, lq.mask);
+        const present = lq.contains(entity);
         if (matches and !present) {
-            lq.add(entity_id);
+            lq.add(entity);
         } else if (!matches and present) {
-            lq.remove(entity_id);
+            lq.remove(entity);
         }
     }
 }
 
 /// Remove an entity from all live queries (called before destroy).
-fn removeFromAllLiveQueries(self: *Engine, entity_id: u32) void {
+fn removeFromAllLiveQueries(self: *Engine, entity_id: ecs.entity_t) void {
     for (self.live_queries[0..self.live_query_count]) |*lq| {
         lq.remove(entity_id);
     }
@@ -394,32 +397,23 @@ fn resolveQueryOps(L: ?*lc.lua_State, ops: []ComponentOps, count: usize) bool {
 }
 
 fn findSmallestAndBuild(self: *Engine, L: ?*lc.lua_State, ops: []const ComponentOps, count: usize) void {
-    var smallest_idx: usize = 0;
-    var smallest_len: usize = ops[0].lenFn(&self.registry);
-    for (1..count) |i| {
-        const l = ops[i].lenFn(&self.registry);
-        if (l < smallest_len) {
-            smallest_len = l;
-            smallest_idx = i;
-        }
+    // Build a flecs query from the component IDs and iterate it.
+    // This replaces the old "smallest set + filter" approach — flecs handles
+    // the intersection natively via archetype matching.
+    var comp_ids: [16]ecs.id_t = undefined;
+    for (0..count) |i| {
+        comp_ids[i] = ops[i].idFn();
     }
+    const q = queryInit(self.world, comp_ids[0..count], &.{});
+    defer ecs.query_fini(q);
 
-    const entity_list = ops[smallest_idx].dataFn(&self.registry);
-    lc.lua_createtable(L, @intCast(smallest_len), 0);
+    lc.lua_newtable(L);
     var table_idx: c_int = 1;
+    var it = ecs.query_iter(self.world, q);
 
-    for (entity_list) |entity| {
-        var match = true;
-        for (0..count) |i| {
-            if (i == smallest_idx) continue;
-            if (!ops[i].hasFn(&self.registry, entity)) {
-                match = false;
-                break;
-            }
-        }
-        if (match) {
-            const entity_int: u32 = @bitCast(entity);
-            lc.lua_pushinteger(L, @intCast(entity_int));
+    while (ecs.query_next(&it)) {
+        for (it.entities()) |entity| {
+            lc.lua_pushinteger(L, @intCast(entity));
             lc.lua_rawseti(L, -2, table_idx);
             table_idx += 1;
         }
@@ -465,43 +459,28 @@ fn luaEach(L: ?*lc.lua_State) callconv(.c) c_int {
         return 0;
     }
 
-    var ops: [16]ComponentOps = undefined;
+    // Build flecs query from component names
+    var comp_ids: [16]ecs.id_t = undefined;
     for (0..comp_count) |i| {
         const name = std.mem.span(lc.luaL_checklstring(L, @intCast(i + 1), null));
         if (findOps(name)) |found| {
-            ops[i] = found.ops;
+            comp_ids[i] = found.ops.idFn();
         } else {
             _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, @intCast(i + 1), null));
             return 0;
         }
     }
 
-    // Find smallest component set
-    var smallest_idx: usize = 0;
-    var smallest_len: usize = ops[0].lenFn(&self.registry);
-    for (1..comp_count) |i| {
-        const l = ops[i].lenFn(&self.registry);
-        if (l < smallest_len) {
-            smallest_len = l;
-            smallest_idx = i;
-        }
-    }
+    const q = queryInit(self.world, comp_ids[0..comp_count], &.{});
+    defer ecs.query_fini(q);
 
     // Iterate and call callback per matching entity
-    const entity_list = ops[smallest_idx].dataFn(&self.registry);
-    for (entity_list) |entity| {
-        var match = true;
-        for (0..comp_count) |i| {
-            if (i == smallest_idx) continue;
-            if (!ops[i].hasFn(&self.registry, entity)) {
-                match = false;
-                break;
-            }
-        }
-        if (match) {
+    var it = ecs.query_iter(self.world, q);
+
+    while (ecs.query_next(&it)) {
+        for (it.entities()) |entity| {
             lc.lua_pushvalue(L, nargs); // push callback
-            const entity_int: u32 = @bitCast(entity);
-            lc.lua_pushinteger(L, @intCast(entity_int));
+            lc.lua_pushinteger(L, @intCast(entity));
             // Use lua_call (not pcall) — errors propagate to the system-level
             // pcall in runLuaSystems, avoiding per-entity error handler overhead.
             lc.lua_call(L, 1, 0);
@@ -527,9 +506,9 @@ fn luaCreateQuery(L: ?*lc.lua_State) callconv(.c) c_int {
         return 0;
     }
 
-    // Build mask and resolve ops for initial population
+    // Build mask and resolve component IDs for initial population
     var mask: u32 = 0;
-    var ops: [16]ComponentOps = undefined;
+    var comp_ids: [16]ecs.id_t = undefined;
     const count: usize = @intCast(nargs);
     if (count > 16) {
         _ = lc.luaL_error(L, "create_query supports at most 16 components");
@@ -539,7 +518,7 @@ fn luaCreateQuery(L: ?*lc.lua_State) callconv(.c) c_int {
         const name = std.mem.span(lc.luaL_checklstring(L, @intCast(i + 1), null));
         if (findOps(name)) |found| {
             mask |= @as(u32, 1) << @as(u5, @intCast(found.index));
-            ops[i] = found.ops;
+            comp_ids[i] = found.ops.idFn();
         } else {
             _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, @intCast(i + 1), null));
             return 0;
@@ -551,20 +530,14 @@ fn luaCreateQuery(L: ?*lc.lua_State) callconv(.c) c_int {
     self.live_queries[idx] = .{ .mask = mask };
     self.live_query_count += 1;
 
-    // Populate with existing matching entities (iterate smallest set, filter)
-    var smallest_idx: usize = 0;
-    var smallest_len: usize = ops[0].lenFn(&self.registry);
-    for (1..count) |i| {
-        const l = ops[i].lenFn(&self.registry);
-        if (l < smallest_len) {
-            smallest_len = l;
-            smallest_idx = i;
-        }
-    }
-    const entity_list = ops[smallest_idx].dataFn(&self.registry);
-    for (entity_list) |entity| {
-        if (entityMatchesMask(&self.registry, entity, mask)) {
-            self.live_queries[idx].add(@bitCast(entity));
+    // Populate with existing matching entities using a flecs query
+    const q = queryInit(self.world, comp_ids[0..count], &.{});
+    defer ecs.query_fini(q);
+    var it = ecs.query_iter(self.world, q);
+
+    while (ecs.query_next(&it)) {
+        for (it.entities()) |entity| {
+            self.live_queries[idx].add(entity);
         }
     }
 
@@ -584,9 +557,9 @@ fn luaEachQuery(L: ?*lc.lua_State) callconv(.c) c_int {
     }
 
     const entities = self.live_queries[handle - 1].data();
-    for (entities) |entity_id| {
+    for (entities) |entity| {
         lc.lua_pushvalue(L, 2);
-        lc.lua_pushinteger(L, @intCast(entity_id));
+        lc.lua_pushinteger(L, @intCast(entity));
         lc.lua_call(L, 1, 0);
     }
     return 0;
@@ -599,16 +572,15 @@ fn luaEachQuery(L: ?*lc.lua_State) callconv(.c) c_int {
 fn luaRef(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const entity = getEntityOrError(self, L, 1) orelse return lunatic_lua_error(L);
-    const entity_id: u32 = @bitCast(entity);
     const name = componentName(L, 2);
 
     if (findOps(name)) |found| {
-        if (!found.ops.hasFn(&self.registry, entity)) {
-            _ = lc.luaL_error(L, "entity %d has no component '%s'", @as(c_int, @intCast(entity_id)), lc.luaL_checklstring(L, 2, null));
+        if (!found.ops.hasFn(self, entity)) {
+            _ = lc.luaL_error(L, "entity has no component '%s'", lc.luaL_checklstring(L, 2, null));
             return 0;
         }
         const ptr: *ComponentRef = @ptrCast(@alignCast(lc.lua_newuserdata(L, @sizeOf(ComponentRef))));
-        ptr.* = .{ .entity_id = entity_id, .ops_index = found.index };
+        ptr.* = .{ .entity_id = entity, .ops_index = found.index };
         lc.luaL_getmetatable(L, ref_metatable_name);
         _ = lc.lua_setmetatable(L, -2);
         return 1;
@@ -621,10 +593,10 @@ fn refIndex(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const ptr: *const ComponentRef = @ptrCast(@alignCast(lc.lua_touserdata(L, 1) orelse return 0));
     const field_name = std.mem.span(lc.luaL_checklstring(L, 2, null));
-    const entity: ecs.Entity = @bitCast(ptr.entity_id);
+    const entity = ptr.entity_id;
 
-    if (!self.registry.valid(entity)) {
-        _ = lc.luaL_error(L, "stale ref: entity %d has been destroyed", @as(c_int, @intCast(ptr.entity_id)));
+    if (!ecs.is_alive(self.world, entity)) {
+        _ = lc.luaL_error(L, "stale ref: entity has been destroyed");
         return 0;
     }
 
@@ -636,7 +608,7 @@ fn refIndex(L: ?*lc.lua_State) callconv(.c) c_int {
         return 0;
     }
     // Tag component — return boolean presence
-    lc.lua_pushboolean(L, if (ops.hasFn(&self.registry, entity)) 1 else 0);
+    lc.lua_pushboolean(L, if (ops.hasFn(self, entity)) 1 else 0);
     return 1;
 }
 
@@ -644,10 +616,10 @@ fn refNewIndex(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const ptr: *const ComponentRef = @ptrCast(@alignCast(lc.lua_touserdata(L, 1) orelse return 0));
     const field_name = std.mem.span(lc.luaL_checklstring(L, 2, null));
-    const entity: ecs.Entity = @bitCast(ptr.entity_id);
+    const entity = ptr.entity_id;
 
-    if (!self.registry.valid(entity)) {
-        _ = lc.luaL_error(L, "stale ref: entity %d has been destroyed", @as(c_int, @intCast(ptr.entity_id)));
+    if (!ecs.is_alive(self.world, entity)) {
+        _ = lc.luaL_error(L, "stale ref: entity has been destroyed");
         return 0;
     }
 
@@ -728,7 +700,7 @@ fn luaSetAmbient(L: ?*lc.lua_State) callconv(.c) c_int {
 fn luaSetBloom(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const entity = getEntityOrError(self, L, 1) orelse return lunatic_lua_error(L);
-    const cam = self.registry.tryGet(engine_mod.core_components.Camera, entity) orelse {
+    const cam = ecs.get_mut(self.world, entity, engine_mod.core_components.Camera) orelse {
         _ = lc.lua_pushfstring(L, "set_bloom: entity has no camera component");
         return lunatic_lua_error(L);
     };
@@ -813,7 +785,7 @@ fn luaPhysicsAddBox(L: ?*lc.lua_State) callconv(.c) c_int {
     const hz = checkFloat(L, 4);
     const motion = luaMotionType(L, 5);
 
-    const pos = self.registry.getConst(core_comp.Position, entity);
+    const pos = ecs.get(self.world, entity, core_comp.Position) orelse return 0;
     const shape_settings = phys.BoxShapeSettings.create(.{ hx, hy, hz }) catch return 0;
     const shape = shape_settings.asShapeSettings().createShape() catch return 0;
     defer shape.release();
@@ -834,7 +806,7 @@ fn luaPhysicsAddBox(L: ?*lc.lua_State) callconv(.c) c_int {
         .angular_damping = 0.4,
     }, .activate) catch return 0;
 
-    self.registry.addOrReplace(entity, core_comp.RigidBody{ .body_id = @intFromEnum(body_id) });
+    _ = ecs.set(self.world, entity, core_comp.RigidBody, core_comp.RigidBody{ .body_id = @intFromEnum(body_id) });
     return 0;
 }
 
@@ -848,7 +820,7 @@ fn luaPhysicsAddSphere(L: ?*lc.lua_State) callconv(.c) c_int {
     const restitution: f32 = if (nargs >= 4) checkFloat(L, 4) else 0.0;
     const friction: f32 = if (nargs >= 5) checkFloat(L, 5) else 0.2;
 
-    const pos = self.registry.getConst(core_comp.Position, entity);
+    const pos = ecs.get(self.world, entity, core_comp.Position) orelse return 0;
     const shape_settings = phys.SphereShapeSettings.create(radius) catch return 0;
     const shape = shape_settings.asShapeSettings().createShape() catch return 0;
     defer shape.release();
@@ -865,7 +837,7 @@ fn luaPhysicsAddSphere(L: ?*lc.lua_State) callconv(.c) c_int {
         .angular_damping = 0.4,
     }, .activate) catch return 0;
 
-    self.registry.addOrReplace(entity, core_comp.RigidBody{ .body_id = @intFromEnum(body_id) });
+    _ = ecs.set(self.world, entity, core_comp.RigidBody, core_comp.RigidBody{ .body_id = @intFromEnum(body_id) });
     return 0;
 }
 
