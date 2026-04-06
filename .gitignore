@@ -3,4 +3,4 @@ zig-out/
 .DS_Store
 imgui.ini
 tmp/
-node_modules/
+**/node_modules/
