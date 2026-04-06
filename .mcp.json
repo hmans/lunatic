@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "lunatic-engine": {
+      "command": "node",
+      "args": ["mcp/server.mjs"],
+      "env": {}
+    }
+  }
+}

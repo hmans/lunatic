@@ -11,6 +11,7 @@ pub const postprocess = @import("postprocess");
 pub const physics = @import("physics");
 const lua_api = @import("lua_api");
 pub const gltf = @import("gltf");
+pub const debug_server = @import("debug_server");
 
 pub const core_components = @import("core_components");
 const lua = @import("lua");
@@ -305,6 +306,9 @@ pub const Engine = struct {
     // Lua
     lua_state: ?*lc.lua_State = null,
 
+    // Debug server (HTTP API for external tools)
+    dbg_server: debug_server.DebugServer = .{},
+
     // State
     headless: bool = false,
     debug_stats: bool = false,
@@ -349,6 +353,7 @@ pub const Engine = struct {
         for (self.live_queries[0..self.live_query_count]) |*lq| lq.deinit();
         if (self.lua_state) |L| lc.lua_close(L);
 
+        self.dbg_server.stop();
         physics.deinitPhysics(self);
         if (self.gpu_device) |_| {
             c.cImGui_ImplSDLGPU3_Shutdown();
@@ -393,6 +398,12 @@ pub const Engine = struct {
     pub fn run(self: *Engine) !void {
         const device = self.gpu_device orelse return error.NotInitialized;
 
+        // Start debug server (non-fatal if it fails)
+        self.dbg_server.start(self) catch |err| {
+            std.debug.print("[debug-server] failed to start: {}\n", .{err});
+        };
+        defer self.dbg_server.stop();
+
         var running = true;
         var last_time = c.SDL_GetPerformanceCounter();
         const freq: f64 = @floatFromInt(c.SDL_GetPerformanceFrequency());
@@ -425,6 +436,9 @@ pub const Engine = struct {
             c.igNewFrame();
 
             self.runAllSystems(dt);
+
+            // Process debug server requests (after systems, before rendering)
+            self.dbg_server.drainRequests();
 
             // Physics stats
             if (self.physics.system) |phys_sys| {
@@ -595,6 +609,8 @@ pub const Engine = struct {
 
                 self.downloadScreenshot(device, cmd, sw_w, sw_h);
                 self.screenshot_requested = false;
+                // If this screenshot was triggered by the debug server, complete the HTTP response
+                self.dbg_server.completeScreenshot();
             } else {
                 _ = c.SDL_SubmitGPUCommandBuffer(cmd);
             }

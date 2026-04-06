@@ -274,12 +274,24 @@ fn buildEngineModules(
         },
     });
 
+    const debug_server_mod = b.createModule(.{
+        .root_source_file = b.path("engine/src/debug_server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = engine_mod },
+            .{ .name = "lua", .module = lua_mod },
+        },
+    });
+
     // Wire cross-module deps
     engine_mod.addImport("renderer", renderer_mod);
     engine_mod.addImport("postprocess", postprocess_mod);
     engine_mod.addImport("physics", physics_mod);
     engine_mod.addImport("lua_api", lua_api_mod);
     engine_mod.addImport("gltf", gltf_mod);
+    engine_mod.addImport("debug_server", debug_server_mod);
 
     return .{
         .engine = engine_mod,
