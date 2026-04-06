@@ -51,6 +51,7 @@ jobs:
           build-type: Release
           cmake-arguments: "-DSDL_UNIX_CONSOLE_BUILD=ON -DSDL_STATIC=OFF -DSDL_SHARED=ON"
           add-to-environment: true
+          discriminator: ${{ matrix.os }}
 
       # Other dependencies
       - name: Install dependencies (macOS)
