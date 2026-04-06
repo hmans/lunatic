@@ -14,6 +14,16 @@ const gltf_mod = engine_mod.gltf;
 
 const lua = @import("lua");
 const lc = lua.c;
+
+// Safe error raising — calls lua_error from C to avoid longjmp through Zig frames.
+extern fn lunatic_lua_error(L: ?*lc.lua_State) c_int;
+extern fn lunatic_luaL_error(L: ?*lc.lua_State, msg: [*:0]const u8) c_int;
+
+/// Raise a Lua error safely from Zig. Pushes the error string and calls lua_error from C.
+/// Use: `return raiseError(L, "msg")` or after `lua_pushfstring`: `return lunatic_lua_error(L)`
+fn raiseError(L: ?*lc.lua_State, msg: [*:0]const u8) c_int {
+    return lunatic_luaL_error(L, msg);
+}
 const component_ops = @import("component_ops");
 const ComponentOps = component_ops.ComponentOps;
 
@@ -169,13 +179,24 @@ fn getEngine(L: ?*lc.lua_State) *Engine {
     return @ptrCast(@alignCast(ptr));
 }
 
-fn entityFromLua(self: *Engine, L: ?*lc.lua_State, idx: c_int) ecs.Entity {
+const EntityResult = struct { entity: ecs.Entity, valid: bool };
+
+fn entityFromLua(self: *Engine, L: ?*lc.lua_State, idx: c_int) EntityResult {
     const id: u32 = @intCast(lc.luaL_checkinteger(L, idx));
     const entity: ecs.Entity = @bitCast(id);
     if (!self.registry.valid(entity)) {
-        _ = lc.luaL_error(L, "invalid entity %d", @as(c_int, @intCast(id)));
+        _ = lc.lua_pushfstring(L, "invalid entity %d", @as(c_int, @intCast(id)));
+        return .{ .entity = entity, .valid = false };
     }
-    return entity;
+    return .{ .entity = entity, .valid = true };
+}
+
+/// Helper: get entity or raise Lua error safely via C helper.
+/// Returns null if entity is invalid (Lua error raised, caller must return immediately).
+fn getEntityOrError(self: *Engine, L: ?*lc.lua_State, idx: c_int) ?ecs.Entity {
+    const result = entityFromLua(self, L, idx);
+    if (!result.valid) return null; // error string already pushed
+    return result.entity;
 }
 
 fn componentName(L: ?*lc.lua_State, idx: c_int) []const u8 {
@@ -226,7 +247,7 @@ fn luaSpawn(L: ?*lc.lua_State) callconv(.c) c_int {
 
 fn luaDestroy(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lunatic_lua_error(L);
     // Clean up physics body if present
     if (self.registry.tryGet(core_comp.RigidBody, entity)) |rb| {
         const body_id: phys.BodyId = @enumFromInt(rb.body_id);
@@ -241,7 +262,7 @@ fn luaDestroy(L: ?*lc.lua_State) callconv(.c) c_int {
 
 fn luaAdd(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lunatic_lua_error(L);
     const name = componentName(L, 2);
     if (findOps(name)) |found| {
         found.ops.addFn(self, entity, L, 3);
@@ -254,7 +275,7 @@ fn luaAdd(L: ?*lc.lua_State) callconv(.c) c_int {
 
 fn luaGet(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lunatic_lua_error(L);
     const name = componentName(L, 2);
     if (findOps(name)) |found| {
         return found.ops.getFn(self, entity, L);
@@ -265,7 +286,7 @@ fn luaGet(L: ?*lc.lua_State) callconv(.c) c_int {
 
 fn luaRemove(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lunatic_lua_error(L);
     const name = componentName(L, 2);
     if (findOps(name)) |found| {
         found.ops.removeFn(&self.registry, entity);
@@ -577,7 +598,7 @@ fn luaEachQuery(L: ?*lc.lua_State) callconv(.c) c_int {
 
 fn luaRef(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lunatic_lua_error(L);
     const entity_id: u32 = @bitCast(entity);
     const name = componentName(L, 2);
 
@@ -706,10 +727,10 @@ fn luaSetAmbient(L: ?*lc.lua_State) callconv(.c) c_int {
 /// intensity = 0 disables bloom (just tonemapping).
 fn luaSetBloom(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lunatic_lua_error(L);
     const cam = self.registry.tryGet(engine_mod.core_components.Camera, entity) orelse {
-        _ = lc.luaL_error(L, "set_bloom: entity has no camera component");
-        unreachable;
+        _ = lc.lua_pushfstring(L, "set_bloom: entity has no camera component");
+        return lunatic_lua_error(L);
     };
     const nargs = lc.lua_gettop(L);
     if (nargs >= 2) cam.bloom_intensity = checkFloat(L, 2);
@@ -786,7 +807,7 @@ const phys = engine_mod.physics;
 /// Creates a Jolt box body and sets the entity's rigid_body component.
 fn luaPhysicsAddBox(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lunatic_lua_error(L);
     const hx = checkFloat(L, 2);
     const hy = checkFloat(L, 3);
     const hz = checkFloat(L, 4);
@@ -809,6 +830,8 @@ fn luaPhysicsAddBox(L: ?*lc.lua_State) callconv(.c) c_int {
         .object_layer = if (motion == .static) phys.object_layers.non_moving else phys.object_layers.moving,
         .restitution = restitution,
         .friction = friction,
+        .linear_damping = 0.2,
+        .angular_damping = 0.4,
     }, .activate) catch return 0;
 
     self.registry.addOrReplace(entity, core_comp.RigidBody{ .body_id = @intFromEnum(body_id) });
@@ -818,7 +841,7 @@ fn luaPhysicsAddBox(L: ?*lc.lua_State) callconv(.c) c_int {
 /// lunatic.physics_add_sphere(entity, radius, motion_type, restitution, friction)
 fn luaPhysicsAddSphere(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
-    const entity = entityFromLua(self, L, 1);
+    const entity = getEntityOrError(self, L, 1) orelse return lunatic_lua_error(L);
     const radius = checkFloat(L, 2);
     const motion = luaMotionType(L, 3);
     const nargs = lc.lua_gettop(L);
@@ -838,6 +861,8 @@ fn luaPhysicsAddSphere(L: ?*lc.lua_State) callconv(.c) c_int {
         .object_layer = if (motion == .static) phys.object_layers.non_moving else phys.object_layers.moving,
         .restitution = restitution,
         .friction = friction,
+        .linear_damping = 0.2,
+        .angular_damping = 0.4,
     }, .activate) catch return 0;
 
     self.registry.addOrReplace(entity, core_comp.RigidBody{ .body_id = @intFromEnum(body_id) });
@@ -990,8 +1015,8 @@ fn luaUiCond(L: ?*lc.lua_State, idx: c_int) c_int {
 fn luaCreateCubeMesh(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const id = self.createCubeMesh() catch {
-        _ = lc.luaL_error(L, "failed to create cube mesh");
-        unreachable;
+        _ = lc.lua_pushfstring(L, "failed to create cube mesh");
+        return lunatic_lua_error(L);
     };
     lc.lua_pushinteger(L, @intCast(id));
     return 1;
@@ -1012,8 +1037,8 @@ fn luaCreateSphereMesh(L: ?*lc.lua_State) callconv(.c) c_int {
         break :blk r;
     } else 16;
     const id = self.createSphereMesh(segments, rings) catch {
-        _ = lc.luaL_error(L, "failed to create sphere mesh");
-        unreachable;
+        _ = lc.lua_pushfstring(L, "failed to create sphere mesh");
+        return lunatic_lua_error(L);
     };
     lc.lua_pushinteger(L, @intCast(id));
     return 1;
@@ -1066,8 +1091,8 @@ fn luaCreateMaterial(L: ?*lc.lua_State) callconv(.c) c_int {
     lc.lua_pop(L, 1);
 
     const id = self.createMaterial(data) catch {
-        _ = lc.luaL_error(L, "too many materials");
-        unreachable;
+        _ = lc.lua_pushfstring(L, "too many materials");
+        return lunatic_lua_error(L);
     };
     lc.lua_pushinteger(L, @intCast(id));
     return 1;
@@ -1092,8 +1117,8 @@ fn luaLoadGltf(L: ?*lc.lua_State) callconv(.c) c_int {
     const path = lc.luaL_checklstring(L, 1, null);
 
     var model = gltf_mod.load(self, path) catch {
-        _ = lc.luaL_error(L, "failed to load gltf: %s", path);
-        unreachable;
+        _ = lc.lua_pushfstring(L, "failed to load gltf: %s", path);
+        return lunatic_lua_error(L);
     };
     defer model.deinit();
 

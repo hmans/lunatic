@@ -54,23 +54,60 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) 
     addShader(b, pp_mod, "postprocess", "lensflare", "frag", .fragment);
 }
 
+/// Add all system include/lib paths from known prefixes where dependencies are found.
+fn addSystemPaths(mod: *std.Build.Module, allocator: std.mem.Allocator) void {
+    // Check SDL3_PREFIX env var (set by setup-sdl in CI)
+    const env_prefix: ?[]const u8 = std.process.getEnvVarOwned(allocator, "SDL3_PREFIX") catch null;
+
+    var prefix_list: [4][]const u8 = undefined;
+    var prefix_count: usize = 0;
+    if (env_prefix) |p| {
+        prefix_list[prefix_count] = p;
+        prefix_count += 1;
+    }
+    for ([_][]const u8{ "/opt/homebrew", "/usr/local", "/usr" }) |p| {
+        prefix_list[prefix_count] = p;
+        prefix_count += 1;
+    }
+    const prefixes = prefix_list[0..prefix_count];
+
+    for (prefixes) |prefix| {
+        const inc = std.fmt.allocPrint(allocator, "{s}/include", .{prefix}) catch continue;
+        const lib = std.fmt.allocPrint(allocator, "{s}/lib", .{prefix}) catch continue;
+
+        // Check if this prefix has anything useful (SDL3 or LuaJIT)
+        const sdl_check = std.fmt.allocPrint(allocator, "{s}/include/SDL3/SDL.h", .{prefix}) catch continue;
+        const has_sdl = if (std.fs.cwd().access(sdl_check, .{})) |_| true else |_| false;
+
+        const luajit_check = std.fmt.allocPrint(allocator, "{s}/include/luajit-2.1", .{prefix}) catch continue;
+        const has_luajit = if (std.fs.cwd().access(luajit_check, .{})) |_| true else |_| false;
+
+        if (has_sdl or has_luajit) {
+            mod.addIncludePath(.{ .cwd_relative = inc });
+            mod.addLibraryPath(.{ .cwd_relative = lib });
+        }
+        if (has_luajit) {
+            mod.addIncludePath(.{ .cwd_relative = std.fmt.allocPrint(allocator, "{s}/include/luajit-2.1", .{prefix}) catch continue });
+        }
+    }
+}
+
 /// Add C include paths for @cImport to a module.
-// TODO: Replace hardcoded /opt/homebrew paths with pkg-config or env vars for cross-platform builds.
 fn addCIncludes(b: *std.Build, mod: *std.Build.Module, vendor_path: std.Build.LazyPath) void {
-    mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/luajit-2.1" });
+    addSystemPaths(mod, b.allocator);
     mod.addIncludePath(vendor_path);
     mod.addIncludePath(b.path("engine/vendor/imgui"));
 }
 
 /// Configure shared link dependencies on a compile step.
 fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
-    compile.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    addSystemPaths(compile.root_module, b.allocator);
     compile.linkSystemLibrary("SDL3");
     compile.linkSystemLibrary("luajit-5.1");
     compile.addCSourceFile(.{ .file = b.path("engine/vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
     compile.addCSourceFile(.{ .file = b.path("engine/vendor/stb_image_write_impl.c"), .flags = &.{"-std=c99"} });
     compile.addCSourceFile(.{ .file = b.path("engine/vendor/cgltf_impl.c"), .flags = &.{"-std=c99"} });
+    compile.addCSourceFile(.{ .file = b.path("engine/vendor/lua_error_helper.c"), .flags = &.{"-std=c99"} });
 
     // Dear ImGui (C++ core + C wrapper + SDL3/GPU backends)
     const imgui_flags: []const []const u8 = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-DIMGUI_IMPL_API=extern \"C\"" };
@@ -90,7 +127,6 @@ fn addLinkDeps(b: *std.Build, compile: *std.Build.Step.Compile) void {
         compile.addCSourceFile(.{ .file = b.path(src), .flags = imgui_flags });
     }
     compile.addIncludePath(imgui_include);
-    compile.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     compile.linkSystemLibrary("c++");
 }
 

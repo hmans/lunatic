@@ -74,6 +74,8 @@ pub const SystemEntry = struct {
     name_buf: [31:0]u8 = .{0} ** 31,
     kind: SystemKind = .zig,
     time_us: u64 = 0,
+    acc_us: u64 = 0, // accumulated for averaging
+    avg_us: f64 = 0, // display average
     // Payload
     zig_fn: ?ZigSystemFn = null,
     lua_ref: c_int = 0,
@@ -183,12 +185,52 @@ pub const FrameStats = struct {
     entities_rendered: u32 = 0,
     physics_active: u32 = 0,
     physics_total: u32 = 0,
-    // Render sub-timings
-    time_prepare_us: u64 = 0, // draw list build + sort
-    time_instances_us: u64 = 0, // matrix computation + upload
-    time_scene_us: u64 = 0, // scene render pass
-    time_postprocess_us: u64 = 0, // DoF + bloom + composite
-    time_imgui_us: u64 = 0, // ImGui overlay
+    // Render sub-timings (raw + smoothed)
+    time_prepare_us: u64 = 0,
+    time_instances_us: u64 = 0,
+    time_scene_us: u64 = 0,
+    time_postprocess_us: u64 = 0,
+    time_imgui_us: u64 = 0,
+    avg_prepare: f64 = 0,
+    avg_instances: f64 = 0,
+    avg_scene: f64 = 0,
+    avg_postprocess: f64 = 0,
+    avg_imgui: f64 = 0,
+
+    // Accumulate samples, snapshot averages twice per second
+    acc_prepare: u64 = 0,
+    acc_instances: u64 = 0,
+    acc_scene: u64 = 0,
+    acc_postprocess: u64 = 0,
+    acc_imgui: u64 = 0,
+    acc_frames: u32 = 0,
+    snapshot_frames: u32 = 1, // frames in last snapshot (for system avg)
+
+    pub fn accumulate(self: *FrameStats) void {
+        self.acc_prepare += self.time_prepare_us;
+        self.acc_instances += self.time_instances_us;
+        self.acc_scene += self.time_scene_us;
+        self.acc_postprocess += self.time_postprocess_us;
+        self.acc_imgui += self.time_imgui_us;
+        self.acc_frames += 1;
+
+        // Snapshot every ~0.5s (30 frames at 60fps)
+        if (self.acc_frames >= 30) {
+            self.snapshot_frames = self.acc_frames;
+            const n: f64 = @floatFromInt(self.acc_frames);
+            self.avg_prepare = @as(f64, @floatFromInt(self.acc_prepare)) / n;
+            self.avg_instances = @as(f64, @floatFromInt(self.acc_instances)) / n;
+            self.avg_scene = @as(f64, @floatFromInt(self.acc_scene)) / n;
+            self.avg_postprocess = @as(f64, @floatFromInt(self.acc_postprocess)) / n;
+            self.avg_imgui = @as(f64, @floatFromInt(self.acc_imgui)) / n;
+            self.acc_prepare = 0;
+            self.acc_instances = 0;
+            self.acc_scene = 0;
+            self.acc_postprocess = 0;
+            self.acc_imgui = 0;
+            self.acc_frames = 0;
+        }
+    }
 };
 
 pub const Engine = struct {
@@ -516,6 +558,8 @@ pub const Engine = struct {
             const tui1 = c.SDL_GetPerformanceCounter();
             self.stats.time_imgui_us = (tui1 - tui0) * 1_000_000 / pf;
 
+            self.stats.accumulate();
+
             // Screenshot: blit to swapchain + download from intermediate texture
             if (self.screenshot_requested and self.screenshot_texture != null) {
                 // Blit intermediate → swapchain so the frame is still displayed
@@ -556,7 +600,7 @@ pub const Engine = struct {
             }
 
             // Debug stats to console (once per second)
-            if (self.debug_stats and self.current_frame % 60 == 0) {
+            if (self.debug_stats and self.stats.acc_frames == 0 and self.current_frame > 0) {
                 self.printDebugStats();
             }
         }
@@ -577,19 +621,18 @@ pub const Engine = struct {
             s.entities_rendered,
             s.physics_active,
             s.physics_total,
-            @as(f64, @floatFromInt(s.time_prepare_us)) / 1000.0,
-            @as(f64, @floatFromInt(s.time_instances_us)) / 1000.0,
-            @as(f64, @floatFromInt(s.time_scene_us)) / 1000.0,
-            @as(f64, @floatFromInt(s.time_postprocess_us)) / 1000.0,
-            @as(f64, @floatFromInt(s.time_imgui_us)) / 1000.0,
+            s.avg_prepare / 1000.0,
+            s.avg_instances / 1000.0,
+            s.avg_scene / 1000.0,
+            s.avg_postprocess / 1000.0,
+            s.avg_imgui / 1000.0,
         });
 
-        // Per-system breakdown
         for (self.systems[0..self.system_count]) |sys| {
             if (sys.disabled) continue;
             const kind_label: []const u8 = if (sys.kind == .zig) "zig" else "lua";
             std.debug.print("  {d:.2}ms [{s}] {s}\n", .{
-                @as(f64, @floatFromInt(sys.time_us)) / 1000.0,
+                sys.avg_us / 1000.0,
                 kind_label,
                 sys.name(),
             });
@@ -1277,6 +1320,16 @@ pub const Engine = struct {
 
             const t_end = c.SDL_GetPerformanceCounter();
             sys.time_us = (t_end - t_start) * 1_000_000 / perf_freq;
+            sys.acc_us += sys.time_us;
+        }
+
+        // Snapshot system averages on the same cadence as render stats
+        if (self.stats.acc_frames == 0) {
+            const n: f64 = @floatFromInt(@max(self.stats.snapshot_frames, 1));
+            for (self.systems[0..self.system_count]) |*sys2| {
+                sys2.avg_us = @as(f64, @floatFromInt(sys2.acc_us)) / n;
+                sys2.acc_us = 0;
+            }
         }
     }
 
@@ -1310,7 +1363,7 @@ pub const Engine = struct {
             const kind_label: [*:0]const u8 = if (sys.kind == .zig) "zig" else "lua";
             var sys_buf: [128]u8 = undefined;
             const sys_line = std.fmt.bufPrintZ(&sys_buf, "{d:.2}ms [{s}] {s}", .{
-                @as(f64, @floatFromInt(sys.time_us)) / 1000.0,
+                sys.avg_us / 1000.0,
                 kind_label,
                 sys.name(),
             }) catch "???";
@@ -1320,18 +1373,18 @@ pub const Engine = struct {
         // Render sub-phases
         c.igSeparatorText("Render");
 
-        const render_phases = [_]struct { name: []const u8, us: u64 }{
-            .{ .name = "prepare", .us = s.time_prepare_us },
-            .{ .name = "instances", .us = s.time_instances_us },
-            .{ .name = "scene", .us = s.time_scene_us },
-            .{ .name = "postprocess", .us = s.time_postprocess_us },
-            .{ .name = "imgui", .us = s.time_imgui_us },
+        const render_phases = [_]struct { name: []const u8, avg: f64 }{
+            .{ .name = "prepare", .avg = s.avg_prepare },
+            .{ .name = "instances", .avg = s.avg_instances },
+            .{ .name = "scene", .avg = s.avg_scene },
+            .{ .name = "postprocess", .avg = s.avg_postprocess },
+            .{ .name = "imgui", .avg = s.avg_imgui },
         };
 
         for (render_phases) |phase| {
             var phase_buf: [128]u8 = undefined;
             const phase_line = std.fmt.bufPrintZ(&phase_buf, "{d:.2}ms {s}", .{
-                @as(f64, @floatFromInt(phase.us)) / 1000.0,
+                phase.avg / 1000.0,
                 phase.name,
             }) catch "???";
             c.igTextUnformatted(phase_line);
