@@ -40,6 +40,8 @@ fn addShader(
 fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) void {
     addShader(b, mod, "scene", "default", "vert", .vertex);
     addShader(b, mod, "scene", "default", "frag", .fragment);
+    addShader(b, mod, "shadow", "shadow", "vert", .vertex);
+    addShader(b, mod, "shadow", "shadow", "frag", .fragment);
     addShader(b, pp_mod, "postprocess", "fullscreen", "vert", .vertex);
     addShader(b, pp_mod, "postprocess", "downsample", "frag", .fragment);
     addShader(b, pp_mod, "postprocess", "upsample", "frag", .fragment);

@@ -209,6 +209,12 @@ pub const Engine = struct {
     rt_w: u32 = 0,
     rt_h: u32 = 0,
 
+    // Cascaded shadow maps
+    shadow_atlas: ?*c.SDL_GPUTexture = null, // R32_FLOAT color target (stores depth)
+    shadow_depth: ?*c.SDL_GPUTexture = null, // D32_FLOAT depth target (for z-testing)
+    shadow_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    shadow_sampler: ?*c.SDL_GPUSampler = null,
+
     // Scene
     clear_color: [4]f32 = .{ 0.08, 0.08, 0.12, 1.0 },
     ambient_color: [4]f32 = .{ 0.15, 0.15, 0.2, 0.0 },
@@ -318,6 +324,10 @@ pub const Engine = struct {
             if (self.cluster_info_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
             if (self.cluster_index_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
             if (self.cluster_transfer) |t| c.SDL_ReleaseGPUTransferBuffer(device, t);
+            if (self.shadow_atlas) |t| c.SDL_ReleaseGPUTexture(device, t);
+            if (self.shadow_depth) |t| c.SDL_ReleaseGPUTexture(device, t);
+            if (self.shadow_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+            if (self.shadow_sampler) |s| c.SDL_ReleaseGPUSampler(device, s);
             if (self.pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
             if (self.sdl_window) |w| c.SDL_DestroyWindow(w);
             c.SDL_DestroyGPUDevice(device);
@@ -421,18 +431,21 @@ pub const Engine = struct {
             while (cam_iter.next()) |cam_entity| {
                 const cam = cam_view.getConst(core_components.Camera, cam_entity);
 
-                // Phase 2: Instance data (matrix computation + GPU upload)
+                // Phase 2: Shadow map rendering (uploads its own instance data per cascade)
+                const shadow_uniforms = renderer.executeShadowPass(self, cmd, cam_entity, sw_w, sw_h, frame);
+
+                // Phase 2.5: Instance data for scene (re-upload after shadow pass overwrote buffer)
                 const ti0 = c.SDL_GetPerformanceCounter();
                 renderer.uploadInstanceData(self, cmd, cam_entity, sw_w, sw_h, frame);
                 const ti1 = c.SDL_GetPerformanceCounter();
                 self.stats.time_instances_us = (ti1 - ti0) * 1_000_000 / pf;
 
-                // Phase 2.5: Cluster assignment + upload (per-camera)
+                // Phase 2.7: Cluster assignment + upload (per-camera)
                 renderer.updateClusters(self, cmd, cam_entity);
 
                 // Phase 3: Scene render pass
                 const ts0 = c.SDL_GetPerformanceCounter();
-                renderer.executeScenePass(self, cmd, cam_entity, hdr_tex, sw_w, sw_h, frame, cam.exposure);
+                renderer.executeScenePass(self, cmd, cam_entity, hdr_tex, sw_w, sw_h, frame, cam.exposure, shadow_uniforms);
                 const ts1 = c.SDL_GetPerformanceCounter();
                 self.stats.time_scene_us = (ts1 - ts0) * 1_000_000 / pf;
 
@@ -681,6 +694,51 @@ pub const Engine = struct {
 
         // Post-processing (bloom)
         try postprocess.initPostProcess(self);
+
+        // Cascaded shadow maps
+        // Shadow atlas: R32_FLOAT color target (stores depth values, sampleable)
+        self.shadow_atlas = c.SDL_CreateGPUTexture(self.gpu_device.?, &c.SDL_GPUTextureCreateInfo{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = c.SDL_GPU_TEXTUREFORMAT_R32_FLOAT,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = renderer.shadow_atlas_size,
+            .height = renderer.shadow_atlas_size,
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        // Shadow depth: D32_FLOAT for z-testing during shadow pass
+        self.shadow_depth = c.SDL_CreateGPUTexture(self.gpu_device.?, &c.SDL_GPUTextureCreateInfo{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = c.SDL_GPU_TEXTUREFORMAT_D32_FLOAT,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET,
+            .width = renderer.shadow_atlas_size,
+            .height = renderer.shadow_atlas_size,
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        self.shadow_sampler = c.SDL_CreateGPUSampler(self.gpu_device.?, &c.SDL_GPUSamplerCreateInfo{
+            .min_filter = c.SDL_GPU_FILTER_NEAREST,
+            .mag_filter = c.SDL_GPU_FILTER_NEAREST,
+            .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+            .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .mip_lod_bias = 0,
+            .max_anisotropy = 1,
+            .compare_op = 0,
+            .min_lod = 0,
+            .max_lod = 0,
+            .enable_anisotropy = false,
+            .enable_compare = false,
+            .padding1 = 0,
+            .padding2 = 0,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        try renderer.initShadowPipeline(self);
 
         // Dear ImGui
         _ = c.igCreateContext(null);

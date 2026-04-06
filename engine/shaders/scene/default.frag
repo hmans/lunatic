@@ -25,13 +25,20 @@ layout(set = 3, binding = 1) uniform MaterialUniforms {
     vec4 emissive;         // .xyz = emissive factor, .w = has_occlusion
 } mat;
 
+layout(set = 3, binding = 2) uniform ShadowUniforms {
+    mat4 light_vp[4];
+    vec4 cascade_splits;
+    vec4 shadow_params;    // .x = atlas_size, .y = cascade_size, .z = bias, .w = enabled
+} shadow;
+
 layout(set = 2, binding = 0) uniform sampler2D base_color_tex;
 layout(set = 2, binding = 1) uniform sampler2D metallic_roughness_tex;
 layout(set = 2, binding = 2) uniform sampler2D normal_tex;
 layout(set = 2, binding = 3) uniform sampler2D emissive_tex;
 layout(set = 2, binding = 4) uniform sampler2D occlusion_tex;
+layout(set = 2, binding = 5) uniform sampler2D shadow_atlas;
 
-// ---- Clustered Lighting ----
+// ---- Clustered Lighting (storage buffer bindings shifted for shadow uniform) ----
 
 struct GPULight {
     vec4 pos_radius;     // xyz = world position, w = radius
@@ -40,15 +47,15 @@ struct GPULight {
     vec4 cone_params;    // x = cos(inner_cone), y = cos(outer_cone)
 };
 
-layout(std430, set = 1, binding = 2) readonly buffer LightBuffer {
+layout(std430, set = 1, binding = 3) readonly buffer LightBuffer {
     GPULight lights[];
 };
 
-layout(std430, set = 1, binding = 3) readonly buffer ClusterInfoBuffer {
+layout(std430, set = 1, binding = 4) readonly buffer ClusterInfoBuffer {
     uvec2 cluster_infos[];  // x = offset, y = count
 };
 
-layout(std430, set = 1, binding = 4) readonly buffer LightIndexBuffer {
+layout(std430, set = 1, binding = 5) readonly buffer LightIndexBuffer {
     uint light_indices[];
 };
 
@@ -78,7 +85,51 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-// Evaluate a point or spot light using the same PBR BRDF as the directional light
+// ---- Shadow Sampling ----
+
+float sampleShadow(vec3 frag_world_pos) {
+    if (shadow.shadow_params.w < 0.5) return 1.0;
+
+    // Select cascade by view-space distance
+    float view_depth = length(frag_world_pos - scene.camera_pos.xyz);
+
+    int cascade = 3;
+    for (int i = 0; i < 4; i++) {
+        if (view_depth < shadow.cascade_splits[i]) {
+            cascade = i;
+            break;
+        }
+    }
+
+    // Project into shadow space
+    vec4 shadow_coord = shadow.light_vp[cascade] * vec4(frag_world_pos, 1.0);
+    shadow_coord.xyz /= shadow_coord.w;
+
+    // Remap XY from NDC [-1,1] to UV [0,1] (depth is already [0,1] in Vulkan)
+    shadow_coord.xy = shadow_coord.xy * 0.5 + 0.5;
+
+    // Out of bounds = lit
+    if (shadow_coord.x < 0.0 || shadow_coord.x > 1.0 ||
+        shadow_coord.y < 0.0 || shadow_coord.y > 1.0 ||
+        shadow_coord.z < 0.0 || shadow_coord.z > 1.0) return 1.0;
+
+    // Map to atlas tile UV (2x2 grid)
+    vec2 tile_offset;
+    if (cascade == 0)      tile_offset = vec2(0.0, 0.0);
+    else if (cascade == 1) tile_offset = vec2(0.5, 0.0);
+    else if (cascade == 2) tile_offset = vec2(0.0, 0.5);
+    else                   tile_offset = vec2(0.5, 0.5);
+
+    vec2 atlas_uv = shadow_coord.xy * 0.5 + tile_offset;
+
+    // Manual depth comparison (debug: bypass comparison sampler)
+    float bias = shadow.shadow_params.z;
+    float stored_depth = texture(shadow_atlas, atlas_uv).r;
+    return (shadow_coord.z - bias) <= stored_depth ? 1.0 : 0.0;
+}
+
+// ---- Point/Spot Light Evaluation ----
+
 vec3 evaluateLight(GPULight light, vec3 N, vec3 V, float NdotV, vec3 frag_pos,
                    vec3 base_color, float metallic, float roughness, vec3 F0) {
     vec3 L_vec = light.pos_radius.xyz - frag_pos;
@@ -92,7 +143,6 @@ vec3 evaluateLight(GPULight light, vec3 N, vec3 V, float NdotV, vec3 frag_pos,
     if (NdotL <= 0.0) return vec3(0.0);
 
     // Physically-based inverse-square attenuation with smooth window to zero at radius
-    // (UE4-style: inverse square * smooth windowing function)
     float d2 = dist * dist;
     float r2 = radius * radius;
     float ratio4 = (d2 * d2) / (r2 * r2);
@@ -147,7 +197,7 @@ void main() {
 
     // Material parameters
     float metallic = mat.material_params.x;
-    float roughness = max(mat.material_params.y, 0.04); // clamp to avoid division by zero
+    float roughness = max(mat.material_params.y, 0.04);
 
     // Base color
     vec3 base_color = mat.albedo.xyz;
@@ -155,7 +205,7 @@ void main() {
         base_color *= texture(base_color_tex, frag_uv).xyz;
     }
 
-    // Metallic/roughness texture (green = roughness, blue = metallic per glTF spec)
+    // Metallic/roughness texture
     if (mat.texture_flags.y > 0.5) {
         vec3 mr = texture(metallic_roughness_tex, frag_uv).xyz;
         roughness *= mr.g;
@@ -163,9 +213,7 @@ void main() {
         roughness = max(roughness, 0.04);
     }
 
-    // Specular anti-aliasing: widen roughness when the normal changes faster
-    // than the pixel can resolve. Prevents sub-pixel GGX peaks from flickering.
-    // (Tokuyoshi/Kaplanyan 2019, simplified)
+    // Specular anti-aliasing
     float sigma2 = dot(fwidth(N), vec3(0.333));
     roughness = sqrt(roughness * roughness + sigma2 * sigma2);
 
@@ -175,24 +223,22 @@ void main() {
     float NdotH = max(dot(N, H), 0.0);
     float HdotV = max(dot(H, V), 0.0);
 
-    // Fresnel reflectance at normal incidence (dielectric = 0.04, metallic = base_color)
     vec3 F0 = mix(vec3(0.04), base_color, metallic);
 
     float D = distributionGGX(NdotH, roughness);
     float G = geometrySmith(NdotV, NdotL, roughness);
     vec3  F = fresnelSchlick(HdotV, F0);
 
-    // Specular
     vec3 specular = (D * G * F) / (4.0 * NdotV * NdotL + 0.0001);
-
-    // Diffuse (metals have no diffuse)
     vec3 kD = (1.0 - F) * (1.0 - metallic);
     vec3 diffuse = kD * base_color / PI;
 
-    // Direct lighting (directional, now with color)
-    vec3 color = (diffuse + specular) * NdotL * scene.light_color.xyz;
+    // Direct lighting (directional) with shadow
+    float shadow_factor = sampleShadow(world_pos);
+    vec3 color = (diffuse + specular) * NdotL * scene.light_color.xyz * shadow_factor;
 
-    // Ambient (simple, not IBL)
+
+    // Ambient (unaffected by shadow)
     vec3 ambient_color = scene.ambient.xyz * base_color;
 
     // Occlusion (modulates ambient only)
@@ -203,16 +249,14 @@ void main() {
 
     color += ambient_color;
 
-    // Clustered point/spot lights
+    // Clustered point/spot lights (unaffected by directional shadow)
     if (scene.cluster_grid.w > 0.0) {
-        // Determine cluster index from screen position and depth
         float linear_dist = length(world_pos - scene.camera_pos.xyz);
         float tile_w = scene.cluster_screen.x / scene.cluster_grid.x;
         float tile_h = scene.cluster_screen.y / scene.cluster_grid.y;
         uint cx = min(uint(gl_FragCoord.x / tile_w), uint(scene.cluster_grid.x) - 1u);
         uint cy = min(uint(gl_FragCoord.y / tile_h), uint(scene.cluster_grid.y) - 1u);
 
-        // Exponential depth slice
         float near = scene.cluster_depth.x;
         float log_ratio = scene.cluster_depth.z;
         uint cz = uint(log(max(linear_dist, near) / near) / log_ratio * scene.cluster_grid.z);
@@ -246,12 +290,10 @@ void main() {
         color = mix(color, scene.fog_color.xyz, fog_factor);
     }
 
-    // Clamp to sane HDR range. GGX specular can produce extreme single-pixel
-    // values (thousands) at low roughness, causing temporal fireflies.
-    // 64x overbright is more than enough for bloom while preventing outliers.
+    // Clamp to sane HDR range
     color = min(color, vec3(64.0));
 
-    // Store linear depth (distance from camera) in alpha for DoF
+    // Store linear depth in alpha for DoF
     float linear_depth = length(world_pos - scene.camera_pos.xyz);
     out_color = vec4(color, linear_depth);
 }
