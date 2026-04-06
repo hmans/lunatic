@@ -87,8 +87,48 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
 
 // ---- Shadow Sampling ----
 
-float sampleShadow(vec3 frag_world_pos) {
+float sampleShadowCascade(vec3 pos, int cascade) {
+    vec4 sc = shadow.light_vp[cascade] * vec4(pos, 1.0);
+    sc.xyz /= sc.w;
+    sc.x = sc.x * 0.5 + 0.5;
+    sc.y = (-sc.y) * 0.5 + 0.5;  // flip Y: Metal render targets have inverted Y vs clip space
+
+    if (sc.x < 0.0 || sc.x > 1.0 ||
+        sc.y < 0.0 || sc.y > 1.0 ||
+        sc.z < 0.0 || sc.z > 1.0) return 1.0;
+
+    // Map to atlas tile UV (2x2 grid)
+    vec2 tile_offset;
+    if (cascade == 0)      tile_offset = vec2(0.0, 0.0);
+    else if (cascade == 1) tile_offset = vec2(0.5, 0.0);
+    else if (cascade == 2) tile_offset = vec2(0.0, 0.5);
+    else                   tile_offset = vec2(0.5, 0.5);
+
+    vec2 atlas_uv = sc.xy * 0.5 + tile_offset;
+    float bias = shadow.shadow_params.z;
+    float depth = sc.z - bias;
+
+    // 4-tap PCF for softer shadow edges
+    float texel = 1.0 / shadow.shadow_params.x; // 1 / atlas_size
+    float result = 0.0;
+    result += depth <= texture(shadow_atlas, atlas_uv + vec2(-texel, -texel)).r ? 1.0 : 0.0;
+    result += depth <= texture(shadow_atlas, atlas_uv + vec2( texel, -texel)).r ? 1.0 : 0.0;
+    result += depth <= texture(shadow_atlas, atlas_uv + vec2(-texel,  texel)).r ? 1.0 : 0.0;
+    result += depth <= texture(shadow_atlas, atlas_uv + vec2( texel,  texel)).r ? 1.0 : 0.0;
+    return result * 0.25;
+}
+
+float sampleShadow(vec3 frag_world_pos, vec3 N, vec3 L) {
     if (shadow.shadow_params.w < 0.5) return 1.0;
+
+    float NdotL = dot(N, L);
+    // Surfaces facing away from the light can't be in shadow
+    if (NdotL <= 0.0) return 1.0;
+
+    // Normal-offset bias: push the sample point along the normal to reduce
+    // self-shadowing on surfaces nearly parallel to the light
+    float normal_bias = 0.05 * (1.0 - NdotL);
+    vec3 biased_pos = frag_world_pos + N * normal_bias;
 
     // Select cascade by view-space distance
     float view_depth = length(frag_world_pos - scene.camera_pos.xyz);
@@ -101,31 +141,7 @@ float sampleShadow(vec3 frag_world_pos) {
         }
     }
 
-    // Project into shadow space
-    vec4 shadow_coord = shadow.light_vp[cascade] * vec4(frag_world_pos, 1.0);
-    shadow_coord.xyz /= shadow_coord.w;
-
-    // Remap XY from NDC [-1,1] to UV [0,1] (depth is already [0,1] in Vulkan)
-    shadow_coord.xy = shadow_coord.xy * 0.5 + 0.5;
-
-    // Out of bounds = lit
-    if (shadow_coord.x < 0.0 || shadow_coord.x > 1.0 ||
-        shadow_coord.y < 0.0 || shadow_coord.y > 1.0 ||
-        shadow_coord.z < 0.0 || shadow_coord.z > 1.0) return 1.0;
-
-    // Map to atlas tile UV (2x2 grid)
-    vec2 tile_offset;
-    if (cascade == 0)      tile_offset = vec2(0.0, 0.0);
-    else if (cascade == 1) tile_offset = vec2(0.5, 0.0);
-    else if (cascade == 2) tile_offset = vec2(0.0, 0.5);
-    else                   tile_offset = vec2(0.5, 0.5);
-
-    vec2 atlas_uv = shadow_coord.xy * 0.5 + tile_offset;
-
-    // Manual depth comparison (debug: bypass comparison sampler)
-    float bias = shadow.shadow_params.z;
-    float stored_depth = texture(shadow_atlas, atlas_uv).r;
-    return (shadow_coord.z - bias) <= stored_depth ? 1.0 : 0.0;
+    return sampleShadowCascade(biased_pos, cascade);
 }
 
 // ---- Point/Spot Light Evaluation ----
@@ -234,7 +250,8 @@ void main() {
     vec3 diffuse = kD * base_color / PI;
 
     // Direct lighting (directional) with shadow
-    float shadow_factor = sampleShadow(world_pos);
+    float shadow_factor = sampleShadow(world_pos, N, L);
+
     vec3 color = (diffuse + specular) * NdotL * scene.light_color.xyz * shadow_factor;
 
 

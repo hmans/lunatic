@@ -71,7 +71,7 @@ const MaterialUniforms = extern struct {
 pub const cascade_count: u32 = 4;
 pub const shadow_atlas_size: u32 = 4096;
 pub const shadow_cascade_size: u32 = 2048;
-const cascade_lambda: f32 = 0.7;
+const cascade_lambda: f32 = 0.5;
 
 pub const ShadowUniforms = extern struct {
     light_vp: [cascade_count][4][4]f32, // 4 cascade light VP matrices
@@ -984,7 +984,7 @@ const CascadeData = struct {
 fn computeCascades(self: *Engine, cam_entity: ecs.Entity, w: u32, h: u32, light_dir: [4]f32) CascadeData {
     const cam = self.registry.getConst(Camera, cam_entity);
     const near = cam.near;
-    const far = @min(cam.far, 200.0);
+    const far = @min(cam.far, 80.0);
     const splits = computeCascadeSplits(near, far);
     const view = computeView(self, cam_entity);
 
@@ -1232,7 +1232,7 @@ pub fn executeShadowPass(
     uniforms.shadow_params = .{
         @floatFromInt(shadow_atlas_size),
         @floatFromInt(shadow_cascade_size),
-        0.002,
+        0.005,
         1.0, // enabled
     };
     return uniforms;
@@ -1371,9 +1371,9 @@ pub fn executeScenePass(
     c.SDL_PushGPUFragmentUniformData(cmd, 2, &shadow_uniforms, @sizeOf(ShadowUniforms));
 
     // Bind shadow atlas as the 6th texture sampler (index 5)
-    if (self.shadow_atlas != null) {
+    if (self.shadow_atlas != null and self.shadow_sampler != null) {
         const shadow_binding = [1]c.SDL_GPUTextureSamplerBinding{
-            .{ .texture = self.shadow_atlas.?, .sampler = self.assets.default_sampler.? },
+            .{ .texture = self.shadow_atlas.?, .sampler = self.shadow_sampler.? },
         };
         c.SDL_BindGPUFragmentSamplers(render_pass, 5, &shadow_binding, 1);
     }
