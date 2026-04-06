@@ -9,6 +9,7 @@ layout(location = 3) in vec4 in_tangent;
 struct InstanceData {
     mat4 mvp;
     mat4 model;
+    vec4 flags; // .x = receives_shadow
 };
 
 layout(std430, set = 0, binding = 0) readonly buffer InstanceBuffer {
@@ -20,6 +21,7 @@ layout(location = 1) out vec3 world_normal;
 layout(location = 2) out vec2 frag_uv;
 layout(location = 3) out vec3 world_tangent;
 layout(location = 4) out vec3 world_bitangent;
+layout(location = 5) flat out float receives_shadow;
 
 void main() {
     InstanceData inst = instances[gl_InstanceIndex];
@@ -35,4 +37,5 @@ void main() {
     world_tangent = T;
     world_bitangent = B;
     frag_uv = in_uv;
+    receives_shadow = inst.flags.x;
 }

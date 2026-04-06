@@ -5,6 +5,7 @@ layout(location = 1) in vec3 world_normal;
 layout(location = 2) in vec2 frag_uv;
 layout(location = 3) in vec3 world_tangent;
 layout(location = 4) in vec3 world_bitangent;
+layout(location = 5) flat in float receives_shadow;
 
 layout(set = 3, binding = 0) uniform SceneUniforms {
     vec4 light_dir;
@@ -250,7 +251,7 @@ void main() {
     vec3 diffuse = kD * base_color / PI;
 
     // Direct lighting (directional) with shadow
-    float shadow_factor = sampleShadow(world_pos, N, L);
+    float shadow_factor = receives_shadow > 0.5 ? sampleShadow(world_pos, N, L) : 1.0;
 
     vec3 color = (diffuse + specular) * NdotL * scene.light_color.xyz * shadow_factor;
 

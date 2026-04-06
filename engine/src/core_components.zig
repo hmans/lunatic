@@ -121,8 +121,18 @@ pub const RigidBody = struct {
     pub const lua = .{ .name = "rigid_body" };
 };
 
+/// Tag: entity's mesh is rendered into the shadow map.
+pub const ShadowCaster = struct {
+    pub const lua = .{ .name = "shadow_caster" };
+};
+
+/// Tag: entity's mesh receives shadows from the shadow map.
+pub const ShadowReceiver = struct {
+    pub const lua = .{ .name = "shadow_receiver" };
+};
+
 /// Core component tuple — engine modules reference these directly.
-pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, PointLight, SpotLight, LookAt, FlyCamera, Age, RigidBody };
+pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, PointLight, SpotLight, LookAt, FlyCamera, Age, RigidBody, ShadowCaster, ShadowReceiver };
 
 /// Concatenate core components with example-specific ones.
 /// Usage: `pub const all = core.withExtra(.{ Spin, Player });`

@@ -52,6 +52,8 @@ function scene.setup(cam)
   lunatic.add(floor, "material", floor_mat)
   lunatic.add(floor, "scale", 20, 0.2, 20)
   lunatic.add(floor, "rotation", 0, 0, 0)
+  lunatic.add(floor, "shadow_caster")
+  lunatic.add(floor, "shadow_receiver")
 
   -- Grid of spheres: rows = roughness (0.05 to 1.0), columns = metallic (0 to 1)
   local rows = 7
@@ -75,6 +77,8 @@ function scene.setup(cam)
       lunatic.add(e, "material", mat)
       lunatic.add(e, "scale", 0.5, 0.5, 0.5)
       lunatic.add(e, "rotation", 0, 0, 0)
+      lunatic.add(e, "shadow_caster")
+      lunatic.add(e, "shadow_receiver")
     end
   end
 

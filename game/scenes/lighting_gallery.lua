@@ -42,6 +42,8 @@ function scene.setup(cam)
   lunatic.add(floor, "material", floor_mat)
   lunatic.add(floor, "scale", 30, 0.5, 30)
   lunatic.add(floor, "rotation", 0, 0, 0)
+  lunatic.add(floor, "shadow_caster")
+  lunatic.add(floor, "shadow_receiver")
 
   -- Some columns/cubes as geometry to catch light
   local pillar_mat = track_mat(lunatic.create_material({ albedo = { 0.6, 0.6, 0.65 }, roughness = 0.3, metallic = 0.1 }))
@@ -55,6 +57,8 @@ function scene.setup(cam)
     lunatic.add(pillar, "material", pillar_mat)
     lunatic.add(pillar, "scale", 0.6, 3, 0.6)
     lunatic.add(pillar, "rotation", 0, 0, 0)
+    lunatic.add(pillar, "shadow_caster")
+    lunatic.add(pillar, "shadow_receiver")
   end
 
   -- Center sphere (reflective)
@@ -65,6 +69,8 @@ function scene.setup(cam)
   lunatic.add(center, "material", chrome)
   lunatic.add(center, "scale", 2, 2, 2)
   lunatic.add(center, "rotation", 0, 0, 0)
+  lunatic.add(center, "shadow_caster")
+  lunatic.add(center, "shadow_receiver")
 
   -- Ring of colored point lights at ground level
   local colors = {

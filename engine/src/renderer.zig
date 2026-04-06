@@ -22,6 +22,8 @@ const LookAt = components.LookAt;
 const Scale = components.Scale;
 const MeshHandle = components.MeshHandle;
 const MaterialHandle = components.MaterialHandle;
+const ShadowCaster = components.ShadowCaster;
+const ShadowReceiver = components.ShadowReceiver;
 
 // ============================================================
 // Compiled shaders (built from GLSL sources in shaders/)
@@ -43,6 +45,7 @@ const shadow_frag_msl = @embedFile("shader_shadow_frag_msl");
 pub const InstanceData = extern struct {
     mvp: [4][4]f32,
     model: [4][4]f32,
+    flags: [4]f32, // .x = receives_shadow (1.0 = yes, 0.0 = no)
 };
 
 const SceneUniforms = extern struct {
@@ -558,7 +561,8 @@ fn uploadInstances(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, vp: Mat4, draw_c
             Mat4.identity();
         const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), Mat4.mul(rotation, scl));
         const mvp = Mat4.mul(vp, model);
-        instances[i] = .{ .mvp = mvp.m, .model = model.m };
+        const receives = if (self.registry.has(ShadowReceiver, entry.entity)) @as(f32, 1.0) else @as(f32, 0.0);
+        instances[i] = .{ .mvp = mvp.m, .model = model.m, .flags = .{ receives, 0, 0, 0 } };
     }
 
     c.SDL_UnmapGPUTransferBuffer(self.gpu_device.?, transfer);
@@ -1143,6 +1147,12 @@ pub fn executeShadowPass(
             const instances: [*]InstanceData = @ptrCast(@alignCast(ptr));
 
             for (self.draw_list[0..frame.draw_count], 0..) |entry, i| {
+                const is_caster = self.registry.has(ShadowCaster, entry.entity);
+                if (!is_caster) {
+                    // Zero-scale MVP: all vertices collapse to a point, degenerate triangles produce no fragments
+                    instances[i] = .{ .mvp = .{.{ 0, 0, 0, 0 }} ** 4, .model = .{.{ 0, 0, 0, 0 }} ** 4, .flags = .{ 0, 0, 0, 0 } };
+                    continue;
+                }
                 const pos = self.registry.getConst(Position, entry.entity);
                 const rot = self.registry.getConst(Rotation, entry.entity);
                 const rotation = Mat4.mul(Mat4.mul(Mat4.rotateZ(rot.z), Mat4.rotateY(rot.y)), Mat4.rotateX(rot.x));
@@ -1151,7 +1161,7 @@ pub fn executeShadowPass(
                 else
                     Mat4.identity();
                 const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), Mat4.mul(rotation, scl));
-                instances[i] = .{ .mvp = Mat4.mul(light_vp, model).m, .model = model.m };
+                instances[i] = .{ .mvp = Mat4.mul(light_vp, model).m, .model = model.m, .flags = .{ 0, 0, 0, 0 } };
             }
 
             c.SDL_UnmapGPUTransferBuffer(self.gpu_device.?, transfer);

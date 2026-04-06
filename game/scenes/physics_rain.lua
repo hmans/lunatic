@@ -70,6 +70,8 @@ function scene.setup(cam)
   lunatic.add(floor, "material", floor_mat)
   lunatic.add(floor, "scale", 20, 0.5, 20)
   lunatic.add(floor, "rotation", 0, 0, 0)
+  lunatic.add(floor, "shadow_caster")
+  lunatic.add(floor, "shadow_receiver")
   lunatic.physics_add_box(floor, 10, 0.25, 10, "static")
   lunatic.physics_optimize()
 
@@ -110,6 +112,8 @@ function scene.setup(cam)
       mat = common[math.random(#common)]
     end
     lunatic.add(e, "material", mat)
+    lunatic.add(e, "shadow_caster")
+    lunatic.add(e, "shadow_receiver")
     lunatic.physics_add_sphere(e, scale * 0.5, "dynamic", 0.1, 1.5)
 
     body_ring[ring_head] = e

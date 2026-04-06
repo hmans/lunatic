@@ -8,6 +8,7 @@ layout(location = 3) in vec4 in_tangent;
 struct InstanceData {
     mat4 mvp;
     mat4 model;
+    vec4 flags;
 };
 
 layout(std430, set = 0, binding = 0) readonly buffer InstanceBuffer {
