@@ -11,7 +11,7 @@ pub fn main() !void {
     }
 
     var engine: Engine = undefined;
-    try engine.init(.{ .debug_stats = debug });
+    try engine.init(.{ .width = 1280, .height = 720, .debug_stats = debug });
     defer engine.deinit();
 
     try engine.loadScript("examples/main.lua");
