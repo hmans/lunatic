@@ -30,7 +30,8 @@ brew install zig sdl3 luajit shaderc spirv-cross
 ## Build & Run
 
 ```
-zig build run
+zig build run            # Run the game (game/)
+zig build run-examples   # Run the example scenes (examples/)
 ```
 
 ## Tests

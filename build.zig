@@ -145,6 +145,7 @@ fn buildEngineModules(
     optimize: std.builtin.OptimizeMode,
     entt: *std.Build.Dependency,
     zphysics_dep: *std.Build.Dependency,
+    components_path: []const u8,
 ) EngineModules {
     const ecs_mod = entt.module("zig-ecs");
     const zphysics_mod = zphysics_dep.module("root");
@@ -165,7 +166,7 @@ fn buildEngineModules(
     });
 
     const components_mod = b.createModule(.{
-        .root_source_file = b.path("game/components.zig"),
+        .root_source_file = b.path(components_path),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -319,10 +320,10 @@ pub fn build(b: *std.Build) void {
     });
 
     // Game executable
-    const mods = buildEngineModules(b, target, optimize, entt, zphysics_dep);
-    addShaders(b, mods.renderer, mods.postprocess);
+    const game_mods = buildEngineModules(b, target, optimize, entt, zphysics_dep, "game/components.zig");
+    addShaders(b, game_mods.renderer, game_mods.postprocess);
 
-    const exe = b.addExecutable(.{
+    const game_exe = b.addExecutable(.{
         .name = "lunatic",
         .root_module = b.createModule(.{
             .root_source_file = b.path("game/main.zig"),
@@ -330,21 +331,49 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
             .imports = &.{
-                .{ .name = "engine", .module = mods.engine },
+                .{ .name = "engine", .module = game_mods.engine },
             },
         }),
     });
-    exe.linkLibrary(mods.joltc);
-    addLinkDeps(b, exe);
-    b.installArtifact(exe);
+    game_exe.linkLibrary(game_mods.joltc);
+    addLinkDeps(b, game_exe);
+    b.installArtifact(game_exe);
 
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.setCwd(b.path("."));
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    const game_run = b.addRunArtifact(game_exe);
+    game_run.setCwd(b.path("."));
+    game_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| game_run.addArgs(args);
 
     const run_step = b.step("run", "Run the game");
-    run_step.dependOn(&run_cmd.step);
+    run_step.dependOn(&game_run.step);
+
+    // Examples executable
+    const examples_mods = buildEngineModules(b, target, optimize, entt, zphysics_dep, "examples/components.zig");
+    addShaders(b, examples_mods.renderer, examples_mods.postprocess);
+
+    const examples_exe = b.addExecutable(.{
+        .name = "lunatic-examples",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "engine", .module = examples_mods.engine },
+            },
+        }),
+    });
+    examples_exe.linkLibrary(examples_mods.joltc);
+    addLinkDeps(b, examples_exe);
+    b.installArtifact(examples_exe);
+
+    const examples_run = b.addRunArtifact(examples_exe);
+    examples_run.setCwd(b.path("."));
+    examples_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| examples_run.addArgs(args);
+
+    const run_examples_step = b.step("run-examples", "Run the examples");
+    run_examples_step.dependOn(&examples_run.step);
 
     // Tests
     const math_tests = b.addTest(.{
@@ -363,7 +392,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const test_mods = buildEngineModules(b, target, optimize, entt, zphysics_dep);
+    const test_mods = buildEngineModules(b, target, optimize, entt, zphysics_dep, "examples/components.zig");
     addShaders(b, test_mods.renderer, test_mods.postprocess);
 
     const integration_tests = b.addTest(.{

@@ -340,7 +340,6 @@ pub const Engine = struct {
         }
         lc.luaL_openlibs(L);
         lua_api.registerLuaApi(self);
-        _ = lc.luaL_dostring(L, "package.path = 'game/?.lua;' .. package.path");
 
         if (!config.headless) {
             try self.initGpu(config);
@@ -384,9 +383,21 @@ pub const Engine = struct {
         self.registry.deinit();
     }
 
-    /// Load and execute a Lua script file.
+    /// Load and execute a Lua script file. Sets the Lua package path to the
+    /// script's directory so that `require("scenes.foo")` resolves relative to it.
     pub fn loadScript(self: *Engine, path: [*:0]const u8) !void {
         const L = self.lua_state.?;
+
+        // Extract directory from the script path and prepend to package.path
+        const path_slice = std.mem.span(path);
+        if (std.mem.lastIndexOfScalar(u8, path_slice, '/')) |sep| {
+            const dir = path_slice[0..sep];
+            var buf: [512]u8 = undefined;
+            const lua_code = std.fmt.bufPrint(buf[0..511], "package.path = '{s}/?.lua;' .. package.path", .{dir}) catch return;
+            buf[lua_code.len] = 0;
+            _ = lc.luaL_dostring(L, @as([*:0]const u8, @ptrCast(lua_code.ptr)));
+        }
+
         if (lc.luaL_loadfile(L, path) != 0 or lc.lua_pcall(L, 0, 0, 0) != 0) {
             const err = lc.lua_tolstring(L, -1, null);
             std.debug.print("Lua error: {s}\n", .{err});

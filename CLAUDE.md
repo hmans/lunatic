@@ -15,11 +15,18 @@ A 3D game engine: Zig core + SDL3 GPU + LuaJIT scripting + zig-ecs.
 - `engine/shaders/shadow/` — shadow map shaders (shadow.vert/frag)
 - `engine/shaders/postprocess/` — post-processing shaders (bloom, DoF, composite, etc.)
 - `engine/vendor/` — vendored C/C++ libs (stb_image, cgltf, Dear ImGui + dcimgui)
-- `game/main.zig` — game entry point (minimal: init, load script, run)
-- `game/main.lua` — game logic (scene setup, systems, debug UI)
-- `game/components.zig` — game-specific components (extends core with Spin, Player, etc.)
+- `game/` — user's game project (skeleton: main.zig, components.zig, main.lua)
+- `examples/` — demo scenes and example game code
 - `assets/` — binary assets tracked via Git LFS (fonts, textures, models)
 - `mcp/` — MCP server for Claude Code integration (Node.js)
+
+### Build targets
+
+- `zig build run` — build and run the game (`game/`)
+- `zig build run-examples` — build and run the examples (`examples/`)
+- `zig build test` — run all tests
+
+Each target has its own `components.zig` for game-specific components. The engine's `loadScript()` sets `package.path` from the script's directory, so `require("scenes.foo")` resolves relative to the script.
 
 ## Details
 
@@ -93,6 +100,10 @@ On Metal, the swapchain texture is framebufferOnly, so the engine renders to an 
 ## Scale Target
 
 The engine must handle tens of thousands to hundreds of thousands of entities efficiently, even if current demos are small. Design all per-entity paths (queries, iteration, rendering) with this scale in mind. Avoid per-entity allocations, per-entity `pcall`, or O(n²) patterns in hot loops.
+
+## IMPORTANT: Verify with examples
+
+**Any change to the engine MUST be verified against the examples suite.** Run `zig build run-examples` and confirm the examples still work correctly before committing engine changes. The examples exercise shadows, clustered lighting, post-processing, physics, and scene management — if they break, the engine is broken.
 
 ## Conventions
 
