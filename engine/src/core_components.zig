@@ -69,6 +69,29 @@ pub const DirectionalLight = struct {
     pub const lua = .{ .name = "directional_light" };
 };
 
+pub const PointLight = struct {
+    radius: f32 = 10.0,
+    r: f32 = 1.0,
+    g: f32 = 1.0,
+    b: f32 = 1.0,
+    intensity: f32 = 1.0,
+    pub const lua = .{ .name = "point_light" };
+};
+
+pub const SpotLight = struct {
+    radius: f32 = 10.0,
+    r: f32 = 1.0,
+    g: f32 = 1.0,
+    b: f32 = 1.0,
+    intensity: f32 = 1.0,
+    dir_x: f32 = 0.0,
+    dir_y: f32 = -1.0,
+    dir_z: f32 = 0.0,
+    inner_cone: f32 = 30.0,
+    outer_cone: f32 = 45.0,
+    pub const lua = .{ .name = "spot_light" };
+};
+
 pub const LookAt = struct {
     target: u32 = 0,
     pub const lua = .{ .name = "look_at" };
@@ -99,7 +122,7 @@ pub const RigidBody = struct {
 };
 
 /// Core component tuple — engine modules reference these directly.
-pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, LookAt, FlyCamera, Age, RigidBody };
+pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, PointLight, SpotLight, LookAt, FlyCamera, Age, RigidBody };
 
 /// Concatenate core components with example-specific ones.
 /// Usage: `pub const all = core.withExtra(.{ Spin, Player });`

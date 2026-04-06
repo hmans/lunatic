@@ -9,9 +9,13 @@ layout(location = 4) in vec3 world_bitangent;
 layout(set = 3, binding = 0) uniform SceneUniforms {
     vec4 light_dir;
     vec4 camera_pos;
-    vec4 fog_color;   // .xyz = color, .w = fog_enabled
-    vec4 fog_params;  // .x = fog_start, .y = fog_end
+    vec4 fog_color;        // .xyz = color, .w = fog_enabled
+    vec4 fog_params;       // .x = fog_start, .y = fog_end
     vec4 ambient;
+    vec4 light_color;      // .xyz = directional light color
+    vec4 cluster_grid;     // .x = nx, .y = ny, .z = nz, .w = num_lights
+    vec4 cluster_depth;    // .x = near, .y = far, .z = log(far/near)
+    vec4 cluster_screen;   // .x = screen_w, .y = screen_h, .z = tiles_per_pixel_x, .w = tiles_per_pixel_y
 } scene;
 
 layout(set = 3, binding = 1) uniform MaterialUniforms {
@@ -26,6 +30,27 @@ layout(set = 2, binding = 1) uniform sampler2D metallic_roughness_tex;
 layout(set = 2, binding = 2) uniform sampler2D normal_tex;
 layout(set = 2, binding = 3) uniform sampler2D emissive_tex;
 layout(set = 2, binding = 4) uniform sampler2D occlusion_tex;
+
+// ---- Clustered Lighting ----
+
+struct GPULight {
+    vec4 pos_radius;     // xyz = world position, w = radius
+    vec4 color_type;     // xyz = color*intensity, w = type (0=point, 1=spot)
+    vec4 dir_spot;       // xyz = direction (spot only)
+    vec4 cone_params;    // x = cos(inner_cone), y = cos(outer_cone)
+};
+
+layout(std430, set = 1, binding = 2) readonly buffer LightBuffer {
+    GPULight lights[];
+};
+
+layout(std430, set = 1, binding = 3) readonly buffer ClusterInfoBuffer {
+    uvec2 cluster_infos[];  // x = offset, y = count
+};
+
+layout(std430, set = 1, binding = 4) readonly buffer LightIndexBuffer {
+    uint light_indices[];
+};
 
 layout(location = 0) out vec4 out_color;
 
@@ -51,6 +76,57 @@ float geometrySmith(float NdotV, float NdotL, float roughness) {
 // Fresnel-Schlick approximation
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// Evaluate a point or spot light using the same PBR BRDF as the directional light
+vec3 evaluateLight(GPULight light, vec3 N, vec3 V, float NdotV, vec3 frag_pos,
+                   vec3 base_color, float metallic, float roughness, vec3 F0) {
+    vec3 L_vec = light.pos_radius.xyz - frag_pos;
+    float dist = length(L_vec);
+    float radius = light.pos_radius.w;
+
+    if (dist > radius) return vec3(0.0);
+
+    vec3 L = L_vec / dist;
+    float NdotL = max(dot(N, L), 0.0);
+    if (NdotL <= 0.0) return vec3(0.0);
+
+    // Physically-based inverse-square attenuation with smooth window to zero at radius
+    // (UE4-style: inverse square * smooth windowing function)
+    float d2 = dist * dist;
+    float r2 = radius * radius;
+    float ratio4 = (d2 * d2) / (r2 * r2);
+    float window = clamp(1.0 - ratio4, 0.0, 1.0);
+    window *= window;
+    float att = window / (d2 + 1.0);
+
+    // Spot light cone falloff
+    if (light.color_type.w > 0.5) {
+        vec3 spot_dir = normalize(light.dir_spot.xyz);
+        float cos_angle = dot(-L, spot_dir);
+        float cos_inner = light.cone_params.x;
+        float cos_outer = light.cone_params.y;
+        float spot_factor = clamp((cos_angle - cos_outer) / (cos_inner - cos_outer + 0.0001), 0.0, 1.0);
+        att *= spot_factor;
+    }
+
+    if (att <= 0.0) return vec3(0.0);
+
+    // PBR BRDF
+    vec3 H = normalize(V + L);
+    float NdotH = max(dot(N, H), 0.0);
+    float HdotV = max(dot(H, V), 0.0);
+
+    float D = distributionGGX(NdotH, roughness);
+    float G = geometrySmith(NdotV, NdotL, roughness);
+    vec3  F = fresnelSchlick(HdotV, F0);
+
+    vec3 specular = (D * G * F) / (4.0 * NdotV * NdotL + 0.0001);
+    vec3 kD = (1.0 - F) * (1.0 - metallic);
+    vec3 diffuse = kD * base_color / PI;
+
+    vec3 radiance = light.color_type.xyz * att;
+    return (diffuse + specular) * radiance * NdotL;
 }
 
 void main() {
@@ -113,8 +189,8 @@ void main() {
     vec3 kD = (1.0 - F) * (1.0 - metallic);
     vec3 diffuse = kD * base_color / PI;
 
-    // Direct lighting
-    vec3 color = (diffuse + specular) * NdotL;
+    // Direct lighting (directional, now with color)
+    vec3 color = (diffuse + specular) * NdotL * scene.light_color.xyz;
 
     // Ambient (simple, not IBL)
     vec3 ambient_color = scene.ambient.xyz * base_color;
@@ -126,6 +202,33 @@ void main() {
     }
 
     color += ambient_color;
+
+    // Clustered point/spot lights
+    if (scene.cluster_grid.w > 0.0) {
+        // Determine cluster index from screen position and depth
+        float linear_dist = length(world_pos - scene.camera_pos.xyz);
+        float tile_w = scene.cluster_screen.x / scene.cluster_grid.x;
+        float tile_h = scene.cluster_screen.y / scene.cluster_grid.y;
+        uint cx = min(uint(gl_FragCoord.x / tile_w), uint(scene.cluster_grid.x) - 1u);
+        uint cy = min(uint(gl_FragCoord.y / tile_h), uint(scene.cluster_grid.y) - 1u);
+
+        // Exponential depth slice
+        float near = scene.cluster_depth.x;
+        float log_ratio = scene.cluster_depth.z;
+        uint cz = uint(log(max(linear_dist, near) / near) / log_ratio * scene.cluster_grid.z);
+        cz = min(cz, uint(scene.cluster_grid.z) - 1u);
+
+        uint cluster_idx = cx + cy * uint(scene.cluster_grid.x) + cz * uint(scene.cluster_grid.x) * uint(scene.cluster_grid.y);
+        uvec2 info = cluster_infos[cluster_idx];
+        uint offset = info.x;
+        uint count = info.y;
+
+        for (uint i = 0u; i < count; i++) {
+            uint light_idx = light_indices[offset + i];
+            color += evaluateLight(lights[light_idx], N, V, NdotV, world_pos,
+                                   base_color, metallic, roughness, F0);
+        }
+    }
 
     // Emissive
     vec3 emissive_color = mat.emissive.xyz;

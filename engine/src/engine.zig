@@ -229,6 +229,19 @@ pub const Engine = struct {
     // Draw sorting scratch buffer
     draw_list: [renderer.max_renderables]renderer.DrawEntry = undefined,
 
+    // Clustered lighting GPU buffers
+    cluster_light_buffer: ?*c.SDL_GPUBuffer = null,
+    cluster_info_buffer: ?*c.SDL_GPUBuffer = null,
+    cluster_index_buffer: ?*c.SDL_GPUBuffer = null,
+    cluster_transfer: ?*c.SDL_GPUTransferBuffer = null,
+
+    // Clustered lighting CPU scratch
+    cluster_lights: [renderer.max_lights]renderer.GPULight = undefined,
+    cluster_light_count: u32 = 0,
+    cluster_infos: [renderer.num_clusters]renderer.ClusterInfo = undefined,
+    cluster_indices: [renderer.max_light_indices]u32 = undefined,
+    cluster_index_count: u32 = 0,
+
     // Frame counter + stats
     current_frame: u64 = 0,
     stats: FrameStats = .{},
@@ -301,6 +314,10 @@ pub const Engine = struct {
             if (self.depth_texture) |dt| c.SDL_ReleaseGPUTexture(device, dt);
             if (self.instance_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
             if (self.instance_transfer) |t| c.SDL_ReleaseGPUTransferBuffer(device, t);
+            if (self.cluster_light_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
+            if (self.cluster_info_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
+            if (self.cluster_index_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
+            if (self.cluster_transfer) |t| c.SDL_ReleaseGPUTransferBuffer(device, t);
             if (self.pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
             if (self.sdl_window) |w| c.SDL_DestroyWindow(w);
             c.SDL_DestroyGPUDevice(device);
@@ -409,6 +426,9 @@ pub const Engine = struct {
                 renderer.uploadInstanceData(self, cmd, cam_entity, sw_w, sw_h, frame);
                 const ti1 = c.SDL_GetPerformanceCounter();
                 self.stats.time_instances_us = (ti1 - ti0) * 1_000_000 / pf;
+
+                // Phase 2.5: Cluster assignment + upload (per-camera)
+                renderer.updateClusters(self, cmd, cam_entity);
 
                 // Phase 3: Scene render pass
                 const ts0 = c.SDL_GetPerformanceCounter();
@@ -631,6 +651,33 @@ pub const Engine = struct {
             .props = 0,
         }) orelse return error.BufferFailed;
         self.instance_capacity = renderer.max_renderables;
+
+        // Clustered lighting buffers
+        const light_buf_size: u32 = renderer.max_lights * @sizeOf(renderer.GPULight);
+        const info_buf_size: u32 = renderer.num_clusters * @sizeOf(renderer.ClusterInfo);
+        const index_buf_size: u32 = renderer.max_light_indices * @sizeOf(u32);
+        const cluster_transfer_size: u32 = light_buf_size + info_buf_size + index_buf_size;
+
+        self.cluster_light_buffer = c.SDL_CreateGPUBuffer(self.gpu_device.?, &c.SDL_GPUBufferCreateInfo{
+            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+            .size = light_buf_size,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        self.cluster_info_buffer = c.SDL_CreateGPUBuffer(self.gpu_device.?, &c.SDL_GPUBufferCreateInfo{
+            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+            .size = info_buf_size,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        self.cluster_index_buffer = c.SDL_CreateGPUBuffer(self.gpu_device.?, &c.SDL_GPUBufferCreateInfo{
+            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+            .size = index_buf_size,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        self.cluster_transfer = c.SDL_CreateGPUTransferBuffer(self.gpu_device.?, &c.SDL_GPUTransferBufferCreateInfo{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = cluster_transfer_size,
+            .props = 0,
+        }) orelse return error.BufferFailed;
 
         // Post-processing (bloom)
         try postprocess.initPostProcess(self);

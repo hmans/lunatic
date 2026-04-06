@@ -16,6 +16,8 @@ const Position = components.Position;
 const Rotation = components.Rotation;
 const Camera = components.Camera;
 const DirectionalLight = components.DirectionalLight;
+const PointLight = components.PointLight;
+const SpotLight = components.SpotLight;
 const LookAt = components.LookAt;
 const Scale = components.Scale;
 const MeshHandle = components.MeshHandle;
@@ -45,6 +47,10 @@ const SceneUniforms = extern struct {
     fog_color: [4]f32,
     fog_params: [4]f32,
     ambient: [4]f32,
+    light_color: [4]f32, // xyz = directional light color * intensity
+    cluster_grid: [4]f32, // x=nx, y=ny, z=nz, w=num_lights
+    cluster_depth: [4]f32, // x=near, y=far, z=log(far/near)
+    cluster_screen: [4]f32, // x=screen_w, y=screen_h, z=tiles_per_pixel_x, w=tiles_per_pixel_y
 };
 
 const MaterialUniforms = extern struct {
@@ -52,6 +58,31 @@ const MaterialUniforms = extern struct {
     material_params: [4]f32 = .{ 0, 0.5, 0, 0 }, // .x = metallic, .y = roughness
     texture_flags: [4]f32 = .{ 0, 0, 0, 0 }, // .x = has_base_color, .y = has_metallic_roughness, .z = has_normal, .w = has_emissive
     emissive: [4]f32 = .{ 0, 0, 0, 0 }, // .xyz = emissive factor, .w = has_occlusion
+};
+
+// ============================================================
+// Clustered lighting constants and GPU types
+// ============================================================
+
+pub const cluster_x: u32 = 16;
+pub const cluster_y: u32 = 9;
+pub const cluster_z: u32 = 24;
+pub const num_clusters: u32 = cluster_x * cluster_y * cluster_z;
+pub const max_lights: u32 = 256;
+pub const max_light_indices: u32 = 256 * 1024;
+
+/// GPU light struct — 64 bytes, matches GLSL std430 layout.
+pub const GPULight = extern struct {
+    pos_radius: [4]f32,
+    color_type: [4]f32, // xyz = color*intensity, w = type (0=point, 1=spot)
+    dir_spot: [4]f32, // xyz = direction (spot only)
+    cone_params: [4]f32, // x = cos(inner), y = cos(outer)
+};
+
+/// Per-cluster offset+count, maps to uvec2 in GLSL.
+pub const ClusterInfo = extern struct {
+    offset: u32,
+    count: u32,
 };
 
 // ============================================================
@@ -191,7 +222,7 @@ pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
     };
     defer c.SDL_ReleaseGPUShader(device, vert_shader);
 
-    const frag_shader = createShader(device, frag_spv, frag_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 5, 0) orelse {
+    const frag_shader = createShader(device, frag_spv, frag_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 5, 3) orelse {
         std.debug.print("Failed to create fragment shader: {s}\n", .{c.SDL_GetError()});
         return error.ShaderFailed;
     };
@@ -302,19 +333,73 @@ fn resolveTexture(self: *Engine, tex_id: ?u32, dummy: *c.SDL_GPUTexture) *c.SDL_
     return dummy;
 }
 
+/// Directional light data gathered from ECS.
+pub const DirLightData = struct {
+    dir: [4]f32,
+    color: [4]f32,
+};
+
 /// Query the ECS for the first directional light, or return defaults.
-fn gatherLights(registry: *ecs.Registry) [4]f32 {
-    var light_dir = [4]f32{ 0.4, 0.8, 0.4, 0.0 };
-    var light_view = registry.view(.{DirectionalLight}, .{});
-    var light_iter = light_view.entityIterator();
-    if (light_iter.next()) |light_entity| {
-        const dl = light_view.getConst(light_entity);
+fn gatherDirectionalLight(registry: *ecs.Registry) DirLightData {
+    var result = DirLightData{
+        .dir = .{ 0.4, 0.8, 0.4, 0.0 },
+        .color = .{ 1.0, 1.0, 1.0, 0.0 },
+    };
+    var view = registry.view(.{DirectionalLight}, .{});
+    var iter = view.entityIterator();
+    if (iter.next()) |entity| {
+        const dl = view.getConst(entity);
         const len_sq = dl.dir_x * dl.dir_x + dl.dir_y * dl.dir_y + dl.dir_z * dl.dir_z;
         if (len_sq > 1e-8) {
-            light_dir = .{ dl.dir_x, dl.dir_y, dl.dir_z, 0.0 };
+            result.dir = .{ dl.dir_x, dl.dir_y, dl.dir_z, 0.0 };
         }
+        result.color = .{ dl.r, dl.g, dl.b, 0.0 };
     }
-    return light_dir;
+    return result;
+}
+
+/// Gather all point and spot lights into the engine's cluster_lights scratch buffer.
+fn gatherClusterLights(self: *Engine) u32 {
+    var count: u32 = 0;
+
+    // Point lights
+    var pl_view = self.registry.view(.{ Position, PointLight }, .{});
+    var pl_iter = pl_view.entityIterator();
+    while (pl_iter.next()) |entity| {
+        if (count >= max_lights) break;
+        const pos = pl_view.getConst(Position, entity);
+        const pl = pl_view.getConst(PointLight, entity);
+        self.cluster_lights[count] = .{
+            .pos_radius = .{ pos.x, pos.y, pos.z, pl.radius },
+            .color_type = .{ pl.r * pl.intensity, pl.g * pl.intensity, pl.b * pl.intensity, 0.0 },
+            .dir_spot = .{ 0, 0, 0, 0 },
+            .cone_params = .{ 0, 0, 0, 0 },
+        };
+        count += 1;
+    }
+
+    // Spot lights
+    var sl_view = self.registry.view(.{ Position, SpotLight }, .{});
+    var sl_iter = sl_view.entityIterator();
+    while (sl_iter.next()) |entity| {
+        if (count >= max_lights) break;
+        const pos = sl_view.getConst(Position, entity);
+        const sl = sl_view.getConst(SpotLight, entity);
+        const inner_rad = sl.inner_cone * (std.math.pi / 180.0);
+        const outer_rad = sl.outer_cone * (std.math.pi / 180.0);
+        const len_sq = sl.dir_x * sl.dir_x + sl.dir_y * sl.dir_y + sl.dir_z * sl.dir_z;
+        const inv_len = if (len_sq > 1e-8) 1.0 / @sqrt(len_sq) else 1.0;
+        self.cluster_lights[count] = .{
+            .pos_radius = .{ pos.x, pos.y, pos.z, sl.radius },
+            .color_type = .{ sl.r * sl.intensity, sl.g * sl.intensity, sl.b * sl.intensity, 1.0 },
+            .dir_spot = .{ sl.dir_x * inv_len, sl.dir_y * inv_len, sl.dir_z * inv_len, 0 },
+            .cone_params = .{ @cos(inner_rad), @cos(outer_rad), 0, 0 },
+        };
+        count += 1;
+    }
+
+    self.cluster_light_count = count;
+    return count;
 }
 
 /// Collect all renderable entities into the draw list, sorted by mesh+material
@@ -486,8 +571,9 @@ fn submitDrawCalls(
 
 /// Cached per-frame scene data (computed once, shared across cameras).
 pub const FrameContext = struct {
-    light_dir: [4]f32,
+    dir_light: DirLightData,
     draw_count: u32,
+    light_count: u32,
 };
 
 /// Prepare shared scene data for the frame: gather lights, build sorted draw list,
@@ -509,24 +595,17 @@ pub fn prepareFrame(self: *Engine, w: u32, h: u32) FrameContext {
     }
 
     return .{
-        .light_dir = gatherLights(&self.registry),
+        .dir_light = gatherDirectionalLight(&self.registry),
         .draw_count = buildDrawList(self),
+        .light_count = gatherClusterLights(self),
     };
 }
 
-/// Render the scene from a single camera into the given color target texture.
-fn computeVP(self: *Engine, cam_entity: ecs.Entity, w: u32, h: u32) Mat4 {
+/// Compute the view matrix for a camera entity.
+fn computeView(self: *Engine, cam_entity: ecs.Entity) Mat4 {
     const cam_pos = self.registry.getConst(Position, cam_entity);
-    const cam = self.registry.getConst(Camera, cam_entity);
-    const w_f: f32 = @floatFromInt(w);
-    const h_f: f32 = @floatFromInt(h);
-    const vp_w = cam.viewport_w * w_f;
-    const vp_h = cam.viewport_h * h_f;
-    const aspect: f32 = vp_w / vp_h;
-    const proj = Mat4.perspective(cam.fov, aspect, cam.near, cam.far);
-
     const eye = Vec3.new(cam_pos.x, cam_pos.y, cam_pos.z);
-    const view = if (self.registry.tryGet(LookAt, cam_entity)) |look_at| blk: {
+    return if (self.registry.tryGet(LookAt, cam_entity)) |look_at| blk: {
         const target_entity: ecs.Entity = @bitCast(look_at.target);
         if (self.registry.valid(target_entity)) {
             if (self.registry.tryGet(Position, target_entity)) |target_pos| {
@@ -537,8 +616,210 @@ fn computeVP(self: *Engine, cam_entity: ecs.Entity, w: u32, h: u32) Mat4 {
     } else if (self.registry.tryGet(Rotation, cam_entity)) |cam_rot| blk: {
         break :blk Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, cam_rot.x, cam_rot.y, cam_rot.z);
     } else Mat4.viewFromTransform(cam_pos.x, cam_pos.y, cam_pos.z, 0, 0, 0);
+}
 
+/// Compute the view-projection matrix for a camera entity.
+fn computeVP(self: *Engine, cam_entity: ecs.Entity, w: u32, h: u32) Mat4 {
+    const cam = self.registry.getConst(Camera, cam_entity);
+    const w_f: f32 = @floatFromInt(w);
+    const h_f: f32 = @floatFromInt(h);
+    const vp_w = cam.viewport_w * w_f;
+    const vp_h = cam.viewport_h * h_f;
+    const aspect: f32 = vp_w / vp_h;
+    const proj = Mat4.perspective(cam.fov, aspect, cam.near, cam.far);
+    const view = computeView(self, cam_entity);
     return Mat4.mul(proj, view);
+}
+
+// ============================================================
+// Clustered lighting: assignment and upload
+// ============================================================
+
+/// Assign lights to clusters using a two-pass count-then-fill algorithm.
+/// Conservative: assigns each light to all XY tiles within its Z slice range.
+fn assignLightsToClusters(self: *Engine, cam_pos_world: [3]f32, near: f32, far: f32) void {
+    const light_count = self.cluster_light_count;
+    const log_ratio = @log(far / near);
+    const cz_f: f32 = @floatFromInt(cluster_z);
+
+    // Reset cluster infos
+    for (0..num_clusters) |i| {
+        self.cluster_infos[i] = .{ .offset = 0, .count = 0 };
+    }
+
+    if (light_count == 0) {
+        self.cluster_index_count = 0;
+        return;
+    }
+
+    // Pass 1: Count lights per cluster
+    for (0..light_count) |li| {
+        const light = self.cluster_lights[li];
+        const radius = light.pos_radius[3];
+        const wx = light.pos_radius[0];
+        const wy = light.pos_radius[1];
+        const wz = light.pos_radius[2];
+
+        // Radial distance from camera (matches shader's length(world_pos - camera_pos))
+        const dx = wx - cam_pos_world[0];
+        const dy = wy - cam_pos_world[1];
+        const dz = wz - cam_pos_world[2];
+        const dist = @sqrt(dx * dx + dy * dy + dz * dz);
+
+        // Frustum cull: light sphere vs near/far
+        if (dist + radius < near or dist - radius > far) continue;
+
+        // Z slice range (exponential)
+        const z_min_depth = @max(dist - radius, near);
+        const z_max_depth = @min(dist + radius, far);
+        const z_min_f = @max(@floor(@log(z_min_depth / near) / log_ratio * cz_f), 0);
+        const z_max_f = @min(@ceil(@log(z_max_depth / near) / log_ratio * cz_f), cz_f - 1);
+        const z_min: u32 = @intFromFloat(z_min_f);
+        const z_max: u32 = @intFromFloat(z_max_f);
+
+        // Conservative: assign to all XY tiles within Z range
+        // TODO: Project light sphere to screen for tighter XY bounds
+        var zz: u32 = z_min;
+        while (zz <= z_max) : (zz += 1) {
+            const z_base = zz * cluster_x * cluster_y;
+            var yy: u32 = 0;
+            while (yy < cluster_y) : (yy += 1) {
+                const zy_base = z_base + yy * cluster_x;
+                var xx: u32 = 0;
+                while (xx < cluster_x) : (xx += 1) {
+                    const idx = zy_base + xx;
+                    if (self.cluster_infos[idx].count < 255) {
+                        self.cluster_infos[idx].count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Prefix sum to compute offsets
+    var offset: u32 = 0;
+    for (0..num_clusters) |i| {
+        self.cluster_infos[i].offset = offset;
+        offset += self.cluster_infos[i].count;
+        self.cluster_infos[i].count = 0; // Reset for fill pass
+    }
+    self.cluster_index_count = @min(offset, max_light_indices);
+
+    // Pass 2: Fill light indices
+    for (0..light_count) |li| {
+        const light = self.cluster_lights[li];
+        const radius = light.pos_radius[3];
+        const wx = light.pos_radius[0];
+        const wy = light.pos_radius[1];
+        const wz = light.pos_radius[2];
+
+        const dx = wx - cam_pos_world[0];
+        const dy = wy - cam_pos_world[1];
+        const dz = wz - cam_pos_world[2];
+        const dist = @sqrt(dx * dx + dy * dy + dz * dz);
+
+        if (dist + radius < near or dist - radius > far) continue;
+
+        const z_min_depth = @max(dist - radius, near);
+        const z_max_depth = @min(dist + radius, far);
+        const z_min_f = @max(@floor(@log(z_min_depth / near) / log_ratio * cz_f), 0);
+        const z_max_f = @min(@ceil(@log(z_max_depth / near) / log_ratio * cz_f), cz_f - 1);
+        const z_min: u32 = @intFromFloat(z_min_f);
+        const z_max: u32 = @intFromFloat(z_max_f);
+
+        var zz: u32 = z_min;
+        while (zz <= z_max) : (zz += 1) {
+            const z_base = zz * cluster_x * cluster_y;
+            var yy: u32 = 0;
+            while (yy < cluster_y) : (yy += 1) {
+                const zy_base = z_base + yy * cluster_x;
+                var xx: u32 = 0;
+                while (xx < cluster_x) : (xx += 1) {
+                    const idx = zy_base + xx;
+                    const info = &self.cluster_infos[idx];
+                    const write_pos = info.offset + info.count;
+                    if (write_pos < max_light_indices and info.count < 255) {
+                        self.cluster_indices[write_pos] = @intCast(li);
+                        info.count += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Upload cluster data (lights, cluster info, light indices) to GPU via a single copy pass.
+fn uploadClusterData(self: *Engine, cmd: *c.SDL_GPUCommandBuffer) void {
+    const transfer = self.cluster_transfer orelse return;
+    const device = self.gpu_device.?;
+
+    const light_size = self.cluster_light_count * @sizeOf(GPULight);
+    const info_size = num_clusters * @sizeOf(ClusterInfo);
+    const index_size = self.cluster_index_count * @sizeOf(u32);
+
+    // Fixed offsets in transfer buffer (use max sizes for alignment)
+    const info_offset: u32 = max_lights * @sizeOf(GPULight);
+    const index_offset: u32 = info_offset + num_clusters * @sizeOf(ClusterInfo);
+
+    const ptr = c.SDL_MapGPUTransferBuffer(device, transfer, true) orelse return;
+    const bytes: [*]u8 = @ptrCast(ptr);
+
+    if (light_size > 0) {
+        const src = std.mem.sliceAsBytes(self.cluster_lights[0..self.cluster_light_count]);
+        @memcpy(bytes[0..src.len], src);
+    }
+    {
+        const src = std.mem.sliceAsBytes(&self.cluster_infos);
+        @memcpy(bytes[info_offset..][0..src.len], src);
+    }
+    if (index_size > 0) {
+        const src = std.mem.sliceAsBytes(self.cluster_indices[0..self.cluster_index_count]);
+        @memcpy(bytes[index_offset..][0..src.len], src);
+    }
+
+    c.SDL_UnmapGPUTransferBuffer(device, transfer);
+
+    const copy_pass = c.SDL_BeginGPUCopyPass(cmd) orelse return;
+
+    // Always upload at least a minimal amount so the buffer is valid
+    c.SDL_UploadToGPUBuffer(copy_pass, &c.SDL_GPUTransferBufferLocation{
+        .transfer_buffer = transfer,
+        .offset = 0,
+    }, &c.SDL_GPUBufferRegion{
+        .buffer = self.cluster_light_buffer.?,
+        .offset = 0,
+        .size = @max(light_size, @sizeOf(GPULight)),
+    }, true);
+
+    c.SDL_UploadToGPUBuffer(copy_pass, &c.SDL_GPUTransferBufferLocation{
+        .transfer_buffer = transfer,
+        .offset = info_offset,
+    }, &c.SDL_GPUBufferRegion{
+        .buffer = self.cluster_info_buffer.?,
+        .offset = 0,
+        .size = info_size,
+    }, true);
+
+    if (index_size > 0) {
+        c.SDL_UploadToGPUBuffer(copy_pass, &c.SDL_GPUTransferBufferLocation{
+            .transfer_buffer = transfer,
+            .offset = index_offset,
+        }, &c.SDL_GPUBufferRegion{
+            .buffer = self.cluster_index_buffer.?,
+            .offset = 0,
+            .size = index_size,
+        }, true);
+    }
+
+    c.SDL_EndGPUCopyPass(copy_pass);
+}
+
+/// Assign lights to clusters and upload cluster data for a specific camera.
+pub fn updateClusters(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, cam_entity: ecs.Entity) void {
+    const cam = self.registry.getConst(Camera, cam_entity);
+    const cam_pos = self.registry.getConst(Position, cam_entity);
+    assignLightsToClusters(self, .{ cam_pos.x, cam_pos.y, cam_pos.z }, cam.near, cam.far);
+    uploadClusterData(self, cmd);
 }
 
 /// Compute per-instance matrices and upload to GPU. Must be called before executeScenePass.
@@ -613,6 +894,14 @@ pub fn executeScenePass(
     const render_pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target) orelse return;
     c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
 
+    // Bind clustered lighting storage buffers to fragment shader
+    const frag_bufs = [3]*c.SDL_GPUBuffer{
+        self.cluster_light_buffer.?,
+        self.cluster_info_buffer.?,
+        self.cluster_index_buffer.?,
+    };
+    c.SDL_BindGPUFragmentStorageBuffers(render_pass, 0, &frag_bufs, 3);
+
     const w_f: f32 = @floatFromInt(w);
     const h_f: f32 = @floatFromInt(h);
     const vp_x = cam.viewport_x * w_f;
@@ -636,11 +925,30 @@ pub fn executeScenePass(
 
     const hdr_fog = srgbToHdr3(self.fog_color, exposure);
     const scene_uniforms = SceneUniforms{
-        .light_dir = frame.light_dir,
+        .light_dir = frame.dir_light.dir,
         .camera_pos = .{ cam_pos.x, cam_pos.y, cam_pos.z, 0.0 },
         .fog_color = .{ hdr_fog[0], hdr_fog[1], hdr_fog[2], if (self.fog_enabled) 1.0 else 0.0 },
         .fog_params = .{ self.fog_start, self.fog_end, 0.0, 0.0 },
         .ambient = self.ambient_color,
+        .light_color = frame.dir_light.color,
+        .cluster_grid = .{
+            @floatFromInt(cluster_x),
+            @floatFromInt(cluster_y),
+            @floatFromInt(cluster_z),
+            @floatFromInt(self.cluster_light_count),
+        },
+        .cluster_depth = .{
+            cam.near,
+            cam.far,
+            @log(cam.far / cam.near),
+            0.0,
+        },
+        .cluster_screen = .{
+            w_f,
+            h_f,
+            @as(f32, @floatFromInt(cluster_x)) / w_f,
+            @as(f32, @floatFromInt(cluster_y)) / h_f,
+        },
     };
     c.SDL_PushGPUFragmentUniformData(cmd, 0, &scene_uniforms, @sizeOf(SceneUniforms));
 
