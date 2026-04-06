@@ -62,7 +62,6 @@ lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1,
   0.37,  -- flare_ghost_dispersal
   0.5,   -- flare_halo_width
   0.005, -- flare_chroma_distortion
-  0.5,   -- flare_starburst
   0.5    -- flare_dirt_intensity
 )
 
@@ -196,7 +195,6 @@ lunatic.system("debug_ui", function(dt)
     cam_ref.flare_ghost_dispersal = ui.slider_float("Ghost Dispersal", cam_ref.flare_ghost_dispersal, 0.1, 1.0)
     cam_ref.flare_halo_width = ui.slider_float("Halo Width", cam_ref.flare_halo_width, 0.1, 0.9)
     cam_ref.flare_chroma_distortion = ui.slider_float("Chroma Distortion", cam_ref.flare_chroma_distortion, 0, 0.02)
-    cam_ref.flare_starburst = ui.slider_float("Starburst", cam_ref.flare_starburst, 0, 1)
     cam_ref.flare_dirt_intensity = ui.slider_float("Lens Dirt", cam_ref.flare_dirt_intensity, 0, 1)
   end
 

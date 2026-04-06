@@ -70,7 +70,7 @@ const CompositeParams = extern struct {
 
 const FlareParams = extern struct {
     params: [4]f32, // .x = ghost_dispersal, .y = halo_width, .z = chroma_distortion, .w = intensity
-    params2: [4]f32, // .x = starburst_intensity, .y = camera_angle_z (radians)
+    params2: [4]f32, // (reserved)
 };
 
 // ============================================================
@@ -147,9 +147,7 @@ pub const CameraPostSettings = struct {
     flare_ghost_dispersal: f32,
     flare_halo_width: f32,
     flare_chroma_distortion: f32,
-    flare_starburst: f32,
     flare_dirt_intensity: f32,
-    camera_angle_z: f32,
 };
 
 // ============================================================
@@ -777,12 +775,7 @@ pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain
                 settings.flare_chroma_distortion,
                 settings.flare_intensity,
             },
-            .params2 = .{
-                settings.flare_starburst,
-                settings.camera_angle_z,
-                0,
-                0,
-            },
+            .params2 = .{ 0, 0, 0, 0 },
         };
         c.SDL_PushGPUFragmentUniformData(cmd, 0, &flare_params, @sizeOf(FlareParams));
 

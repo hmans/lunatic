@@ -433,9 +433,7 @@ pub const Engine = struct {
                     .flare_ghost_dispersal = cam.flare_ghost_dispersal,
                     .flare_halo_width = cam.flare_halo_width,
                     .flare_chroma_distortion = cam.flare_chroma_distortion,
-                    .flare_starburst = cam.flare_starburst,
                     .flare_dirt_intensity = cam.flare_dirt_intensity,
-                    .camera_angle_z = self.registry.getConst(core_components.Rotation, cam_entity).z * (std.math.pi / 180.0),
                 };
                 // When capturing a screenshot, render to an intermediate texture
                 // instead of the swapchain (Metal swapchain is framebufferOnly).
