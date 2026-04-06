@@ -1,6 +1,6 @@
 # Lunatic Engine
 
-A 3D game engine: Zig core + SDL3 GPU + LuaJIT scripting + zig-ecs.
+A 3D game engine: Zig core + SDL3 GPU + LuaJIT scripting + zig-ecs. Please refer to the repository's [README.md](README.md) for an overview of the project.
 
 ## Goals
 
