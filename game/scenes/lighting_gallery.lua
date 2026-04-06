@@ -4,17 +4,18 @@ local scene = {
   name = "Lighting Gallery",
 }
 
--- Pre-create materials once (material registry is finite and never freed)
-local floor_mat = lunatic.create_material({ albedo = { 0.4, 0.4, 0.42 }, roughness = 0.7 })
-local pillar_mat = lunatic.create_material({ albedo = { 0.6, 0.6, 0.65 }, roughness = 0.3, metallic = 0.1 })
-local chrome = lunatic.create_material({ albedo = { 0.95, 0.95, 0.97 }, metallic = 1.0, roughness = 0.05 })
-
 function scene.setup(cam)
   local entities = {}
+  local materials = {}
 
   local function track(e)
     entities[#entities + 1] = e
     return e
+  end
+
+  local function track_mat(id)
+    materials[#materials + 1] = id
+    return id
   end
 
   -- Dark scene, no fog
@@ -34,12 +35,16 @@ function scene.setup(cam)
   lunatic.add(light, "directional_light", 0.2, 0.8, 0.3, 0.15, 0.15, 0.2)
 
   -- Floor
+  local floor_mat = track_mat(lunatic.create_material({ albedo = { 0.4, 0.4, 0.42 }, roughness = 0.7 }))
   local floor = track(lunatic.spawn())
   lunatic.add(floor, "position", 0, -0.25, 0)
   lunatic.add(floor, "mesh", "cube")
   lunatic.add(floor, "material", floor_mat)
   lunatic.add(floor, "scale", 30, 0.5, 30)
   lunatic.add(floor, "rotation", 0, 0, 0)
+
+  -- Some columns/cubes as geometry to catch light
+  local pillar_mat = track_mat(lunatic.create_material({ albedo = { 0.6, 0.6, 0.65 }, roughness = 0.3, metallic = 0.1 }))
   for i = 1, 6 do
     local angle = (i - 1) * math.pi * 2 / 6
     local x = math.cos(angle) * 6
@@ -53,6 +58,7 @@ function scene.setup(cam)
   end
 
   -- Center sphere (reflective)
+  local chrome = track_mat(lunatic.create_material({ albedo = { 0.95, 0.95, 0.97 }, metallic = 1.0, roughness = 0.05 }))
   local center = track(lunatic.spawn())
   lunatic.add(center, "position", 0, 1.5, 0)
   lunatic.add(center, "mesh", "sphere")
@@ -115,6 +121,9 @@ function scene.setup(cam)
     orbit_active = false
     for _, e in ipairs(entities) do
       pcall(lunatic.destroy, e)
+    end
+    for _, m in ipairs(materials) do
+      lunatic.destroy_material(m)
     end
   end
 end

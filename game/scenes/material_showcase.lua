@@ -4,32 +4,18 @@ local scene = {
   name = "Material Showcase",
 }
 
--- Pre-create materials once (material registry is finite and never freed)
-local rows = 7
-local cols = 7
-local spacing = 1.4
-
-local floor_mat = lunatic.create_material({ albedo = { 0.2, 0.2, 0.22 }, roughness = 0.95 })
-
-local grid_mats = {}
-for row = 0, rows - 1 do
-  for col = 0, cols - 1 do
-    local roughness = 0.05 + (row / (rows - 1)) * 0.95
-    local metallic = col / (cols - 1)
-    grid_mats[row * cols + col] = lunatic.create_material({
-      albedo = { 0.9, 0.3, 0.2 },
-      metallic = metallic,
-      roughness = roughness,
-    })
-  end
-end
-
 function scene.setup(cam)
   local entities = {}
+  local materials = {}
 
   local function track(e)
     entities[#entities + 1] = e
     return e
+  end
+
+  local function track_mat(id)
+    materials[#materials + 1] = id
+    return id
   end
 
   -- Neutral lighting
@@ -59,6 +45,7 @@ function scene.setup(cam)
   lunatic.add(rim, "point_light", 20, 1.0, 0.85, 0.6, 2.0)
 
   -- Floor
+  local floor_mat = track_mat(lunatic.create_material({ albedo = { 0.2, 0.2, 0.22 }, roughness = 0.95 }))
   local floor = track(lunatic.spawn())
   lunatic.add(floor, "position", 0, -0.6, 0)
   lunatic.add(floor, "mesh", "cube")
@@ -67,15 +54,25 @@ function scene.setup(cam)
   lunatic.add(floor, "rotation", 0, 0, 0)
 
   -- Grid of spheres: rows = roughness (0.05 to 1.0), columns = metallic (0 to 1)
+  local rows = 7
+  local cols = 7
+  local spacing = 1.4
   local x_offset = -(cols - 1) * spacing / 2
   local z_offset = -(rows - 1) * spacing / 2
 
   for row = 0, rows - 1 do
+    local roughness = 0.05 + (row / (rows - 1)) * 0.95
     for col = 0, cols - 1 do
+      local metallic = col / (cols - 1)
+      local mat = track_mat(lunatic.create_material({
+        albedo = { 0.9, 0.3, 0.2 },
+        metallic = metallic,
+        roughness = roughness,
+      }))
       local e = track(lunatic.spawn())
       lunatic.add(e, "position", x_offset + col * spacing, 0.5, z_offset + row * spacing)
       lunatic.add(e, "mesh", "sphere")
-      lunatic.add(e, "material", grid_mats[row * cols + col])
+      lunatic.add(e, "material", mat)
       lunatic.add(e, "scale", 0.5, 0.5, 0.5)
       lunatic.add(e, "rotation", 0, 0, 0)
     end
@@ -84,6 +81,9 @@ function scene.setup(cam)
   return function()
     for _, e in ipairs(entities) do
       pcall(lunatic.destroy, e)
+    end
+    for _, m in ipairs(materials) do
+      lunatic.destroy_material(m)
     end
   end
 end

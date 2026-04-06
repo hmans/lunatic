@@ -746,7 +746,6 @@ pub const Engine = struct {
     /// Upload vertex (and optional index) data to the GPU. Returns a mesh handle.
     /// Pass a name for built-in meshes (accessible via `lunatic.mesh.*` in Lua), or null.
     pub fn createMesh(self: *Engine, name: ?[*:0]const u8, vertices: []const Vertex, indices: ?[]const u32) !u32 {
-        if (self.assets.mesh_count >= max_meshes) return error.TooManyMeshes;
         const device = self.gpu_device orelse return error.NotInitialized;
         const vbuf = uploadGPUBuffer(device, std.mem.sliceAsBytes(vertices), c.SDL_GPU_BUFFERUSAGE_VERTEX) orelse return error.BufferFailed;
 
@@ -760,7 +759,23 @@ pub const Engine = struct {
             icount = @intCast(idx.len);
         }
 
-        const id = self.assets.mesh_count;
+        // Try to reuse a freed slot
+        var id: u32 = self.assets.mesh_count;
+        for (0..self.assets.mesh_count) |i| {
+            if (self.assets.mesh_registry[i] == null) {
+                id = @intCast(i);
+                break;
+            }
+        }
+        if (id == self.assets.mesh_count) {
+            if (self.assets.mesh_count >= max_meshes) {
+                c.SDL_ReleaseGPUBuffer(device, vbuf);
+                if (ibuf) |ib| c.SDL_ReleaseGPUBuffer(device, ib);
+                return error.TooManyMeshes;
+            }
+            self.assets.mesh_count += 1;
+        }
+
         self.assets.mesh_registry[id] = .{
             .vertex_buffer = vbuf,
             .vertex_count = @intCast(vertices.len),
@@ -768,8 +783,19 @@ pub const Engine = struct {
             .index_count = icount,
         };
         self.assets.mesh_names[id] = name;
-        self.assets.mesh_count += 1;
         return id;
+    }
+
+    /// Destroy a mesh, releasing its GPU buffers and freeing the registry slot.
+    pub fn destroyMesh(self: *Engine, id: u32) void {
+        if (id >= self.assets.mesh_count) return;
+        if (self.assets.mesh_registry[id]) |mesh| {
+            const device = self.gpu_device orelse return;
+            c.SDL_ReleaseGPUBuffer(device, mesh.vertex_buffer);
+            if (mesh.index_buffer) |ib| c.SDL_ReleaseGPUBuffer(device, ib);
+        }
+        self.assets.mesh_registry[id] = null;
+        self.assets.mesh_names[id] = null;
     }
 
     /// Generate and upload a unit cube mesh. Returns a mesh handle.
@@ -804,12 +830,28 @@ pub const Engine = struct {
 
     /// Create a material with an optional name (accessible via `lunatic.material.*` in Lua).
     pub fn createNamedMaterial(self: *Engine, name: ?[*:0]const u8, data: MaterialData) !u32 {
+        // First try to reuse a freed slot
+        for (0..self.assets.material_count) |i| {
+            if (self.assets.material_registry[i] == null) {
+                self.assets.material_registry[i] = data;
+                self.assets.material_names[i] = name;
+                return @intCast(i);
+            }
+        }
+        // Otherwise append
         if (self.assets.material_count >= max_materials) return error.TooManyMaterials;
         const id = self.assets.material_count;
         self.assets.material_registry[id] = data;
         self.assets.material_names[id] = name;
         self.assets.material_count += 1;
         return id;
+    }
+
+    /// Destroy a material, freeing its registry slot for reuse.
+    pub fn destroyMaterial(self: *Engine, id: u32) void {
+        if (id >= self.assets.material_count) return;
+        self.assets.material_registry[id] = null;
+        self.assets.material_names[id] = null;
     }
 
     /// Look up a named material by string. Returns the handle or null.

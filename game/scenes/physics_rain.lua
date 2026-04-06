@@ -4,19 +4,18 @@ local scene = {
   name = "Physics Rain",
 }
 
--- Pre-create materials once (material registry is finite and never freed)
-local white  = lunatic.create_material({ albedo = { 0.85, 0.85, 0.85 } })
-local ember  = lunatic.create_material({ albedo = { 1, 0.4, 0.05 }, emissive = { 40, 12, 1 } })
-local matte  = lunatic.create_material({ albedo = { 0.05, 0.05, 0.05 }, roughness = 1.0 })
-local silver = lunatic.create_material({ albedo = { 0.9, 0.9, 0.92 }, metallic = 1.0, roughness = 0.15 })
-local floor_mat = lunatic.create_material({ albedo = { 0.25, 0.25, 0.28 }, roughness = 0.9 })
-
 function scene.setup(cam)
   local entities = {}
+  local materials = {}
 
   local function track(e)
     entities[#entities + 1] = e
     return e
+  end
+
+  local function track_mat(id)
+    materials[#materials + 1] = id
+    return id
   end
 
   -- Scene settings
@@ -56,6 +55,13 @@ function scene.setup(cam)
   local spot = track(lunatic.spawn())
   lunatic.add(spot, "position", 0, 12, 0)
   lunatic.add(spot, "spot_light", 18, 1.0, 0.9, 0.7, 5.0, 0, -1, 0, 20, 35)
+
+  -- Materials
+  local white  = track_mat(lunatic.create_material({ albedo = { 0.85, 0.85, 0.85 } }))
+  local ember  = track_mat(lunatic.create_material({ albedo = { 1, 0.4, 0.05 }, emissive = { 40, 12, 1 } }))
+  local matte  = track_mat(lunatic.create_material({ albedo = { 0.05, 0.05, 0.05 }, roughness = 1.0 }))
+  local silver = track_mat(lunatic.create_material({ albedo = { 0.9, 0.9, 0.92 }, metallic = 1.0, roughness = 0.15 }))
+  local floor_mat = track_mat(lunatic.create_material({ albedo = { 0.25, 0.25, 0.28 }, roughness = 0.9 }))
 
   -- Floor
   local floor = track(lunatic.spawn())
@@ -144,6 +150,9 @@ function scene.setup(cam)
       if body_ring[i] then
         pcall(lunatic.destroy, body_ring[i])
       end
+    end
+    for _, m in ipairs(materials) do
+      lunatic.destroy_material(m)
     end
   end
 end
