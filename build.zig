@@ -17,9 +17,9 @@ fn addShader(
 
     const glslc = b.addSystemCommand(&.{
         "glslc", stage_flag,
-        "engine/shaders/" ++ dir ++ "/" ++ name ++ "." ++ ext,
-        "-o",
     });
+    glslc.addFileArg(b.path("engine/shaders/" ++ dir ++ "/" ++ name ++ "." ++ ext));
+    glslc.addArg("-o");
     const spv = glslc.addOutputFileArg(name ++ "." ++ ext ++ ".spv");
 
     const spirv_cross = b.addSystemCommand(&.{
