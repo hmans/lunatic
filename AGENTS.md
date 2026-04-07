@@ -113,6 +113,55 @@ A file-based screenshot mechanism also exists for use without the debug server. 
 
 On Metal, the swapchain texture is framebufferOnly, so the engine renders to an intermediate texture, blits to the swapchain, and downloads from the intermediate. This adds one frame of GPU sync (fence wait) only on screenshot frames.
 
+## Running the Engine as an Agent
+
+You are encouraged to run the engine to test changes, inspect state, and take screenshots. Both the game and the examples suite are available:
+
+```sh
+zig build run               # game (game/main.lua)
+zig build run-examples      # examples suite (examples/main.lua)
+```
+
+Run these in the background. The engine opens a window and starts its main loop; the HTTP APIs become available once you see `[debug-server] listening on http://127.0.0.1:19840` in the output.
+
+### Interacting with the running engine
+
+**Debug server** (primary interface, `localhost:19840`):
+
+```sh
+curl http://localhost:19840/stats                           # JSON: FPS, entity count, GPU timing
+curl -d 'return lunatic.get_stats()' http://localhost:19840/lua  # Evaluate arbitrary Lua
+curl -X POST http://localhost:19840/screenshot -o screenshot.png # Capture current frame
+```
+
+The `/lua` endpoint is the most powerful — you can spawn/destroy entities, modify components, change camera settings, query the ECS, or run any code available to Lua scripts.
+
+**Flecs REST API** (ECS inspection, `localhost:27750`):
+
+```sh
+curl http://localhost:27750/world                                # All entities + components
+curl "http://localhost:27750/query?expr=core_components.Camera"  # Query by component
+curl http://localhost:27750/entity/flecs                         # Specific entity
+```
+
+**MCP tools**: If the MCP server is running (`mcp/server.mjs`), you also have `eval_lua`, `screenshot`, and `get_stats` available as MCP tool calls.
+
+### Process lifecycle — IMPORTANT
+
+**Always kill the engine process when you're done with it.** The engine holds the GPU, audio device, and network ports. Leaving it running wastes resources and blocks subsequent launches.
+
+```sh
+pkill -f "lunatic" 2>/dev/null    # Kill by process name
+```
+
+Do this:
+- After verifying a change looks correct
+- Before starting a new build (the old process holds the ports)
+- When switching between `run` and `run-examples`
+- At the end of any task that involved running the engine
+
+If you forget, the next `zig build run` will succeed but the debug server will fail to bind its port, and MCP tools won't work.
+
 ## Scale Target
 
 The engine must handle tens of thousands to hundreds of thousands of entities efficiently, even if current demos are small. Design all per-entity paths (queries, iteration, rendering) with this scale in mind. Avoid per-entity allocations, per-entity `pcall`, or O(n²) patterns in hot loops.
