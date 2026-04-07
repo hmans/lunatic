@@ -1117,33 +1117,82 @@ fn luaLoadGltf(L: ?*lc.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// lunatic.system(name, callback [, phase])
-/// Register a Lua system. Optional phase argument controls when the system
-/// runs in the flecs pipeline: "on_load", "post_load", "pre_update",
-/// "on_update" (default), "post_update", "pre_store", "on_store".
+/// lunatic.system(name, callback [, phase])          — imperative (no query)
+/// lunatic.system(name, {components}, callback [, phase]) — query-driven
+///
+/// Imperative systems run once per frame with defer_suspend (read-after-write safe).
+/// Query-driven systems declare component interests and are called per matching
+/// entity with (dt, entity). Flecs manages their data dependencies for scheduling.
+///
+/// Phase is optional: "on_load", "post_load", "pre_update", "on_update" (default),
+/// "post_update", "pre_store", "on_store".
 fn luaSystemRegister(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
+    const nargs = lc.lua_gettop(L);
     const name = lc.luaL_checklstring(L, 1, null);
-    lc.luaL_checktype(L, 2, lc.LUA_TFUNCTION);
 
-    // Optional 3rd arg: phase name string
-    const phase_name: ?[]const u8 = if (lc.lua_gettop(L) >= 3 and lc.lua_type(L, 3) == lc.LUA_TSTRING)
-        std.mem.span(lc.lua_tolstring(L, 3, null))
-    else
-        null;
-    const phase = Engine.resolvePhase(phase_name);
+    // Detect form: is arg 2 a table (query-driven) or function (imperative)?
+    if (nargs >= 3 and lc.lua_type(L, 2) == lc.LUA_TTABLE) {
+        // Query-driven: system("name", {"pos", "rot"}, callback [, phase])
+        lc.luaL_checktype(L, 3, lc.LUA_TFUNCTION);
 
-    lc.lua_pushvalue(L, 2);
-    const ref = lc.luaL_ref(L, lc.LUA_REGISTRYINDEX);
+        // Read component names from table
+        var comp_ids: [16]ecs.id_t = undefined;
+        var comp_count: usize = 0;
+        const table_len: usize = @intCast(lc.lua_objlen(L, 2));
+        for (0..@min(table_len, 16)) |i| {
+            lc.lua_rawgeti(L, 2, @intCast(i + 1));
+            const comp_name = std.mem.span(lc.lua_tolstring(L, -1, null));
+            lc.lua_pop(L, 1);
+            if (findOps(comp_name)) |found| {
+                comp_ids[comp_count] = found.ops.idFn();
+                comp_count += 1;
+            } else {
+                _ = lc.luaL_error(L, "unknown component: %s", lc.luaL_checklstring(L, -1, null));
+                return 0;
+            }
+        }
 
-    if (self.lua_system_count >= engine_mod.max_lua_systems) {
-        _ = lc.luaL_error(L, "too many lua systems");
-        return 0;
+        // Optional phase (4th arg)
+        const phase_name: ?[]const u8 = if (nargs >= 4 and lc.lua_type(L, 4) == lc.LUA_TSTRING)
+            std.mem.span(lc.lua_tolstring(L, 4, null))
+        else
+            null;
+        const phase = Engine.resolvePhase(phase_name);
+
+        lc.lua_pushvalue(L, 3); // push callback
+        const ref = lc.luaL_ref(L, lc.LUA_REGISTRYINDEX);
+
+        if (self.lua_system_count >= engine_mod.max_lua_systems) {
+            _ = lc.luaL_error(L, "too many lua systems");
+            return 0;
+        }
+
+        const entity = self.addLuaQuerySystem(name, ref, phase, comp_ids[0..comp_count]);
+        lc.lua_pushinteger(L, @intCast(entity));
+        return 1;
+    } else {
+        // Imperative: system("name", callback [, phase])
+        lc.luaL_checktype(L, 2, lc.LUA_TFUNCTION);
+
+        const phase_name: ?[]const u8 = if (nargs >= 3 and lc.lua_type(L, 3) == lc.LUA_TSTRING)
+            std.mem.span(lc.lua_tolstring(L, 3, null))
+        else
+            null;
+        const phase = Engine.resolvePhase(phase_name);
+
+        lc.lua_pushvalue(L, 2);
+        const ref = lc.luaL_ref(L, lc.LUA_REGISTRYINDEX);
+
+        if (self.lua_system_count >= engine_mod.max_lua_systems) {
+            _ = lc.luaL_error(L, "too many lua systems");
+            return 0;
+        }
+
+        const entity = self.addLuaSystem(name, ref, phase);
+        lc.lua_pushinteger(L, @intCast(entity));
+        return 1;
     }
-
-    const entity = self.addLuaSystem(name, ref, phase);
-    lc.lua_pushinteger(L, @intCast(entity));
-    return 1;
 }
 
 /// lunatic.reset_systems() — remove all Lua-registered systems.

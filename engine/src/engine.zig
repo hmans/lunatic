@@ -314,9 +314,8 @@ fn zigSystemCallback(comptime func: ZigSystemFn) ecs.iter_action_t {
     }.callback;
 }
 
-/// C-callable flecs callback for Lua systems. The lua_ref is stored as an
-/// integer packed into the ctx pointer. Engine is accessed via the world's
-/// engine singleton (stored at init).
+/// C-callable flecs callback for imperative Lua systems (no query terms).
+/// Called once per frame. Uses defer_suspend for read-after-write safety.
 fn luaSystemCallback(it: *ecs.iter_t) callconv(.c) void {
     const engine: *Engine = @ptrCast(@alignCast(it.ctx));
     const lua_ref: c_int = @intCast(@intFromPtr(it.callback_ctx));
@@ -334,6 +333,29 @@ fn luaSystemCallback(it: *ecs.iter_t) callconv(.c) void {
         return;
     }
     ecs.defer_resume(engine.world);
+}
+
+/// C-callable flecs callback for query-driven Lua systems.
+/// Called per archetype table with matched entities. Iterates entities
+/// and calls the Lua callback with (dt, entity) for each.
+/// No defer_suspend — flecs manages data dependencies via query terms.
+fn luaQuerySystemCallback(it: *ecs.iter_t) callconv(.c) void {
+    const engine: *Engine = @ptrCast(@alignCast(it.ctx));
+    const lua_ref: c_int = @intCast(@intFromPtr(it.callback_ctx));
+    const L = engine.lua_state orelse return;
+
+    for (it.entities()) |entity| {
+        lc.lua_rawgeti(L, lc.LUA_REGISTRYINDEX, lua_ref);
+        lc.lua_pushnumber(L, it.delta_time);
+        lc.lua_pushinteger(L, @intCast(entity));
+        if (lc.lua_pcall(L, 2, 0, 0) != 0) {
+            const err = lc.lua_tolstring(L, -1, null);
+            std.debug.print("Lua system error: {s}\n", .{err});
+            lc.lua_pop(L, 1);
+            ecs.enable(engine.world, it.system, false);
+            return;
+        }
+    }
 }
 
 /// Build a flecs query from slices of include/exclude component IDs.
@@ -1521,6 +1543,29 @@ pub const Engine = struct {
         if (std.mem.eql(u8, name, "pre_store")) return ecs.PreStore;
         if (std.mem.eql(u8, name, "on_store")) return ecs.OnStore;
         return ecs.OnUpdate; // fallback
+    }
+
+    /// Register a query-driven Lua system. The system has proper flecs query
+    /// terms so the scheduler knows its data dependencies. The Lua callback
+    /// is called with (dt, entity) for each matching entity.
+    pub fn addLuaQuerySystem(self: *Engine, name: [*:0]const u8, lua_ref: c_int, phase: ecs.entity_t, comp_ids: []const ecs.id_t) ecs.entity_t {
+        if (self.lua_system_count >= max_lua_systems) return 0;
+        var desc = std.mem.zeroes(ecs.system_desc_t);
+        desc.callback = &luaQuerySystemCallback;
+        desc.ctx = self;
+        desc.callback_ctx = @ptrFromInt(@as(usize, @intCast(lua_ref)));
+        desc.phase = phase;
+        desc.multi_threaded = false;
+        // Set query terms from component IDs
+        for (comp_ids, 0..) |comp_id, i| {
+            if (i >= ecs.ECS_MEMBER_DESC_CACHE_SIZE) break;
+            desc.query.terms[i].id = comp_id;
+            desc.query.terms[i].inout = .InOut;
+        }
+        const entity = ecs.SYSTEM(self.world, name, &desc);
+        self.lua_system_entities[self.lua_system_count] = entity;
+        self.lua_system_count += 1;
+        return entity;
     }
 
     /// Tick all systems via the flecs pipeline.
