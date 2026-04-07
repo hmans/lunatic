@@ -114,7 +114,7 @@ function scene.setup(cam)
     lunatic.add(e, "material", mat)
     lunatic.add(e, "shadow_caster")
     lunatic.add(e, "shadow_receiver")
-    lunatic.physics_add_sphere(e, scale * 0.5, "dynamic", 0.1, 1.5)
+    lunatic.physics_add_sphere(e, scale * 0.5, "dynamic", 0.3, 1.5)
 
     body_ring[ring_head] = e
     ring_head = (ring_head % max_bodies) + 1
