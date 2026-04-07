@@ -19,9 +19,9 @@ function scene.setup(cam)
   end
 
   -- Scene settings
-  lunatic.set_clear_color(0.08, 0.08, 0.12)
-  lunatic.set_ambient(0.15, 0.15, 0.25)
-  lunatic.set_fog(15, 60, 0.08, 0.08, 0.12)
+  lunatic.set_clear_color(0.02, 0.02, 0.04)
+  lunatic.set_ambient(0.03, 0.03, 0.05)
+  lunatic.set_fog(20, 60, 0.02, 0.02, 0.04)
 
   -- Camera position
   lunatic.ref(cam, "position").x = 0
@@ -32,7 +32,7 @@ function scene.setup(cam)
 
   -- Directional light
   local light = track(lunatic.spawn())
-  lunatic.add(light, "directional_light", 0.3, 0.8, 0.5, 1.0, 0.95, 0.9)
+  lunatic.add(light, "directional_light", 0.3, 0.8, 0.5, 0.4, 0.38, 0.35)
 
   -- Point lights in a ring
   local light_colors = {
@@ -48,7 +48,7 @@ function scene.setup(cam)
     local col = light_colors[((i - 1) % #light_colors) + 1]
     local pl = track(lunatic.spawn())
     lunatic.add(pl, "position", x, 3, z)
-    lunatic.add(pl, "point_light", 12, col[1], col[2], col[3], 3.0)
+    lunatic.add(pl, "point_light", 14, col[1], col[2], col[3], 8.0)
   end
 
   -- Spot light
@@ -61,7 +61,7 @@ function scene.setup(cam)
   local ember  = track_mat(lunatic.create_material({ albedo = { 1, 0.4, 0.05 }, emissive = { 40, 12, 1 } }))
   local matte  = track_mat(lunatic.create_material({ albedo = { 0.05, 0.05, 0.05 }, roughness = 1.0 }))
   local silver = track_mat(lunatic.create_material({ albedo = { 0.9, 0.9, 0.92 }, metallic = 1.0, roughness = 0.15 }))
-  local floor_mat = track_mat(lunatic.create_material({ albedo = { 0.25, 0.25, 0.28 }, roughness = 0.9 }))
+  local floor_mat = track_mat(lunatic.create_material({ albedo = { 0.15, 0.15, 0.17 }, roughness = 0.85 }))
 
   -- Floor
   local floor = track(lunatic.spawn())
