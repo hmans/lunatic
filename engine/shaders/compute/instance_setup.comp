@@ -1,0 +1,271 @@
+#version 450
+
+// ============================================================================
+// Instance Setup + Frustum Culling + HiZ Occlusion Culling + Indirect Draw
+// — Lunatic Engine
+// ============================================================================
+//
+// GPU-driven compute shader that:
+// 1. Reads raw entity transform data (position, rotation, scale, flags)
+// 2. Builds the model matrix (T * R * S) on the GPU
+// 3. Tests the entity against 6 frustum planes (bounding sphere)
+// 4. Tests the entity against the HiZ depth pyramid (occlusion culling)
+// 5. For visible entities in scene mode: compacts into per-batch regions via
+//    atomicAdd on indirect draw commands (GPU determines instance count)
+// 6. For shadow mode: writes at the entity's index (no compaction)
+//
+// === HiZ Occlusion Culling ===
+// Uses the previous frame's hierarchical depth buffer to reject entities hidden
+// behind geometry. The test projects each entity's bounding sphere center to
+// the previous frame's screen space, picks the HiZ mip level that covers the
+// projected radius, and compares the entity's nearest depth against the stored
+// max depth. If the entity is farther than everything in that HiZ region, it's
+// fully occluded and can be skipped.
+//
+// This is a "previous-frame reprojection" approach with inherent 1-frame latency,
+// the same technique used by UE5/Nanite. The latency is imperceptible in practice.
+// On the first frame or after camera teleportation, occlusion culling is disabled
+// (HiZ contains far-plane depth, so nothing gets culled).
+//
+// The indirect draw commands are initialized with num_instances=0 by the CPU.
+// Each visible entity atomicAdds 1 to its batch's num_instances, getting back
+// the local instance index within the batch's region. After the dispatch, the
+// indirect draw buffer is ready for SDL_DrawGPUIndexedPrimitivesIndirect.
+//
+// Workgroup size: 64 threads (one entity per thread).
+// Dispatch: ceil(entity_count / 64) workgroups in X.
+//
+// SDL3 GPU SPIR-V compute binding layout:
+//   Set 0: readonly storage buffers (entity data, batch info)
+//   Set 1: readwrite storage buffers (instance output, indirect commands)
+//   Set 2: uniform buffers
+//   Set 3: samplers (HiZ depth pyramid)
+// ============================================================================
+
+layout(local_size_x = 64) in;
+
+// ---------------------------------------------------------------------------
+// Per-entity input data uploaded from CPU each frame.
+// ---------------------------------------------------------------------------
+
+struct EntityData {
+    vec4 position;     // xyz = world position, w = receives_shadow (1.0 or 0.0)
+    vec4 rotation;     // xyz = euler angles in degrees, w = batch_id (as float)
+    vec4 scale_flags;  // xyz = scale factors, w = is_shadow_caster (1.0 or 0.0)
+};
+
+// ---------------------------------------------------------------------------
+// Per-instance output consumed by the vertex shader.
+// Must match InstanceData in renderer.zig and default.vert exactly.
+// ---------------------------------------------------------------------------
+
+struct InstanceData {
+    mat4 mvp;
+    mat4 model;
+    vec4 flags;  // .x = receives_shadow
+};
+
+// ---------------------------------------------------------------------------
+// Indirect draw command — matches SDL_GPUIndexedIndirectDrawCommand.
+// The compute shader atomically increments num_instances for visible entities.
+// ---------------------------------------------------------------------------
+
+struct IndirectDrawCommand {
+    uint num_indices;
+    uint num_instances;   // atomic counter, incremented by visible entities
+    uint first_index;
+    int  vertex_offset;
+    uint first_instance;
+};
+
+// ---------------------------------------------------------------------------
+// Buffer bindings
+// ---------------------------------------------------------------------------
+
+// Readonly: entity data (set 0, binding 0) and batch info (set 0, binding 1)
+layout(std430, set = 0, binding = 0) readonly buffer EntityBuffer {
+    EntityData entities[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer BatchInfoBuffer {
+    uint batch_instance_offsets[];  // per-batch instance start in the output buffer
+};
+
+// Readwrite: instance output (set 1, binding 0) and indirect commands (set 1, binding 1)
+layout(std430, set = 1, binding = 0) buffer InstanceBufferOut {
+    InstanceData instances[];
+};
+
+layout(std430, set = 1, binding = 1) buffer IndirectCommandBuffer {
+    IndirectDrawCommand indirect_commands[];
+};
+
+// Culling statistics — atomic counters for debug display.
+// Read back by CPU one frame later (no stall) for the stats panel.
+layout(std430, set = 1, binding = 2) buffer CullingStatsBuffer {
+    uint visible_count;     // entities that passed all culling tests
+    uint frustum_culled;    // entities rejected by frustum culling
+    uint occlusion_culled;  // entities rejected by HiZ occlusion culling
+};
+
+// Uniforms
+layout(std140, set = 2, binding = 0) uniform ComputeUniforms {
+    mat4 vp;
+    vec4 frustum_planes[6];
+    uint entity_count;
+    uint shadow_pass;
+    uint frustum_cull;
+    uint occlusion_cull;         // 0 = disabled, 1 = test against HiZ
+    mat4 prev_vp;                // previous frame's view-projection matrix
+    vec4 prev_camera_pos;        // xyz = previous frame camera world position
+    vec4 hiz_params;             // x = hiz_width (level 0), y = hiz_height (level 0), z = max_mip_level, w = unused
+};
+
+// HiZ depth pyramid (sampled at selected mip level)
+layout(set = 3, binding = 0) uniform sampler2D hiz_texture;
+
+// ---------------------------------------------------------------------------
+// Model matrix construction (T * R * S, rotation = rotZ * rotY * rotX)
+// ---------------------------------------------------------------------------
+
+mat4 buildModelMatrix(vec3 pos, vec3 euler_deg, vec3 scl) {
+    vec3 rad = radians(euler_deg);
+    float cx = cos(rad.x), sx = sin(rad.x);
+    float cy = cos(rad.y), sy = sin(rad.y);
+    float cz = cos(rad.z), sz = sin(rad.z);
+
+    return mat4(
+        vec4(( cy*cz)            * scl.x, ( cy*sz)            * scl.x, (-sy)     * scl.x, 0.0),
+        vec4((sx*sy*cz - cx*sz)  * scl.y, (sx*sy*sz + cx*cz)  * scl.y, ( sx*cy)  * scl.y, 0.0),
+        vec4((cx*sy*cz + sx*sz)  * scl.z, (cx*sy*sz - sx*cz)  * scl.z, ( cx*cy)  * scl.z, 0.0),
+        vec4(pos, 1.0)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Frustum culling: bounding sphere vs 6 planes
+// ---------------------------------------------------------------------------
+
+bool isOutsideFrustum(vec3 center, float radius) {
+    for (int i = 0; i < 6; i++) {
+        float dist = dot(frustum_planes[i].xyz, center) + frustum_planes[i].w;
+        if (dist < -radius) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// HiZ occlusion culling: bounding sphere projected to previous frame's screen
+// ---------------------------------------------------------------------------
+//
+// Projects the entity's bounding sphere to the previous frame's screen space,
+// then samples the HiZ pyramid at the mip level matching the projected size.
+// Returns true if the entity is fully occluded (behind all geometry in the
+// corresponding HiZ region).
+//
+// Uses the entity's bounding sphere (same as frustum culling — center is the
+// world position, radius is max(abs(scale.xyz))). This is cheaper than 8-corner
+// AABB projection and sufficient for most geometry.
+
+bool isOccluded(vec3 world_center, float radius) {
+    // Project bounding sphere center to previous frame's clip space
+    vec4 clip = prev_vp * vec4(world_center, 1.0);
+
+    // Behind the camera — can't reliably test, assume visible
+    if (clip.w <= 0.0) return false;
+
+    // NDC → UV (Y-flipped to match HiZ texture orientation).
+    // The HiZ is built via the fullscreen vertex shader which flips Y so that
+    // UV (0,0) = top-left. NDC Y goes up (+1 = top), so we negate it.
+    vec3 ndc = clip.xyz / clip.w;
+    vec2 uv = vec2(ndc.x * 0.5 + 0.5, (-ndc.y) * 0.5 + 0.5);
+
+    // Off-screen in previous frame — might have scrolled into view, assume visible
+    if (uv.x < -0.1 || uv.x > 1.1 || uv.y < -0.1 || uv.y > 1.1) return false;
+    uv = clamp(uv, vec2(0.0), vec2(1.0));
+
+    // Compute linear depth: distance from previous camera to entity center
+    float entity_nearest_depth = length(world_center - prev_camera_pos.xyz) - radius;
+    if (entity_nearest_depth <= 0.0) return false; // camera is inside the sphere
+
+    // Project the sphere radius to screen pixels to pick the right HiZ mip level.
+    // Approximate: radius in clip space ≈ radius / clip.w, then scale to pixels.
+    float proj_radius_pixels = (radius / clip.w) * max(hiz_params.x, hiz_params.y) * 0.5;
+    float diameter_pixels = proj_radius_pixels * 2.0;
+
+    // Pick mip level: we want the HiZ texel to cover roughly the projected diameter.
+    // Higher mip = coarser = covers more screen area.
+    float mip = ceil(log2(max(diameter_pixels, 1.0)));
+    mip = clamp(mip, 0.0, hiz_params.z);
+
+    // Sample HiZ at the center of the projected sphere.
+    // textureLod uses the mip chain of the bound texture.
+    float hiz_depth = textureLod(hiz_texture, uv, mip).r;
+
+    // Entity is occluded if its nearest point is farther than the max depth
+    // stored in the HiZ region (with a small safety margin to prevent popping
+    // at depth boundaries due to the 1-frame latency).
+    return entity_nearest_depth > hiz_depth * 1.05;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    // --- Buffer access ordering ---
+    // spirv-cross assigns MSL [[buffer(N)]] indices by first-access order.
+    // SDL3 Metal expects: uniforms → readonly storage → readwrite storage.
+    // We force this order by reading from all readonly buffers before any
+    // readwrite buffer access. The uniform (entity_count) is already first.
+    if (idx >= entity_count) return;     // uniform (set 2) → buffer(0)
+    EntityData e = entities[idx];        // readonly 0 (set 0, binding 0) → buffer(1)
+    uint batch_id = uint(e.rotation.w);
+    uint batch_offset = batch_instance_offsets[batch_id]; // readonly 1 (set 0, binding 1) → buffer(2)
+    // readwrite buffers (instances, indirect_commands) are first accessed below → buffer(3), buffer(4)
+
+    // --- Shadow pass: no compaction, write at entity index ---
+    if (shadow_pass != 0u) {
+        if (e.scale_flags.w < 0.5) {
+            instances[idx] = InstanceData(mat4(0.0), mat4(0.0), vec4(0.0));
+            return;
+        }
+        mat4 model = buildModelMatrix(e.position.xyz, e.rotation.xyz, e.scale_flags.xyz);
+        instances[idx] = InstanceData(vp * model, model, vec4(0.0));
+        return;
+    }
+
+    // --- Scene pass: frustum cull + occlusion cull + compact via atomicAdd ---
+
+    float radius = max(abs(e.scale_flags.x), max(abs(e.scale_flags.y), abs(e.scale_flags.z)));
+
+    // Frustum culling: reject entities completely outside the view frustum
+    if (frustum_cull != 0u) {
+        if (isOutsideFrustum(e.position.xyz, radius)) {
+            atomicAdd(frustum_culled, 1u);
+            return;  // culled — don't write anything, no indirect draw increment
+        }
+    }
+
+    // HiZ occlusion culling: reject entities hidden behind other geometry
+    // (uses previous frame's depth pyramid — 1-frame latency, imperceptible)
+    if (occlusion_cull != 0u) {
+        if (isOccluded(e.position.xyz, radius)) {
+            atomicAdd(occlusion_culled, 1u);
+            return;  // occluded — skip this entity
+        }
+    }
+
+    // Visible — passed both culling tests
+    atomicAdd(visible_count, 1u);
+
+    // Visible: build matrices and compact into batch region
+    mat4 model = buildModelMatrix(e.position.xyz, e.rotation.xyz, e.scale_flags.xyz);
+    mat4 mvp = vp * model;
+    vec4 out_flags = vec4(e.position.w, 0.0, 0.0, 0.0);
+
+    // Atomically claim a slot in this batch's indirect draw command.
+    // The returned value is the local instance index within the batch.
+    uint local_idx = atomicAdd(indirect_commands[batch_id].num_instances, 1u);
+
+    // Write instance to compacted position: batch base + local index
+    instances[batch_offset + local_idx] = InstanceData(mvp, model, out_flags);
+}

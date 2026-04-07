@@ -13,6 +13,7 @@ A 3D game engine: Zig core + SDL3 GPU + LuaJIT scripting + flecs ECS. Please ref
 - `engine/src/` — engine core (Zig)
 - `engine/shaders/scene/` — scene rendering shaders (default.vert/frag)
 - `engine/shaders/shadow/` — shadow map shaders (shadow.vert/frag)
+- `engine/shaders/compute/` — compute shaders (GPU-driven instance setup, future culling)
 - `engine/shaders/postprocess/` — post-processing shaders (bloom, DoF, composite, etc.)
 - `engine/vendor/` — vendored C/C++ libs (stb_image, cgltf, Dear ImGui + dcimgui)
 - `game/` — user's game project (skeleton: main.zig, components.zig, main.lua)
@@ -34,11 +35,27 @@ Each target has its own `components.zig` for game-specific components. The engin
 - Engine code is split by responsibility: `engine.zig` (lifecycle, registries, frame orchestration, built-in systems), `renderer.zig` (GPU pipeline, scene rendering), `postprocess.zig` (bloom, DoF, composite+tonemap — GPU handles only, settings from Camera component), `lua_api.zig` (Lua bindings + ImGui `ui` table), `component_ops.zig` (comptime vtable generator), `debug_server.zig` (HTTP debug server + request queue).
 - Adding a new asset handle type (e.g. `TextureHandle` with string name resolution): define struct with `.resolve = .texture` in its `.lua` metadata, add to the `.all` tuple, add a `.texture` variant to `HandleKind` in `engine.zig`, and add a case to `Engine.resolveHandle()`'s switch.
 
+### GPU-Driven Instance Setup (Compute Shader)
+
+Per-instance transform computation (model + MVP matrices) runs on the GPU via a compute shader (`engine/shaders/compute/instance_setup.comp`). The frame loop:
+
+1. **CPU**: `prepareFrame()` builds the sorted draw list, then `uploadEntityData()` uploads raw entity transforms (position, rotation, scale, flags) to a GPU storage buffer via transfer buffer — done once per frame.
+2. **GPU**: `dispatchInstanceSetup()` runs the compute shader, which reads entity data, builds model matrices (T * R * S), multiplies by the VP matrix, and writes `InstanceData` to the instance buffer. Called once per shadow cascade (×4) and once per scene camera — 5 dispatches total, all reusing the same entity data.
+3. **GPU**: The vertex shader reads from the instance buffer as before (no change to the graphics pipeline).
+
+The compute shader handles both scene and shadow passes: in shadow mode (`shadow_pass=1`), non-shadow-caster entities get zeroed MVPs so their triangles degenerate and produce no fragments. In scene mode, the compute shader also performs **HiZ occlusion culling** — projecting each entity's bounding sphere to the previous frame's screen space and testing against the hierarchical depth pyramid.
+
+**HiZ Occlusion Culling**: Uses previous-frame depth reprojection (same approach as UE5/Nanite). The frame loop builds a HiZ mip chain from the HDR alpha channel (linear depth) before the scene pass clears it. The compute shader samples this via `textureLod()` to reject entities hidden behind geometry. Architecture: individual R32_FLOAT textures per mip level (render targets for the downsample chain) + one combined mipmapped R32_FLOAT texture (copy destination, sampled by compute). This avoids read-write hazards during downsample while giving the compute shader efficient mip-level access. State: `prev_vp` and `prev_camera_pos` on Engine struct, updated each frame after scene dispatch.
+
+**Adding compute shaders**: Add a `.comp` file in `engine/shaders/compute/`, call `addShader(b, mod, "compute", name, "comp", .compute)` in `addShaders()`. Compute shaders use a different spirv-cross flag (no `--msl-decoration-binding`) to produce correct Metal buffer ordering (uniforms → readonly → readwrite). The `createComputePipeline()` helper in `renderer.zig` handles pipeline creation.
+
 ### Post-Processing Pipeline
 
 All post-processing settings live on the **Camera component** (per-camera). Pipeline order:
 
 ```
+HiZ build (from previous frame's HDR alpha) → depth pyramid (R32F mip chain)
+  → Compute dispatch: frustum cull + HiZ occlusion cull + instance compaction
 Scene → HDR texture (R16G16B16A16_FLOAT, linear depth in alpha)
   → DoF (if dof_focus_dist > 0): CoC → prefilter → bokeh gather → tent filter → composite
   → Bloom (if bloom_intensity > 0): 6-level mip-chain downsample → upsample with per-level tints
@@ -204,5 +221,5 @@ The engine must handle tens of thousands to hundreds of thousands of entities ef
 - **HDR clear/fog colors**: User-specified sRGB colors are inverse-ACES-transformed in `renderer.zig` so they round-trip correctly through the tonemap. When changing the tonemapper, update `srgbToHdr()`.
 - **DoF depth storage**: Linear depth is stored in the HDR texture's alpha channel (written in `default.frag`). Clear color alpha is set to 1000.0 for background/sky. New fragment shaders must write linear depth to alpha.
 - **PostProcess texture ping-pong**: DoF composite writes to `hdr_texture_b` then swaps with `hdr_texture` to avoid read-write hazards. Bloom and final composite read from whichever is current.
-- **Metal Y-flip for shadow sampling**: On Metal, clip space Y is inverted relative to texture UV space when rendering to custom textures (non-swapchain). When sampling a shadow atlas (or any render-to-texture target), flip Y in the UV computation: use `(-sc.y) * 0.5 + 0.5` instead of `sc.y * 0.5 + 0.5`. The swapchain doesn't need this because SDL3 GPU handles the flip internally. This applies to any shader that reprojects world positions into a previously-rendered texture's UV space.
+- **Y-flip for render-to-texture sampling**: The fullscreen vertex shader (`fullscreen.vert`) flips UV Y so that (0,0) = top-left in all post-process and HiZ textures. When any shader (fragment or **compute**) reprojects world positions to screen and samples a render-to-texture target, the NDC-to-UV conversion must negate Y: use `(-ndc.y) * 0.5 + 0.5` instead of `ndc.y * 0.5 + 0.5`. On Metal specifically, clip space Y is also inverted relative to texture UV space for custom textures (non-swapchain). The swapchain doesn't need this because SDL3 GPU handles the flip internally. This applies to shadow atlas sampling, HiZ occlusion culling, SSR, or any shader that reprojects into a previously-rendered texture's UV space.
 - **Shadow cascade tuning**: Cascade splits use a log/uniform blend controlled by `cascade_lambda` (0.0 = uniform, 1.0 = logarithmic) in `renderer.zig`. The shadow far distance is capped independently of the camera far (`@min(cam.far, 80.0)`). Lower lambda and shorter shadow far distribute cascades more evenly across the visible scene. Current: `cascade_lambda = 0.5`, shadow far = 80.

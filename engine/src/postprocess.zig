@@ -32,6 +32,8 @@ const composite_frag_spv = @embedFile("shader_composite_frag_spv");
 const composite_frag_msl = @embedFile("shader_composite_frag_msl");
 const lensflare_frag_spv = @embedFile("shader_lensflare_frag_spv");
 const lensflare_frag_msl = @embedFile("shader_lensflare_frag_msl");
+const hiz_downsample_frag_spv = @embedFile("shader_hiz_downsample_frag_spv");
+const hiz_downsample_frag_msl = @embedFile("shader_hiz_downsample_frag_msl");
 
 // ============================================================
 // Uniform structs (must match GLSL layouts)
@@ -83,6 +85,13 @@ pub const max_mip_levels = 6;
 // Default per-level tints (UE4-inspired, sum ≈ 1.0)
 const default_tints = [max_mip_levels]f32{ 0.8, 0.6, 0.5, 0.4, 0.3, 0.2 };
 
+/// Maximum HiZ mip levels. 12 supports up to 4096×4096 (2^12 = 4096).
+pub const max_hiz_levels: u32 = 12;
+
+const HizDownsampleParams = extern struct {
+    params: [4]f32, // .xy = texel size of source, .z = is_first_pass (1.0 = read alpha), .w = unused
+};
+
 // ============================================================
 // PostProcess state — GPU handles only, no settings
 // ============================================================
@@ -129,6 +138,27 @@ pub const PostProcessState = struct {
     dof_bokeh_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
     dof_composite_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
     dof_tent_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+
+    // HiZ (hierarchical-Z) for GPU-driven occlusion culling.
+    //
+    // Two sets of textures:
+    // 1. hiz_textures[]: individual R32_FLOAT textures per mip level, used as
+    //    render targets in the downsample chain. Level 0 is half-res, level N
+    //    is half of level N-1.
+    // 2. hiz_combined: single R32_FLOAT texture with num_levels=N, populated by
+    //    copying from the individual textures after the downsample chain. The
+    //    compute shader binds this and uses textureLod() to pick the right level.
+    //
+    // This two-texture approach avoids read-write hazards during the downsample
+    // chain (can't read mip N-1 while writing mip N of the same texture on all
+    // backends), while still giving the compute shader efficient mip-level access.
+    hiz_textures: [max_hiz_levels]?*c.SDL_GPUTexture = .{null} ** max_hiz_levels,
+    hiz_widths: [max_hiz_levels]u32 = .{0} ** max_hiz_levels,
+    hiz_heights: [max_hiz_levels]u32 = .{0} ** max_hiz_levels,
+    hiz_count: u32 = 0,
+    hiz_combined: ?*c.SDL_GPUTexture = null, // mipmapped R32F for compute shader sampling
+    hiz_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    hiz_sampler: ?*c.SDL_GPUSampler = null, // NEAREST filter (no depth averaging)
 };
 
 /// Per-camera post-processing settings, read from Camera component fields.
@@ -448,6 +478,38 @@ pub fn initPostProcess(self: *Engine) !void {
         hdr_format, 1, 1,
     ) orelse return error.PipelineFailed;
 
+    // HiZ downsample pipeline (R32_FLOAT target, NEAREST sampler, 1 uniform + 1 sampler)
+    self.postprocess.hiz_pipeline = createPostProcessPipeline(
+        device,
+        hiz_downsample_frag_spv,
+        hiz_downsample_frag_msl,
+        c.SDL_GPU_TEXTUREFORMAT_R32_FLOAT,
+        1, // uniforms (HizDownsampleParams)
+        1, // samplers (source texture)
+    ) orelse return error.PipelineFailed;
+
+    // HiZ sampler: NEAREST filter — we need exact depth values, not interpolated.
+    // Clamp-to-edge prevents sampling beyond texture borders at mip boundaries.
+    // max_lod must be high enough to allow textureLod() to access all mip levels.
+    self.postprocess.hiz_sampler = c.SDL_CreateGPUSampler(device, &c.SDL_GPUSamplerCreateInfo{
+        .min_filter = c.SDL_GPU_FILTER_NEAREST,
+        .mag_filter = c.SDL_GPU_FILTER_NEAREST,
+        .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+        .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .mip_lod_bias = 0,
+        .max_anisotropy = 1,
+        .compare_op = 0,
+        .min_lod = 0,
+        .max_lod = @as(f32, @floatFromInt(max_hiz_levels)), // allow textureLod access to all levels
+        .enable_anisotropy = false,
+        .enable_compare = false,
+        .padding1 = 0,
+        .padding2 = 0,
+        .props = 0,
+    }) orelse return error.SamplerFailed;
+
     // Textures at initial resolution
     try ensureTextures(self, self.rt_w, self.rt_h);
 }
@@ -502,6 +564,45 @@ pub fn ensureTextures(self: *Engine, w: u32, h: u32) !void {
         pp.flare_texture = null;
     }
 
+    // HiZ mip chain: progressive 2:1 downsamples of linear depth.
+    // Individual render target textures per level + one combined mipmapped texture.
+    for (&pp.hiz_textures) |*ht| {
+        if (ht.*) |t| c.SDL_ReleaseGPUTexture(device, t);
+        ht.* = null;
+    }
+    if (pp.hiz_combined) |t| c.SDL_ReleaseGPUTexture(device, t);
+    pp.hiz_combined = null;
+
+    var hiz_w = @max(w / 2, 1);
+    var hiz_h = @max(h / 2, 1);
+    var hiz_count: u32 = 0;
+    while (hiz_count < max_hiz_levels and (hiz_w >= 1 and hiz_h >= 1)) {
+        pp.hiz_textures[hiz_count] = createRenderTexture(device, c.SDL_GPU_TEXTUREFORMAT_R32_FLOAT, hiz_w, hiz_h) orelse return error.TextureFailed;
+        pp.hiz_widths[hiz_count] = hiz_w;
+        pp.hiz_heights[hiz_count] = hiz_h;
+        hiz_count += 1;
+        if (hiz_w == 1 and hiz_h == 1) break;
+        hiz_w = @max(hiz_w / 2, 1);
+        hiz_h = @max(hiz_h / 2, 1);
+    }
+    pp.hiz_count = hiz_count;
+
+    // Combined mipmapped texture for compute shader sampling via textureLod().
+    // Usage: SAMPLER (compute reads) + COPY_DST (copy from per-level textures).
+    if (hiz_count > 0) {
+        pp.hiz_combined = c.SDL_CreateGPUTexture(device, &c.SDL_GPUTextureCreateInfo{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = c.SDL_GPU_TEXTUREFORMAT_R32_FLOAT,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = pp.hiz_widths[0],
+            .height = pp.hiz_heights[0],
+            .layer_count_or_depth = 1,
+            .num_levels = hiz_count,
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .props = 0,
+        }) orelse return error.TextureFailed;
+    }
+
     pp.cached_w = w;
     pp.cached_h = h;
 }
@@ -532,6 +633,13 @@ pub fn deinitPostProcess(self: *Engine) void {
     if (pp.dof_composite_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.dof_tent_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.sampler) |s| c.SDL_ReleaseGPUSampler(device, s);
+    // HiZ cleanup
+    for (pp.hiz_textures) |ht| {
+        if (ht) |t| c.SDL_ReleaseGPUTexture(device, t);
+    }
+    if (pp.hiz_combined) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.hiz_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+    if (pp.hiz_sampler) |s| c.SDL_ReleaseGPUSampler(device, s);
 }
 
 // ============================================================
@@ -566,6 +674,99 @@ fn setFullscreenViewport(pass: *c.SDL_GPURenderPass, w: u32, h: u32) void {
 
 fn drawFullscreenTriangle(pass: *c.SDL_GPURenderPass) void {
     c.SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+}
+
+// ============================================================
+// HiZ pyramid build
+// ============================================================
+
+/// Build the hierarchical-Z depth pyramid from the previous frame's linear depth.
+///
+/// At the start of a new frame, the HDR texture still holds last frame's render.
+/// The alpha channel contains linear camera distance (written by default.frag).
+/// This function downsamples that depth through the HiZ mip chain, with each
+/// level storing the max depth from its 2×2 parent region.
+///
+/// The result is used by the instance setup compute shader for occlusion culling:
+/// entities whose nearest depth exceeds the HiZ max depth at their projected
+/// screen region are behind all visible geometry and can be skipped.
+///
+/// Must be called BEFORE the scene pass clears the HDR texture.
+pub fn buildHiZPyramid(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, w: u32, h: u32) void {
+    const pp = &self.postprocess;
+    const pipeline = pp.hiz_pipeline orelse return;
+    const hiz_sampler = pp.hiz_sampler orelse return;
+    const hdr_tex = pp.hdr_texture orelse return;
+    const hiz_count = pp.hiz_count;
+    if (hiz_count == 0) return;
+
+    // Downsample chain: each level reads from the previous level (or HDR alpha for level 0)
+    for (0..hiz_count) |i| {
+        const target = pp.hiz_textures[i] orelse continue;
+        const tw = pp.hiz_widths[i];
+        const th = pp.hiz_heights[i];
+
+        // Source: for level 0, read from HDR alpha; otherwise read from previous HiZ level
+        const source: *c.SDL_GPUTexture = if (i == 0) hdr_tex else (pp.hiz_textures[i - 1] orelse continue);
+        const source_w: f32 = if (i == 0) @floatFromInt(w) else @floatFromInt(pp.hiz_widths[i - 1]);
+        const source_h: f32 = if (i == 0) @floatFromInt(h) else @floatFromInt(pp.hiz_heights[i - 1]);
+        const is_first: f32 = if (i == 0) 1.0 else 0.0;
+
+        const pass = beginFullscreenPass(cmd, target) orelse continue;
+        setFullscreenViewport(pass, tw, th);
+        c.SDL_BindGPUGraphicsPipeline(pass, pipeline);
+
+        // Bind source texture with NEAREST sampler
+        const tex_sampler = c.SDL_GPUTextureSamplerBinding{
+            .texture = source,
+            .sampler = hiz_sampler,
+        };
+        c.SDL_BindGPUFragmentSamplers(pass, 0, &tex_sampler, 1);
+
+        // Push params: texel size of source + first pass flag
+        const params = HizDownsampleParams{
+            .params = .{ 1.0 / source_w, 1.0 / source_h, is_first, 0.0 },
+        };
+        c.SDL_PushGPUFragmentUniformData(cmd, 0, &params, @sizeOf(HizDownsampleParams));
+
+        drawFullscreenTriangle(pass);
+        c.SDL_EndGPURenderPass(pass);
+    }
+
+    // Copy each per-level texture into the corresponding mip level of the combined
+    // mipmapped texture. The compute shader binds hiz_combined and uses textureLod().
+    const hiz_combined = pp.hiz_combined orelse return;
+    const copy_pass = c.SDL_BeginGPUCopyPass(cmd) orelse return;
+    for (0..hiz_count) |i| {
+        const src_tex = pp.hiz_textures[i] orelse continue;
+        const mip_w = pp.hiz_widths[i];
+        const mip_h = pp.hiz_heights[i];
+
+        c.SDL_CopyGPUTextureToTexture(
+            copy_pass,
+            &c.SDL_GPUTextureLocation{
+                .texture = src_tex,
+                .mip_level = 0,
+                .layer = 0,
+                .x = 0,
+                .y = 0,
+                .z = 0,
+            },
+            &c.SDL_GPUTextureLocation{
+                .texture = hiz_combined,
+                .mip_level = @intCast(i),
+                .layer = 0,
+                .x = 0,
+                .y = 0,
+                .z = 0,
+            },
+            mip_w,
+            mip_h,
+            1,
+            false, // cycle — don't create new version, we're writing all levels
+        );
+    }
+    c.SDL_EndGPUCopyPass(copy_pass);
 }
 
 // ============================================================

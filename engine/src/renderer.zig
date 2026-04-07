@@ -38,6 +38,8 @@ const shadow_vert_spv = @embedFile("shader_shadow_vert_spv");
 const shadow_vert_msl = @embedFile("shader_shadow_vert_msl");
 const shadow_frag_spv = @embedFile("shader_shadow_frag_spv");
 const shadow_frag_msl = @embedFile("shader_shadow_frag_msl");
+const instance_setup_spv = @embedFile("shader_instance_setup_comp_spv");
+const instance_setup_msl = @embedFile("shader_instance_setup_comp_msl");
 
 // ============================================================
 // Uniform structs
@@ -66,6 +68,123 @@ const MaterialUniforms = extern struct {
     material_params: [4]f32 = .{ 0, 0.5, 0, 0 }, // .x = metallic, .y = roughness
     texture_flags: [4]f32 = .{ 0, 0, 0, 0 }, // .x = has_base_color, .y = has_metallic_roughness, .z = has_normal, .w = has_emissive
     emissive: [4]f32 = .{ 0, 0, 0, 0 }, // .xyz = emissive factor, .w = has_occlusion
+};
+
+// ============================================================
+// GPU-driven: entity data for compute shader instance setup
+// ============================================================
+
+/// Raw per-entity transform data uploaded to GPU for the instance setup compute
+/// shader. Contains position, euler rotation (degrees), scale, and flags.
+/// 48 bytes per entity — matches the EntityData struct in instance_setup.comp.
+pub const EntityData = extern struct {
+    position: [4]f32, // xyz = world position, w = receives_shadow
+    rotation: [4]f32, // xyz = euler angles (degrees), w = unused
+    scale_flags: [4]f32, // xyz = scale, w = is_shadow_caster
+};
+
+/// Uniforms pushed to the instance setup compute shader each dispatch.
+/// Must match ComputeUniforms in instance_setup.comp (std140 layout).
+const ComputeUniforms = extern struct {
+    vp: [4][4]f32, // View-projection matrix for this pass
+    frustum_planes: [6][4]f32, // 6 frustum planes: xyz = normal, w = distance
+    entity_count: u32, // Number of entities to process
+    shadow_pass: u32, // 0 = scene pass, 1 = shadow pass
+    frustum_cull: u32, // 0 = no culling, 1 = cull against frustum
+    occlusion_cull: u32, // 0 = disabled, 1 = test against HiZ pyramid
+    prev_vp: [4][4]f32, // Previous frame's VP matrix (for HiZ reprojection)
+    prev_camera_pos: [4]f32, // xyz = previous frame camera world position
+    hiz_params: [4]f32, // x = hiz_width, y = hiz_height, z = max_mip, w = unused
+};
+
+/// Extract the 6 frustum planes from a view-projection matrix.
+/// Each plane is (nx, ny, nz, d) where dot(n, p) + d >= 0 means inside.
+/// Uses the Griggs-Hartmann method: planes from rows of the VP matrix.
+fn extractFrustumPlanes(vp: Mat4) [6][4]f32 {
+    // VP is column-major: vp.m[col][row].
+    // Row i of VP = (vp.m[0][i], vp.m[1][i], vp.m[2][i], vp.m[3][i]).
+    var planes: [6][4]f32 = undefined;
+
+    // Left:   row3 + row0
+    // Right:  row3 - row0
+    // Bottom: row3 + row1
+    // Top:    row3 - row1
+    // Near:   row3 + row2
+    // Far:    row3 - row2
+    const combos = [6][2]struct { row: usize, sign: f32 }{
+        .{ .{ .row = 0, .sign = 1.0 }, .{ .row = 3, .sign = 1.0 } }, // left
+        .{ .{ .row = 0, .sign = -1.0 }, .{ .row = 3, .sign = 1.0 } }, // right
+        .{ .{ .row = 1, .sign = 1.0 }, .{ .row = 3, .sign = 1.0 } }, // bottom
+        .{ .{ .row = 1, .sign = -1.0 }, .{ .row = 3, .sign = 1.0 } }, // top
+        .{ .{ .row = 2, .sign = 1.0 }, .{ .row = 3, .sign = 1.0 } }, // near
+        .{ .{ .row = 2, .sign = -1.0 }, .{ .row = 3, .sign = 1.0 } }, // far
+    };
+
+    for (0..6) |i| {
+        const r_a = combos[i][0].row;
+        const s_a = combos[i][0].sign;
+        const r_b = combos[i][1].row;
+
+        var plane: [4]f32 = undefined;
+        for (0..4) |col| {
+            plane[col] = vp.m[col][r_b] + s_a * vp.m[col][r_a];
+        }
+
+        // Normalize the plane so distance tests are in world units
+        const len = @sqrt(plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]);
+        if (len > 1e-8) {
+            const inv = 1.0 / len;
+            plane[0] *= inv;
+            plane[1] *= inv;
+            plane[2] *= inv;
+            plane[3] *= inv;
+        }
+        planes[i] = plane;
+    }
+
+    return planes;
+}
+
+// ============================================================
+// GPU-driven: indirect draw structs
+// ============================================================
+
+/// Maximum number of distinct mesh+material batches per frame.
+pub const max_batches: u32 = 256;
+
+/// Per-batch info uploaded to GPU for the compute shader.
+/// Tells each entity where its batch's instance region starts.
+pub const BatchInfo = extern struct {
+    instance_offset: u32, // first instance index in the compacted output buffer
+};
+
+/// Matches SDL_GPUIndexedIndirectDrawCommand exactly. The compute shader
+/// atomically increments num_instances; all other fields are set by CPU.
+pub const IndirectDrawCommand = extern struct {
+    num_indices: u32,
+    num_instances: u32, // written by compute shader via atomicAdd
+    first_index: u32,
+    vertex_offset: i32,
+    first_instance: u32,
+};
+
+/// GPU-written culling statistics. The compute shader atomically increments
+/// these counters during the scene pass. Read back by CPU one frame later
+/// (via download to transfer buffer) for the debug stats panel.
+pub const CullingStats = extern struct {
+    visible_count: u32 = 0,
+    frustum_culled: u32 = 0,
+    occlusion_culled: u32 = 0,
+};
+
+/// CPU-side batch descriptor computed from the sorted draw list each frame.
+/// Used to upload batch info and build indirect draw commands.
+pub const BatchDescriptor = struct {
+    mesh_id: u32,
+    material_id: u32,
+    entity_start: u32, // first entity in this batch (index into draw_list)
+    entity_count: u32, // number of entities in this batch
+    instance_offset: u32, // cumulative offset in the compacted instance buffer
 };
 
 // ============================================================
@@ -200,6 +319,60 @@ fn createShader(device: *c.SDL_GPUDevice, spv: []const u8, msl: []const u8, stag
         .num_storage_textures = 0,
         .num_storage_buffers = num_storage_bufs,
         .num_uniform_buffers = num_uniform_buffers,
+        .props = 0,
+    });
+}
+
+/// Create a GPU compute pipeline from pre-compiled SPIR-V and MSL shader code.
+/// The pipeline is configured with the specified resource counts and workgroup size.
+fn createComputePipeline(
+    device: *c.SDL_GPUDevice,
+    spv: []const u8,
+    msl: []const u8,
+    num_readonly_storage_buffers: u32,
+    num_readwrite_storage_buffers: u32,
+    num_uniform_buffers: u32,
+    num_samplers: u32,
+    threadcount_x: u32,
+    threadcount_y: u32,
+    threadcount_z: u32,
+) ?*c.SDL_GPUComputePipeline {
+    const formats = c.SDL_GetGPUShaderFormats(device);
+
+    var code: [*]const u8 = undefined;
+    var code_size: usize = undefined;
+    var format: c.SDL_GPUShaderFormat = undefined;
+    var entrypoint: [*:0]const u8 = undefined;
+
+    if (formats & c.SDL_GPU_SHADERFORMAT_SPIRV != 0) {
+        code = spv.ptr;
+        code_size = spv.len;
+        format = c.SDL_GPU_SHADERFORMAT_SPIRV;
+        entrypoint = "main";
+    } else if (formats & c.SDL_GPU_SHADERFORMAT_MSL != 0) {
+        code = msl.ptr;
+        code_size = msl.len;
+        format = c.SDL_GPU_SHADERFORMAT_MSL;
+        entrypoint = "main0";
+    } else {
+        std.debug.print("No supported shader format for compute pipeline\n", .{});
+        return null;
+    }
+
+    return c.SDL_CreateGPUComputePipeline(device, &c.SDL_GPUComputePipelineCreateInfo{
+        .code_size = code_size,
+        .code = code,
+        .entrypoint = entrypoint,
+        .format = format,
+        .num_samplers = num_samplers,
+        .num_readonly_storage_textures = 0,
+        .num_readonly_storage_buffers = num_readonly_storage_buffers,
+        .num_readwrite_storage_textures = 0,
+        .num_readwrite_storage_buffers = num_readwrite_storage_buffers,
+        .num_uniform_buffers = num_uniform_buffers,
+        .threadcount_x = threadcount_x,
+        .threadcount_y = threadcount_y,
+        .threadcount_z = threadcount_z,
         .props = 0,
     });
 }
@@ -422,6 +595,55 @@ pub fn initShadowPipeline(self: *Engine) !void {
     }) orelse return error.ShadowPipelineFailed;
 }
 
+/// Create the GPU compute pipeline for instance data setup.
+/// This pipeline replaces the CPU-side uploadInstances() — the compute shader
+/// reads raw entity transforms and produces the InstanceData buffer that the
+/// vertex shader consumes.
+pub fn initComputePipeline(self: *Engine) !void {
+    const device = self.gpu_device.?;
+
+    // instance_setup.comp: 2 readonly storage buffers (entity data + batch info),
+    // 3 readwrite storage buffers (instance output + indirect commands + culling stats),
+    // 1 uniform buffer (VP + frustum planes + counts + HiZ params),
+    // 1 sampler (HiZ depth pyramid for occlusion culling).
+    // Workgroup size: 64×1×1 (matches local_size_x in the shader).
+    self.compute_pipeline = createComputePipeline(
+        device,
+        instance_setup_spv,
+        instance_setup_msl,
+        2, // readonly storage buffers (entity data, batch info)
+        3, // readwrite storage buffers (instance output, indirect commands, culling stats)
+        1, // uniform buffers (VP matrix + frustum + HiZ params)
+        1, // samplers (HiZ depth pyramid)
+        64,
+        1,
+        1,
+    ) orelse {
+        std.debug.print("Failed to create compute pipeline: {s}\n", .{c.SDL_GetError()});
+        return error.ComputePipelineFailed;
+    };
+
+    // Culling stats buffer: 3 u32 atomic counters written by compute, read back by CPU.
+    self.culling_stats_buffer = c.SDL_CreateGPUBuffer(device, &c.SDL_GPUBufferCreateInfo{
+        .usage = c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE,
+        .size = @sizeOf(CullingStats),
+        .props = 0,
+    }) orelse {
+        std.debug.print("Failed to create culling stats buffer: {s}\n", .{c.SDL_GetError()});
+        return error.BufferFailed;
+    };
+
+    // Transfer buffer for async readback (CPU reads previous frame's stats)
+    self.culling_stats_transfer = c.SDL_CreateGPUTransferBuffer(device, &c.SDL_GPUTransferBufferCreateInfo{
+        .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD,
+        .size = @sizeOf(CullingStats),
+        .props = 0,
+    }) orelse {
+        std.debug.print("Failed to create culling stats transfer: {s}\n", .{c.SDL_GetError()});
+        return error.BufferFailed;
+    };
+}
+
 // ============================================================
 // Render system — decomposed into focused phases
 // ============================================================
@@ -440,19 +662,19 @@ pub const DirLightData = struct {
 };
 
 /// Query the ECS for the first directional light, or return defaults.
-fn gatherDirectionalLight(world: *ecs.world_t) DirLightData {
+/// Uses the persistent dir_light_query + columnar access.
+fn gatherDirectionalLight(self: *Engine) DirLightData {
     var result = DirLightData{
         .dir = .{ 0.4, 0.8, 0.4, 0.0 },
         .color = .{ 1.0, 1.0, 1.0, 0.0 },
     };
-    const q = queryInit(world, &.{ecs.id(DirectionalLight)}, &.{});
-    defer ecs.query_fini(q);
-    var it = ecs.query_iter(world, q);
+    const q = self.dir_light_query orelse return result;
+    var it = ecs.query_iter(self.world, q);
 
     if (ecs.query_next(&it)) {
-        if (it.count() > 0) {
-            const entity = it.entities()[0];
-            const dl = ecs.get(world, entity, DirectionalLight) orelse return result;
+        const dls = ecs.field(&it, DirectionalLight, 0) orelse return result;
+        if (dls.len > 0) {
+            const dl = dls[0];
             const len_sq = dl.dir_x * dl.dir_x + dl.dir_y * dl.dir_y + dl.dir_z * dl.dir_z;
             if (len_sq > 1e-8) {
                 result.dir = .{ dl.dir_x, dl.dir_y, dl.dir_z, 0.0 };
@@ -463,75 +685,90 @@ fn gatherDirectionalLight(world: *ecs.world_t) DirLightData {
     return result;
 }
 
-/// Gather all point and spot lights into the engine's cluster_lights scratch buffer.
+/// Gather all point and spot lights using persistent queries + columnar access.
 fn gatherClusterLights(self: *Engine) u32 {
     var count: u32 = 0;
 
     // Point lights
-    const pl_q = queryInit(self.world, &.{ ecs.id(Position), ecs.id(PointLight) }, &.{});
-    defer ecs.query_fini(pl_q);
-    var pl_it = ecs.query_iter(self.world, pl_q);
-
-    while (ecs.query_next(&pl_it)) for (pl_it.entities()) |entity| {
-        if (count >= max_lights) break;
-        const pos = ecs.get(self.world, entity, Position) orelse continue;
-        const pl = ecs.get(self.world, entity, PointLight) orelse continue;
-        self.cluster_lights[count] = .{
-            .pos_radius = .{ pos.x, pos.y, pos.z, pl.radius },
-            .color_type = .{ pl.r * pl.intensity, pl.g * pl.intensity, pl.b * pl.intensity, 0.0 },
-            .dir_spot = .{ 0, 0, 0, 0 },
-            .cone_params = .{ 0, 0, 0, 0 },
-        };
-        count += 1;
-    };
+    if (self.point_light_query) |pl_q| {
+        var pl_it = ecs.query_iter(self.world, pl_q);
+        while (ecs.query_next(&pl_it)) {
+            const positions = ecs.field(&pl_it, Position, 0) orelse continue;
+            const lights = ecs.field(&pl_it, PointLight, 1) orelse continue;
+            for (0..pl_it.count()) |row| {
+                if (count >= max_lights) break;
+                const pos = positions[row];
+                const pl = lights[row];
+                self.cluster_lights[count] = .{
+                    .pos_radius = .{ pos.x, pos.y, pos.z, pl.radius },
+                    .color_type = .{ pl.r * pl.intensity, pl.g * pl.intensity, pl.b * pl.intensity, 0.0 },
+                    .dir_spot = .{ 0, 0, 0, 0 },
+                    .cone_params = .{ 0, 0, 0, 0 },
+                };
+                count += 1;
+            }
+        }
+    }
 
     // Spot lights
-    const sl_q = queryInit(self.world, &.{ ecs.id(Position), ecs.id(SpotLight) }, &.{});
-    defer ecs.query_fini(sl_q);
-    var sl_it = ecs.query_iter(self.world, sl_q);
-
-    while (ecs.query_next(&sl_it)) for (sl_it.entities()) |entity| {
-        if (count >= max_lights) break;
-        const pos = ecs.get(self.world, entity, Position) orelse continue;
-        const sl = ecs.get(self.world, entity, SpotLight) orelse continue;
-        const inner_rad = sl.inner_cone * (std.math.pi / 180.0);
-        const outer_rad = sl.outer_cone * (std.math.pi / 180.0);
-        const len_sq = sl.dir_x * sl.dir_x + sl.dir_y * sl.dir_y + sl.dir_z * sl.dir_z;
-        const inv_len = if (len_sq > 1e-8) 1.0 / @sqrt(len_sq) else 1.0;
-        self.cluster_lights[count] = .{
-            .pos_radius = .{ pos.x, pos.y, pos.z, sl.radius },
-            .color_type = .{ sl.r * sl.intensity, sl.g * sl.intensity, sl.b * sl.intensity, 1.0 },
-            .dir_spot = .{ sl.dir_x * inv_len, sl.dir_y * inv_len, sl.dir_z * inv_len, 0 },
-            .cone_params = .{ @cos(inner_rad), @cos(outer_rad), 0, 0 },
-        };
-        count += 1;
-    };
+    if (self.spot_light_query) |sl_q| {
+        var sl_it = ecs.query_iter(self.world, sl_q);
+        while (ecs.query_next(&sl_it)) {
+            const positions = ecs.field(&sl_it, Position, 0) orelse continue;
+            const lights = ecs.field(&sl_it, SpotLight, 1) orelse continue;
+            for (0..sl_it.count()) |row| {
+                if (count >= max_lights) break;
+                const pos = positions[row];
+                const sl = lights[row];
+                const inner_rad = sl.inner_cone * (std.math.pi / 180.0);
+                const outer_rad = sl.outer_cone * (std.math.pi / 180.0);
+                const len_sq = sl.dir_x * sl.dir_x + sl.dir_y * sl.dir_y + sl.dir_z * sl.dir_z;
+                const inv_len = if (len_sq > 1e-8) 1.0 / @sqrt(len_sq) else 1.0;
+                self.cluster_lights[count] = .{
+                    .pos_radius = .{ pos.x, pos.y, pos.z, sl.radius },
+                    .color_type = .{ sl.r * sl.intensity, sl.g * sl.intensity, sl.b * sl.intensity, 1.0 },
+                    .dir_spot = .{ sl.dir_x * inv_len, sl.dir_y * inv_len, sl.dir_z * inv_len, 0 },
+                    .cone_params = .{ @cos(inner_rad), @cos(outer_rad), 0, 0 },
+                };
+                count += 1;
+            }
+        }
+    }
 
     self.cluster_light_count = count;
     return count;
 }
 
-/// Collect all renderable entities into the draw list, sorted by mesh+material
-/// to minimize GPU state changes. Uses a zig-ecs group for automatic entity
-/// set maintenance — no per-frame filtering needed. Returns the number of entries.
+/// Collect all renderable entities into the draw list, sorted by mesh+material.
 fn buildDrawList(self: *Engine) u32 {
     var draw_count: u32 = 0;
-    // Flecs query replaces the zig-ecs group — flecs queries are automatically
-    // cached and maintained by the archetype storage.
-    const q = queryInit(self.world, &.{ ecs.id(Position), ecs.id(Rotation), ecs.id(MeshHandle) }, &.{});
+    var desc = std.mem.zeroes(ecs.query_desc_t);
+    desc.terms[0].id = ecs.id(Position);
+    desc.terms[1].id = ecs.id(Rotation);
+    desc.terms[2].id = ecs.id(MeshHandle);
+    desc.terms[3].id = ecs.id(MaterialHandle);
+    desc.terms[3].oper = .Optional;
+
+    const q = ecs.query_init(self.world, &desc) catch return 0;
     defer ecs.query_fini(q);
     var it = ecs.query_iter(self.world, q);
 
-    while (ecs.query_next(&it)) for (it.entities()) |entity| {
-        if (draw_count >= max_renderables) break;
-        const mesh_id: u64 = (ecs.get(self.world, entity, MeshHandle) orelse continue).id;
-        const mat_id: u64 = if (ecs.get(self.world, entity, MaterialHandle)) |mh| mh.id else 0;
-        self.draw_list[draw_count] = .{
-            .sort_key = (mesh_id << 32) | mat_id,
-            .entity = entity,
-        };
-        draw_count += 1;
-    };
+    while (ecs.query_next(&it)) {
+        // Column access: one pointer per component per archetype table
+        const meshes = ecs.field(&it, MeshHandle, 2) orelse continue;
+        const mats = ecs.field(&it, MaterialHandle, 3); // optional — may be null
+
+        for (0..it.count()) |row| {
+            if (draw_count >= max_renderables) break;
+            const mesh_id: u64 = meshes[row].id;
+            const mat_id: u64 = if (mats) |m| m[row].id else 0;
+            self.draw_list[draw_count] = .{
+                .sort_key = (mesh_id << 32) | mat_id,
+                .entity = it.entities()[row],
+            };
+            draw_count += 1;
+        }
+    }
 
     std.mem.sort(DrawEntry, self.draw_list[0..draw_count], {}, struct {
         fn lessThan(_: void, a: DrawEntry, b: DrawEntry) bool {
@@ -540,17 +777,6 @@ fn buildDrawList(self: *Engine) u32 {
     }.lessThan);
 
     return draw_count;
-}
-
-/// Count the number of unique batches (distinct sort keys) in the draw list.
-pub fn countBatches(self: *Engine, draw_count: u32) u32 {
-    if (draw_count == 0) return 0;
-    var batches: u32 = 1;
-    var i: u32 = 1;
-    while (i < draw_count) : (i += 1) {
-        if (self.draw_list[i].sort_key != self.draw_list[i - 1].sort_key) batches += 1;
-    }
-    return batches;
 }
 
 /// Upload per-instance data (model + MVP matrices) to the GPU storage buffer.
@@ -594,6 +820,381 @@ fn uploadInstances(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, vp: Mat4, draw_c
     c.SDL_EndGPUCopyPass(copy_pass);
 }
 
+// ============================================================
+// GPU-driven instance setup (compute shader path)
+// ============================================================
+
+/// Build the full draw list with entity data in a single pass. Gathers
+/// transform data using columnar ECS access (cache-coherent), then sorts
+/// the draw list and entity data together by mesh+material.
+///
+/// This replaces the previous three-function sequence (buildDrawList +
+/// computeBatches + uploadEntityData) which did per-entity ecs.get on the
+/// sorted list — destroying cache coherence and doing 6+ hash lookups per entity.
+/// Create the persistent renderable query (called once at init).
+/// Queries for entities with Position + Rotation + MeshHandle, with optional
+/// Scale, MaterialHandle, ShadowReceiver, ShadowCaster.
+pub fn createRenderableQuery(world: *ecs.world_t) ?*ecs.query_t {
+    var desc = std.mem.zeroes(ecs.query_desc_t);
+    desc.terms[0].id = ecs.id(Position);
+    desc.terms[1].id = ecs.id(Rotation);
+    desc.terms[2].id = ecs.id(MeshHandle);
+    desc.terms[3].id = ecs.id(Scale);
+    desc.terms[3].oper = .Optional;
+    desc.terms[4].id = ecs.id(MaterialHandle);
+    desc.terms[4].oper = .Optional;
+    desc.terms[5].id = ecs.id(ShadowReceiver);
+    desc.terms[5].oper = .Optional;
+    desc.terms[5].inout = .InOutNone;
+    desc.terms[6].id = ecs.id(ShadowCaster);
+    desc.terms[6].oper = .Optional;
+    desc.terms[6].inout = .InOutNone;
+    return ecs.query_init(world, &desc) catch null;
+}
+
+pub fn prepareDrawData(self: *Engine, cmd: *c.SDL_GPUCommandBuffer) u32 {
+    const q = self.renderable_query orelse return 0;
+
+    // --- Pass 1: count entities per sort_key bucket ---
+    // Lightweight: only reads MeshHandle + optional MaterialHandle columns.
+    var unique_keys: [max_batches]u64 = undefined;
+    var key_counts: [max_batches]u32 = .{0} ** max_batches;
+    var num_keys: u32 = 0;
+    var total_count: u32 = 0;
+
+    {
+        var it = ecs.query_iter(self.world, q);
+        while (ecs.query_next(&it)) {
+            const meshes = ecs.field(&it, MeshHandle, 2) orelse continue;
+            const mats = ecs.field(&it, MaterialHandle, 4);
+            for (0..it.count()) |row| {
+                if (total_count >= max_renderables) break;
+                const sk: u64 = (@as(u64, meshes[row].id) << 32) | (if (mats) |m| @as(u64, m[row].id) else 0);
+                var found = false;
+                for (unique_keys[0..num_keys], 0..) |k, ki| {
+                    if (k == sk) {
+                        key_counts[ki] += 1;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found and num_keys < max_batches) {
+                    unique_keys[num_keys] = sk;
+                    key_counts[num_keys] = 1;
+                    num_keys += 1;
+                }
+                total_count += 1;
+            }
+        }
+    }
+
+    if (total_count == 0) {
+        self.batch_count = 0;
+        return 0;
+    }
+
+    // Sort unique keys (tiny array, typically <10 elements) + compute offsets
+    const KeyCount = struct { key: u64, count: u32 };
+    var key_sorted: [max_batches]KeyCount = undefined;
+    for (0..num_keys) |i| key_sorted[i] = .{ .key = unique_keys[i], .count = key_counts[i] };
+    std.mem.sort(KeyCount, key_sorted[0..num_keys], {}, struct {
+        fn lessThan(_: void, a: KeyCount, b: KeyCount) bool {
+            return a.key < b.key;
+        }
+    }.lessThan);
+
+    var bucket_offsets: [max_batches]u32 = undefined;
+    var cumulative: u32 = 0;
+    for (0..num_keys) |i| {
+        bucket_offsets[i] = cumulative;
+        self.batch_descriptors[i] = .{
+            .mesh_id = @truncate(key_sorted[i].key >> 32),
+            .material_id = @truncate(key_sorted[i].key),
+            .entity_start = cumulative,
+            .entity_count = key_sorted[i].count,
+            .instance_offset = cumulative,
+        };
+        cumulative += key_sorted[i].count;
+    }
+    self.batch_count = num_keys;
+
+    // --- Pass 2: gather + scatter directly to sorted positions ---
+    // No intermediate arrays. Entity data and draw entries are written directly
+    // to their final sorted positions using the bucket offsets.
+    var scatter_pos: [max_batches]u32 = undefined;
+    @memcpy(scatter_pos[0..num_keys], bucket_offsets[0..num_keys]);
+
+    const transfer = self.entity_data_transfer orelse return 0;
+    const ptr = c.SDL_MapGPUTransferBuffer(self.gpu_device.?, transfer, true) orelse return 0;
+    const entity_data: [*]EntityData = @ptrCast(@alignCast(ptr));
+
+    var draw_count: u32 = 0;
+    {
+        var it = ecs.query_iter(self.world, q);
+        while (ecs.query_next(&it)) {
+            const positions = ecs.field(&it, Position, 0) orelse continue;
+            const rotations = ecs.field(&it, Rotation, 1) orelse continue;
+            const meshes = ecs.field(&it, MeshHandle, 2) orelse continue;
+            const scales = ecs.field(&it, Scale, 3);
+            const mats = ecs.field(&it, MaterialHandle, 4);
+            const has_receiver = ecs.field_is_set(&it, 5);
+            const has_caster = ecs.field_is_set(&it, 6);
+
+            const receives_f: f32 = if (has_receiver) 1.0 else 0.0;
+            const caster_f: f32 = if (has_caster) 1.0 else 0.0;
+
+            for (0..it.count()) |row| {
+                if (draw_count >= max_renderables) break;
+                const pos = positions[row];
+                const rot = rotations[row];
+                const mesh_id: u64 = meshes[row].id;
+                const mat_id: u64 = if (mats) |m| m[row].id else 0;
+                const sk: u64 = (mesh_id << 32) | mat_id;
+
+                // Find bucket and get the sorted output position
+                var bucket: u32 = 0;
+                for (0..num_keys) |ki| {
+                    if (key_sorted[ki].key == sk) {
+                        bucket = @intCast(ki);
+                        break;
+                    }
+                }
+                const dst = scatter_pos[bucket];
+                scatter_pos[bucket] += 1;
+
+                self.draw_list[dst] = .{
+                    .sort_key = sk,
+                    .entity = it.entities()[row],
+                };
+                entity_data[dst] = .{
+                    .position = .{ pos.x, pos.y, pos.z, receives_f },
+                    .rotation = .{ rot.x, rot.y, rot.z, @floatFromInt(bucket) },
+                    .scale_flags = if (scales) |s| .{ s[row].x, s[row].y, s[row].z, caster_f } else .{ 1, 1, 1, caster_f },
+                };
+                draw_count += 1;
+            }
+        }
+    }
+
+    // --- Write batch info + indirect commands + zeroed culling stats into the SAME transfer buffer ---
+    // This avoids multiple map/unmap cycles. Layout: [entity data | batch info | indirect cmds | culling stats]
+    const entity_data_bytes: u32 = draw_count * @sizeOf(EntityData);
+    const batch_region_offset: u32 = entity_data_bytes;
+    const batch_info_size: u32 = self.batch_count * @sizeOf(BatchInfo);
+    const indirect_size: u32 = self.batch_count * @sizeOf(IndirectDrawCommand);
+    const stats_size: u32 = @sizeOf(CullingStats);
+
+    const batch_base: [*]u8 = @as([*]u8, @ptrCast(entity_data)) + entity_data_bytes;
+    const batch_infos: [*]BatchInfo = @ptrCast(@alignCast(batch_base));
+    const indirect_base: [*]u8 = batch_base + batch_info_size;
+    const indirect_cmds: [*]IndirectDrawCommand = @ptrCast(@alignCast(indirect_base));
+    // Zero the culling stats (3 u32 counters) so compute shader atomicAdds start from 0
+    const stats_base: [*]u8 = indirect_base + indirect_size;
+    const stats_ptr: *CullingStats = @ptrCast(@alignCast(stats_base));
+    stats_ptr.* = .{};
+
+    for (self.batch_descriptors[0..self.batch_count], 0..) |batch, i| {
+        batch_infos[i] = .{ .instance_offset = batch.instance_offset };
+        const mesh = self.assets.mesh_registry[batch.mesh_id] orelse continue;
+        indirect_cmds[i] = .{
+            .num_indices = mesh.index_count,
+            .num_instances = 0,
+            .first_index = mesh.first_index,
+            .vertex_offset = @intCast(mesh.base_vertex),
+            .first_instance = batch.instance_offset,
+        };
+    }
+
+    // Single unmap + single copy pass for all three uploads
+    c.SDL_UnmapGPUTransferBuffer(self.gpu_device.?, transfer);
+
+    const gpu_buf = self.entity_data_buffer orelse return draw_count;
+    const batch_info_buf = self.batch_info_buffer orelse return draw_count;
+    const indirect_buf = self.indirect_draw_buffer orelse return draw_count;
+    const stats_buf = self.culling_stats_buffer orelse return draw_count;
+
+    const copy_pass = c.SDL_BeginGPUCopyPass(cmd) orelse return draw_count;
+
+    // Entity data
+    c.SDL_UploadToGPUBuffer(copy_pass, &c.SDL_GPUTransferBufferLocation{
+        .transfer_buffer = transfer,
+        .offset = 0,
+    }, &c.SDL_GPUBufferRegion{
+        .buffer = gpu_buf,
+        .offset = 0,
+        .size = entity_data_bytes,
+    }, true);
+
+    // Batch info
+    c.SDL_UploadToGPUBuffer(copy_pass, &c.SDL_GPUTransferBufferLocation{
+        .transfer_buffer = transfer,
+        .offset = batch_region_offset,
+    }, &c.SDL_GPUBufferRegion{
+        .buffer = batch_info_buf,
+        .offset = 0,
+        .size = batch_info_size,
+    }, true);
+
+    // Indirect draw commands
+    c.SDL_UploadToGPUBuffer(copy_pass, &c.SDL_GPUTransferBufferLocation{
+        .transfer_buffer = transfer,
+        .offset = batch_region_offset + batch_info_size,
+    }, &c.SDL_GPUBufferRegion{
+        .buffer = indirect_buf,
+        .offset = 0,
+        .size = indirect_size,
+    }, true);
+
+    // Zeroed culling stats (so compute shader atomicAdds start fresh)
+    c.SDL_UploadToGPUBuffer(copy_pass, &c.SDL_GPUTransferBufferLocation{
+        .transfer_buffer = transfer,
+        .offset = batch_region_offset + batch_info_size + indirect_size,
+    }, &c.SDL_GPUBufferRegion{
+        .buffer = stats_buf,
+        .offset = 0,
+        .size = stats_size,
+    }, true);
+
+    c.SDL_EndGPUCopyPass(copy_pass);
+
+    return draw_count;
+}
+
+/// Dispatch the instance setup compute shader. Reads entity data from the GPU
+/// entity_data_buffer and writes InstanceData to instance_buffer using the
+/// provided VP matrix. Call this instead of uploadInstances() when using the
+/// compute pipeline.
+///
+/// The shadow_pass flag controls behavior for non-shadow-caster entities:
+/// in shadow mode, they get zeroed MVPs (degenerate triangles = no fragments).
+pub fn dispatchInstanceSetup(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, vp: Mat4, draw_count: u32, shadow_pass: bool, frustum_cull: bool, occlusion_cull: bool) void {
+    if (draw_count == 0) return;
+    const pipeline = self.compute_pipeline orelse return;
+    const instance_buf = self.instance_buffer orelse return;
+    const entity_buf = self.entity_data_buffer orelse return;
+    const batch_info_buf = self.batch_info_buffer orelse return;
+    const indirect_buf = self.indirect_draw_buffer orelse return;
+    const stats_buf = self.culling_stats_buffer orelse return;
+
+    // Resolve HiZ combined mipmapped texture for occlusion culling.
+    // If HiZ isn't available (first frame, or textures not yet created), disable occlusion.
+    const pp = &self.postprocess;
+    const hiz_tex = pp.hiz_combined;
+    const hiz_sampler = pp.hiz_sampler;
+    const do_occlusion = occlusion_cull and !shadow_pass and hiz_tex != null and hiz_sampler != null;
+
+    // Begin compute pass — readwrite outputs: instance buffer + culling stats + indirect commands.
+    // IMPORTANT: The order must match the GLSL shader's first-access order for each buffer,
+    // because spirv-cross assigns MSL [[buffer(N)]] indices by first access. The shader
+    // accesses instances first, then culling_stats (atomicAdd in culling branches), then
+    // indirect_commands (atomicAdd for visible entities). SDL3 maps rw_bindings[i] to the
+    // i-th readwrite buffer index.
+    //
+    // Instance buffer cycles (new version each frame, previous frame may still read it).
+    // Indirect buffer does NOT cycle — we just uploaded num_instances=0 via copy pass
+    // and need the compute shader to atomicAdd to that same version.
+    // Stats buffer cycles on scene pass (fresh counters each frame).
+    const zero_pad = [3]u8{ 0, 0, 0 };
+    const rw_bindings = [3]c.SDL_GPUStorageBufferReadWriteBinding{
+        .{ .buffer = instance_buf, .cycle = true, .padding1 = zero_pad[0], .padding2 = zero_pad[1], .padding3 = zero_pad[2] },
+        .{ .buffer = stats_buf, .cycle = false, .padding1 = zero_pad[0], .padding2 = zero_pad[1], .padding3 = zero_pad[2] },
+        .{ .buffer = indirect_buf, .cycle = false, .padding1 = zero_pad[0], .padding2 = zero_pad[1], .padding3 = zero_pad[2] },
+    };
+    const compute_pass = c.SDL_BeginGPUComputePass(cmd, null, 0, &rw_bindings, 3) orelse return;
+
+    c.SDL_BindGPUComputePipeline(compute_pass, pipeline);
+
+    // Bind readonly storage buffers: entity data (slot 0) + batch info (slot 1)
+    const ro_bufs = [2]*c.SDL_GPUBuffer{ entity_buf, batch_info_buf };
+    c.SDL_BindGPUComputeStorageBuffers(compute_pass, 0, &ro_bufs, 2);
+
+    // Bind HiZ sampler (even when not culling — shader checks occlusion_cull flag).
+    // We always bind a valid texture to avoid GPU errors; when occlusion is off,
+    // the shader never samples it.
+    if (hiz_tex) |tex| {
+        if (hiz_sampler) |samp| {
+            const tex_sampler = c.SDL_GPUTextureSamplerBinding{
+                .texture = tex,
+                .sampler = samp,
+            };
+            c.SDL_BindGPUComputeSamplers(compute_pass, 0, &tex_sampler, 1);
+        }
+    }
+
+    // Push uniforms: VP matrix, frustum planes, entity count, modes, HiZ params
+    const hiz_w: f32 = if (pp.hiz_count > 0) @floatFromInt(pp.hiz_widths[0]) else 0;
+    const hiz_h: f32 = if (pp.hiz_count > 0) @floatFromInt(pp.hiz_heights[0]) else 0;
+    const max_mip: f32 = if (pp.hiz_count > 1) @as(f32, @floatFromInt(pp.hiz_count - 1)) else 0;
+
+    const uniforms = ComputeUniforms{
+        .vp = vp.m,
+        .frustum_planes = if (frustum_cull) extractFrustumPlanes(vp) else std.mem.zeroes([6][4]f32),
+        .entity_count = draw_count,
+        .shadow_pass = if (shadow_pass) 1 else 0,
+        .frustum_cull = if (frustum_cull) 1 else 0,
+        .occlusion_cull = if (do_occlusion) 1 else 0,
+        .prev_vp = self.prev_vp,
+        .prev_camera_pos = self.prev_camera_pos,
+        .hiz_params = .{ hiz_w, hiz_h, max_mip, 0 },
+    };
+    c.SDL_PushGPUComputeUniformData(cmd, 0, &uniforms, @sizeOf(ComputeUniforms));
+
+    // Dispatch: one thread per entity, 64 threads per workgroup
+    const workgroups = (draw_count + 63) / 64;
+    c.SDL_DispatchGPUCompute(compute_pass, workgroups, 1, 1);
+
+    c.SDL_EndGPUComputePass(compute_pass);
+}
+
+/// Compute per-instance matrices via GPU compute dispatch. Replaces the CPU-side
+/// uploadInstanceData that used transfer buffer uploads.
+pub fn dispatchInstanceData(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, cam_entity: ecs.entity_t, w: u32, h: u32, frame: FrameContext) void {
+    const vp = computeVP(self, cam_entity, w, h);
+    // Scene pass: frustum cull + HiZ occlusion cull (if HiZ data available)
+    dispatchInstanceSetup(self, cmd, vp, frame.draw_count, false, true, true);
+
+    // Store current VP and camera position for next frame's HiZ reprojection
+    self.prev_vp = vp.m;
+    if (ecs.get(self.world, cam_entity, Position)) |pos| {
+        self.prev_camera_pos = .{ pos.x, pos.y, pos.z, 0 };
+    }
+
+    // Schedule async readback of culling stats (GPU → transfer buffer).
+    // The CPU reads the transfer buffer at the start of the NEXT frame (no stall).
+    downloadCullingStats(self, cmd);
+}
+
+/// Download culling stats from GPU to transfer buffer for async readback.
+fn downloadCullingStats(self: *Engine, cmd: *c.SDL_GPUCommandBuffer) void {
+    const gpu_buf = self.culling_stats_buffer orelse return;
+    const transfer = self.culling_stats_transfer orelse return;
+
+    const copy_pass = c.SDL_BeginGPUCopyPass(cmd) orelse return;
+    c.SDL_DownloadFromGPUBuffer(
+        copy_pass,
+        &c.SDL_GPUBufferRegion{
+            .buffer = gpu_buf,
+            .offset = 0,
+            .size = @sizeOf(CullingStats),
+        },
+        &c.SDL_GPUTransferBufferLocation{
+            .transfer_buffer = transfer,
+            .offset = 0,
+        },
+    );
+    c.SDL_EndGPUCopyPass(copy_pass);
+}
+
+/// Read the previous frame's culling stats from the transfer buffer.
+/// Call at the start of each frame, before the compute dispatch overwrites the GPU buffer.
+pub fn readbackCullingStats(self: *Engine) void {
+    const transfer = self.culling_stats_transfer orelse return;
+    const ptr = c.SDL_MapGPUTransferBuffer(self.gpu_device.?, transfer, false) orelse return;
+    const stats: *const CullingStats = @ptrCast(@alignCast(ptr));
+    self.culling_stats = stats.*;
+    c.SDL_UnmapGPUTransferBuffer(self.gpu_device.?, transfer);
+}
+
 /// Submit batched instanced draw calls. The draw list is sorted by mesh+material,
 /// so consecutive entries with the same sort_key form a batch drawn in one call.
 fn submitDrawCalls(
@@ -605,9 +1206,15 @@ fn submitDrawCalls(
     if (draw_count == 0) return;
     const default_material = MaterialUniforms{ .albedo = .{ 1, 1, 1, 1 } };
 
-    // Bind the instance storage buffer
+    // Bind instance storage buffer (per-instance transforms from compute shader)
     const buf_ptr = [1]*c.SDL_GPUBuffer{self.instance_buffer.?};
     c.SDL_BindGPUVertexStorageBuffers(render_pass, 0, &buf_ptr, 1);
+
+    // Bind merged geometry buffers once for the entire pass — no per-batch rebinding.
+    // Each batch uses base_vertex/first_index offsets in the draw call instead.
+    const vb_binding = c.SDL_GPUBufferBinding{ .buffer = self.merged_vertex_buffer.?, .offset = 0 };
+    c.SDL_BindGPUVertexBuffers(render_pass, 0, &vb_binding, 1);
+    c.SDL_BindGPUIndexBuffer(render_pass, &c.SDL_GPUBufferBinding{ .buffer = self.merged_index_buffer.?, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
 
     var batch_start: u32 = 0;
     while (batch_start < draw_count) {
@@ -624,13 +1231,6 @@ fn submitDrawCalls(
             batch_start = batch_end;
             continue;
         };
-
-        // Bind mesh
-        const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.vertex_buffer, .offset = 0 };
-        c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
-        if (mesh.index_buffer) |ib| {
-            c.SDL_BindGPUIndexBuffer(render_pass, &c.SDL_GPUBufferBinding{ .buffer = ib, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
-        }
 
         // Bind material
         const sampler = self.assets.default_sampler.?;
@@ -671,14 +1271,82 @@ fn submitDrawCalls(
             c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_bindings, 5);
         }
 
-        // Instanced draw — batch_start is the first instance index
-        if (mesh.index_buffer != null) {
-            c.SDL_DrawGPUIndexedPrimitives(render_pass, mesh.index_count, instance_count, 0, 0, batch_start);
+        // Instanced draw — use merged buffer offsets (base_vertex, first_index)
+        if (mesh.indexed) {
+            c.SDL_DrawGPUIndexedPrimitives(render_pass, mesh.index_count, instance_count, mesh.first_index, @intCast(mesh.base_vertex), batch_start);
         } else {
-            c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, instance_count, 0, batch_start);
+            c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, instance_count, mesh.base_vertex, batch_start);
         }
 
         batch_start = batch_end;
+    }
+}
+
+/// Submit draw calls using GPU-driven indirect rendering. The compute shader
+/// has already compacted visible instances and written indirect draw commands
+/// (with num_instances set via atomicAdd). The CPU just iterates batches,
+/// binds material state, and issues one indirect draw per batch.
+pub fn submitDrawCallsIndirect(
+    self: *Engine,
+    cmd: *c.SDL_GPUCommandBuffer,
+    render_pass: *c.SDL_GPURenderPass,
+) void {
+    if (self.batch_count == 0) return;
+    const indirect_buf = self.indirect_draw_buffer orelse return;
+    const default_material = MaterialUniforms{ .albedo = .{ 1, 1, 1, 1 } };
+
+    // Bind instance storage buffer (per-instance transforms from compute shader)
+    const buf_ptr = [1]*c.SDL_GPUBuffer{self.instance_buffer.?};
+    c.SDL_BindGPUVertexStorageBuffers(render_pass, 0, &buf_ptr, 1);
+
+    // Bind merged geometry buffers once
+    const vb_binding = c.SDL_GPUBufferBinding{ .buffer = self.merged_vertex_buffer.?, .offset = 0 };
+    c.SDL_BindGPUVertexBuffers(render_pass, 0, &vb_binding, 1);
+    c.SDL_BindGPUIndexBuffer(render_pass, &c.SDL_GPUBufferBinding{ .buffer = self.merged_index_buffer.?, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
+
+    const sampler = self.assets.default_sampler.?;
+    const dummy = self.assets.dummy_texture.?;
+
+    for (self.batch_descriptors[0..self.batch_count], 0..) |batch, i| {
+        // Bind material
+        if (self.assets.material_registry[batch.material_id]) |mat| {
+            const has_bc: f32 = if (mat.base_color_texture != null) 1.0 else 0.0;
+            const has_mr: f32 = if (mat.metallic_roughness_texture != null) 1.0 else 0.0;
+            const has_nm: f32 = if (mat.normal_texture != null) 1.0 else 0.0;
+            const has_em: f32 = if (mat.emissive_texture != null) 1.0 else 0.0;
+            const has_ao: f32 = if (mat.occlusion_texture != null) 1.0 else 0.0;
+
+            const mat_uniforms = MaterialUniforms{
+                .albedo = mat.albedo,
+                .material_params = .{ mat.metallic, mat.roughness, 0, 0 },
+                .texture_flags = .{ has_bc, has_mr, has_nm, has_em },
+                .emissive = .{ mat.emissive[0], mat.emissive[1], mat.emissive[2], has_ao },
+            };
+            c.SDL_PushGPUFragmentUniformData(cmd, 1, &mat_uniforms, @sizeOf(MaterialUniforms));
+
+            const tex_bindings = [5]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = resolveTexture(self, mat.base_color_texture, dummy), .sampler = sampler },
+                .{ .texture = resolveTexture(self, mat.metallic_roughness_texture, dummy), .sampler = sampler },
+                .{ .texture = resolveTexture(self, mat.normal_texture, dummy), .sampler = sampler },
+                .{ .texture = resolveTexture(self, mat.emissive_texture, dummy), .sampler = sampler },
+                .{ .texture = resolveTexture(self, mat.occlusion_texture, dummy), .sampler = sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_bindings, 5);
+        } else {
+            c.SDL_PushGPUFragmentUniformData(cmd, 1, &default_material, @sizeOf(MaterialUniforms));
+            const tex_bindings = [5]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = dummy, .sampler = sampler },
+                .{ .texture = dummy, .sampler = sampler },
+                .{ .texture = dummy, .sampler = sampler },
+                .{ .texture = dummy, .sampler = sampler },
+                .{ .texture = dummy, .sampler = sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_bindings, 5);
+        }
+
+        // Indirect draw — GPU determines instance count from the compute shader's atomicAdd
+        const cmd_offset: u32 = @intCast(i * @sizeOf(IndirectDrawCommand));
+        c.SDL_DrawGPUIndexedPrimitivesIndirect(render_pass, indirect_buf, cmd_offset, 1);
     }
 }
 
@@ -708,8 +1376,8 @@ pub fn prepareFrame(self: *Engine, w: u32, h: u32) FrameContext {
     }
 
     return .{
-        .dir_light = gatherDirectionalLight(self.world),
-        .draw_count = buildDrawList(self),
+        .dir_light = gatherDirectionalLight(self),
+        .draw_count = 0, // actual draw count set by prepareDrawData
         .light_count = gatherClusterLights(self),
     };
 }
@@ -1092,6 +1760,11 @@ fn submitShadowDrawCalls(self: *Engine, render_pass: *c.SDL_GPURenderPass, draw_
     if (draw_count == 0) return 0;
     var batch_count: u32 = 0;
 
+    // Bind merged geometry buffers once for the entire shadow pass
+    const vb_binding = c.SDL_GPUBufferBinding{ .buffer = self.merged_vertex_buffer.?, .offset = 0 };
+    c.SDL_BindGPUVertexBuffers(render_pass, 0, &vb_binding, 1);
+    c.SDL_BindGPUIndexBuffer(render_pass, &c.SDL_GPUBufferBinding{ .buffer = self.merged_index_buffer.?, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
+
     var batch_start: u32 = 0;
     while (batch_start < draw_count) {
         const sort_key = self.draw_list[batch_start].sort_key;
@@ -1106,16 +1779,10 @@ fn submitShadowDrawCalls(self: *Engine, render_pass: *c.SDL_GPURenderPass, draw_
             continue;
         };
 
-        const binding = c.SDL_GPUBufferBinding{ .buffer = mesh.vertex_buffer, .offset = 0 };
-        c.SDL_BindGPUVertexBuffers(render_pass, 0, &binding, 1);
-        if (mesh.index_buffer) |ib| {
-            c.SDL_BindGPUIndexBuffer(render_pass, &c.SDL_GPUBufferBinding{ .buffer = ib, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
-        }
-
-        if (mesh.index_buffer != null) {
-            c.SDL_DrawGPUIndexedPrimitives(render_pass, mesh.index_count, instance_count, 0, 0, batch_start);
+        if (mesh.indexed) {
+            c.SDL_DrawGPUIndexedPrimitives(render_pass, mesh.index_count, instance_count, mesh.first_index, @intCast(mesh.base_vertex), batch_start);
         } else {
-            c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, instance_count, 0, batch_start);
+            c.SDL_DrawGPUPrimitives(render_pass, mesh.vertex_count, instance_count, mesh.base_vertex, batch_start);
         }
 
         batch_count += 1;
@@ -1139,7 +1806,6 @@ pub fn executeShadowPass(
     const shadow_depth_tex = self.shadow_depth orelse return emptyShadowUniforms();
     if (frame.draw_count == 0) return emptyShadowUniforms();
 
-    const transfer = self.instance_transfer orelse return emptyShadowUniforms();
     const gpu_buf = self.instance_buffer orelse return emptyShadowUniforms();
 
     const cascades = computeCascades(self, cam_entity, w, h, frame.dir_light.dir);
@@ -1155,43 +1821,9 @@ pub fn executeShadowPass(
     for (0..cascade_count) |ci| {
         const light_vp = cascades.light_vp[ci];
 
-        // Upload instance data with light_vp * model as MVP
-        {
-            const ptr = c.SDL_MapGPUTransferBuffer(self.gpu_device.?, transfer, true) orelse continue;
-            const instances: [*]InstanceData = @ptrCast(@alignCast(ptr));
-
-            for (self.draw_list[0..frame.draw_count], 0..) |entry, i| {
-                const is_caster = ecs.has_id(self.world, entry.entity, ecs.id(ShadowCaster));
-                if (!is_caster) {
-                    // Zero-scale MVP: all vertices collapse to a point, degenerate triangles produce no fragments
-                    instances[i] = .{ .mvp = .{.{ 0, 0, 0, 0 }} ** 4, .model = .{.{ 0, 0, 0, 0 }} ** 4, .flags = .{ 0, 0, 0, 0 } };
-                    continue;
-                }
-                const pos = ecs.get(self.world, entry.entity, Position) orelse continue;
-                const rot = ecs.get(self.world, entry.entity, Rotation) orelse continue;
-                const rotation = Mat4.mul(Mat4.mul(Mat4.rotateZ(rot.z), Mat4.rotateY(rot.y)), Mat4.rotateX(rot.x));
-                const scl = if (ecs.get(self.world, entry.entity, Scale)) |s|
-                    Mat4.scale(s.x, s.y, s.z)
-                else
-                    Mat4.identity();
-                const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), Mat4.mul(rotation, scl));
-                instances[i] = .{ .mvp = Mat4.mul(light_vp, model).m, .model = model.m, .flags = .{ 0, 0, 0, 0 } };
-            }
-
-            c.SDL_UnmapGPUTransferBuffer(self.gpu_device.?, transfer);
-
-            const data_size: u32 = frame.draw_count * @sizeOf(InstanceData);
-            const copy_pass = c.SDL_BeginGPUCopyPass(cmd) orelse continue;
-            c.SDL_UploadToGPUBuffer(copy_pass, &c.SDL_GPUTransferBufferLocation{
-                .transfer_buffer = transfer,
-                .offset = 0,
-            }, &c.SDL_GPUBufferRegion{
-                .buffer = gpu_buf,
-                .offset = 0,
-                .size = data_size,
-            }, true);
-            c.SDL_EndGPUCopyPass(copy_pass);
-        }
+        // Dispatch compute shader to build instance data with light VP.
+        // shadow_pass=true zeros out non-caster entities (degenerate triangles).
+        dispatchInstanceSetup(self, cmd, light_vp, frame.draw_count, true, false, false);
 
         // Render this cascade
         const color_target = c.SDL_GPUColorTargetInfo{
@@ -1402,6 +2034,6 @@ pub fn executeScenePass(
         c.SDL_BindGPUFragmentSamplers(render_pass, 5, &shadow_binding, 1);
     }
 
-    submitDrawCalls(self, cmd, render_pass, frame.draw_count);
+    submitDrawCallsIndirect(self, cmd, render_pass);
     c.SDL_EndGPURenderPass(render_pass);
 }

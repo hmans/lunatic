@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const ShaderStage = enum { vertex, fragment };
+const ShaderStage = enum { vertex, fragment, compute };
 
 fn addShader(
     b: *std.Build,
@@ -13,6 +13,7 @@ fn addShader(
     const stage_flag = switch (stage) {
         .vertex => "-fshader-stage=vertex",
         .fragment => "-fshader-stage=fragment",
+        .compute => "-fshader-stage=compute",
     };
 
     const glslc = b.addSystemCommand(&.{
@@ -22,9 +23,15 @@ fn addShader(
     glslc.addArg("-o");
     const spv = glslc.addOutputFileArg(name ++ "." ++ ext ++ ".spv");
 
-    const spirv_cross = b.addSystemCommand(&.{
-        "spirv-cross", "--msl", "--msl-decoration-binding",
-    });
+    // For vertex/fragment shaders, --msl-decoration-binding preserves the
+    // per-set binding numbers as MSL attribute indices. For compute shaders,
+    // we omit it because Metal has a flat buffer namespace — spirv-cross's
+    // default auto-assignment produces the ordering SDL3 expects:
+    // uniforms → readonly storage → readwrite storage.
+    const spirv_cross = if (stage == .compute)
+        b.addSystemCommand(&.{ "spirv-cross", "--msl" })
+    else
+        b.addSystemCommand(&.{ "spirv-cross", "--msl", "--msl-decoration-binding" });
     spirv_cross.addFileArg(spv);
     spirv_cross.addArg("--output");
     const msl = spirv_cross.addOutputFileArg(name ++ "." ++ ext ++ ".msl");
@@ -42,6 +49,7 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) 
     addShader(b, mod, "scene", "default", "frag", .fragment);
     addShader(b, mod, "shadow", "shadow", "vert", .vertex);
     addShader(b, mod, "shadow", "shadow", "frag", .fragment);
+    addShader(b, mod, "compute", "instance_setup", "comp", .compute);
     addShader(b, pp_mod, "postprocess", "fullscreen", "vert", .vertex);
     addShader(b, pp_mod, "postprocess", "downsample", "frag", .fragment);
     addShader(b, pp_mod, "postprocess", "upsample", "frag", .fragment);
@@ -52,6 +60,7 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) 
     addShader(b, pp_mod, "postprocess", "dof_composite", "frag", .fragment);
     addShader(b, pp_mod, "postprocess", "dof_tent", "frag", .fragment);
     addShader(b, pp_mod, "postprocess", "lensflare", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "hiz_downsample", "frag", .fragment);
 }
 
 /// Add all system include/lib paths from known prefixes where dependencies are found.

@@ -36,11 +36,22 @@ const Vertex = geometry.Vertex;
 // ============================================================
 
 pub const MeshData = struct {
-    vertex_buffer: *c.SDL_GPUBuffer,
     vertex_count: u32,
-    index_buffer: ?*c.SDL_GPUBuffer = null,
     index_count: u32 = 0,
+    /// Offset (in vertices) into the merged vertex buffer.
+    base_vertex: u32 = 0,
+    /// Offset (in indices) into the merged index buffer.
+    first_index: u32 = 0,
+    /// True if this mesh has index data in the merged index buffer.
+    indexed: bool = false,
 };
+
+/// Maximum total vertices across all meshes in the merged vertex buffer.
+/// 1M vertices * 48 bytes = 48 MB — generous for game-scale geometry.
+pub const max_merged_vertices: u32 = 1024 * 1024;
+/// Maximum total indices across all meshes in the merged index buffer.
+/// 4M indices * 4 bytes = 16 MB.
+pub const max_merged_indices: u32 = 4 * 1024 * 1024;
 
 pub const TextureData = struct {
     texture: *c.SDL_GPUTexture,
@@ -108,17 +119,13 @@ pub const AssetStore = struct {
     }
 
     /// Release all GPU resources held by the asset store.
+    /// Note: mesh vertex/index data lives in the merged geometry buffers
+    /// (released by Engine.deinit), so only textures need cleanup here.
     pub fn deinit(self: *AssetStore, device: *c.SDL_GPUDevice) void {
         for (0..self.texture_count) |i| {
             if (self.texture_registry[i]) |tex| c.SDL_ReleaseGPUTexture(device, tex.texture);
         }
         if (self.default_sampler) |s| c.SDL_ReleaseGPUSampler(device, s);
-        for (0..self.mesh_count) |i| {
-            if (self.mesh_registry[i]) |mesh| {
-                c.SDL_ReleaseGPUBuffer(device, mesh.vertex_buffer);
-                if (mesh.index_buffer) |ib| c.SDL_ReleaseGPUBuffer(device, ib);
-            }
-        }
     }
 };
 
@@ -157,6 +164,9 @@ pub const Config = struct {
 pub const FrameStats = struct {
     draw_calls: u32 = 0,
     entities_rendered: u32 = 0,
+    visible_after_cull: u32 = 0, // entities that passed GPU culling (from readback)
+    frustum_culled: u32 = 0, // entities rejected by frustum culling
+    occlusion_culled: u32 = 0, // entities rejected by HiZ occlusion culling
     physics_active: u32 = 0,
     physics_total: u32 = 0,
     // Render sub-timings (raw + smoothed)
@@ -384,6 +394,25 @@ pub const Engine = struct {
     instance_buffer: ?*c.SDL_GPUBuffer = null,
     instance_transfer: ?*c.SDL_GPUTransferBuffer = null,
     instance_capacity: u32 = 0,
+
+    // GPU-driven: compute pipeline + entity data buffers
+    compute_pipeline: ?*c.SDL_GPUComputePipeline = null,
+    entity_data_buffer: ?*c.SDL_GPUBuffer = null,
+    entity_data_transfer: ?*c.SDL_GPUTransferBuffer = null,
+
+    // Merged geometry buffers: all mesh vertex/index data in single GPU buffers.
+    // Eliminates per-batch vertex/index buffer rebinding in draw calls.
+    merged_vertex_buffer: ?*c.SDL_GPUBuffer = null,
+    merged_index_buffer: ?*c.SDL_GPUBuffer = null,
+    merged_vertex_offset: u32 = 0, // append cursor (in vertices)
+    merged_index_offset: u32 = 0, // append cursor (in indices)
+
+    // GPU-driven indirect draw: batch info + indirect command buffers
+    batch_info_buffer: ?*c.SDL_GPUBuffer = null,
+    indirect_draw_buffer: ?*c.SDL_GPUBuffer = null,
+    batch_transfer: ?*c.SDL_GPUTransferBuffer = null,
+    batch_descriptors: [renderer.max_batches]renderer.BatchDescriptor = undefined,
+    batch_count: u32 = 0,
     depth_texture: ?*c.SDL_GPUTexture = null,
     msaa_color_texture: ?*c.SDL_GPUTexture = null,
     swapchain_format: c.SDL_GPUTextureFormat = c.SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
@@ -416,6 +445,29 @@ pub const Engine = struct {
 
     // Draw sorting scratch buffer
     draw_list: [renderer.max_renderables]renderer.DrawEntry = undefined,
+
+    // Persistent ECS queries (created once at init, reused every frame)
+    renderable_query: ?*ecs.query_t = null, // Position, Rotation, MeshHandle + optional Scale, Material, Shadow*
+    dir_light_query: ?*ecs.query_t = null, // DirectionalLight
+    point_light_query: ?*ecs.query_t = null, // Position, PointLight
+    spot_light_query: ?*ecs.query_t = null, // Position, SpotLight
+    camera_query: ?*ecs.query_t = null, // Position, Camera
+
+    // Draw list dirty flag — skip sort + batch rebuild when structure hasn't changed
+    draw_list_dirty: bool = true,
+    prev_draw_count: u32 = 0,
+
+    // Previous frame's VP matrix and camera position, used for HiZ occlusion
+    // culling reprojection. Initialized to identity/zero; occlusion culling
+    // auto-disables on the first frame (HiZ contains far-plane depth).
+    prev_vp: [4][4]f32 = std.mem.zeroes([4][4]f32),
+    prev_camera_pos: [4]f32 = .{ 0, 0, 0, 0 },
+
+    // Culling statistics readback: GPU writes atomic counters during the scene
+    // compute dispatch, CPU reads the previous frame's data (no GPU stall).
+    culling_stats_buffer: ?*c.SDL_GPUBuffer = null,
+    culling_stats_transfer: ?*c.SDL_GPUTransferBuffer = null,
+    culling_stats: renderer.CullingStats = .{}, // previous frame's readback data
 
     // Clustered lighting GPU buffers
     cluster_light_buffer: ?*c.SDL_GPUBuffer = null,
@@ -536,6 +588,14 @@ pub const Engine = struct {
             if (self.depth_texture) |dt| c.SDL_ReleaseGPUTexture(device, dt);
             if (self.instance_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
             if (self.instance_transfer) |t| c.SDL_ReleaseGPUTransferBuffer(device, t);
+            if (self.entity_data_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
+            if (self.entity_data_transfer) |t| c.SDL_ReleaseGPUTransferBuffer(device, t);
+            if (self.compute_pipeline) |p| c.SDL_ReleaseGPUComputePipeline(device, p);
+            if (self.merged_vertex_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
+            if (self.merged_index_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
+            if (self.batch_info_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
+            if (self.indirect_draw_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
+            if (self.batch_transfer) |t| c.SDL_ReleaseGPUTransferBuffer(device, t);
             if (self.cluster_light_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
             if (self.cluster_info_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
             if (self.cluster_index_buffer) |b| c.SDL_ReleaseGPUBuffer(device, b);
@@ -653,31 +713,48 @@ pub const Engine = struct {
 
             const pf = c.SDL_GetPerformanceFrequency();
 
-            // Phase 1: Prepare (draw list build + sort)
+            // Phase 1: Prepare (draw list + entity data + batch computation + GPU uploads)
             const tp0 = c.SDL_GetPerformanceCounter();
             const frame = renderer.prepareFrame(self, sw_w, sw_h);
-            self.stats.entities_rendered = frame.draw_count;
-            self.stats.draw_calls = renderer.countBatches(self, frame.draw_count);
+            // Single-pass: columnar ECS iteration + sort + batch computation + upload
+            const draw_count_actual = renderer.prepareDrawData(self, cmd);
+            const frame_with_draws = renderer.FrameContext{
+                .dir_light = frame.dir_light,
+                .draw_count = draw_count_actual,
+                .light_count = frame.light_count,
+            };
+            self.stats.entities_rendered = draw_count_actual;
+            self.stats.draw_calls = self.batch_count;
+            self.stats.visible_after_cull = self.culling_stats.visible_count;
+            self.stats.frustum_culled = self.culling_stats.frustum_culled;
+            self.stats.occlusion_culled = self.culling_stats.occlusion_culled;
             const tp1 = c.SDL_GetPerformanceCounter();
             self.stats.time_prepare_us = (tp1 - tp0) * 1_000_000 / pf;
 
             const hdr_tex = self.postprocess.hdr_texture.?;
 
-            // Per-camera rendering
-            const cam_q = queryInit(self.world, &.{ecs.id(core_components.Position), ecs.id(core_components.Camera)}, &.{});
-            defer ecs.query_fini(cam_q);
-            var cam_qit = ecs.query_iter(self.world, cam_q);
+            // Phase 1.4: Read back previous frame's culling stats (async, no stall)
+            renderer.readbackCullingStats(self);
+
+            // Phase 1.5: Build HiZ pyramid from previous frame's linear depth.
+            // The HDR texture still holds last frame's render at this point
+            // (alpha = linear camera distance). This builds the hierarchical
+            // depth buffer used by the compute shader for occlusion culling.
+            postprocess.buildHiZPyramid(self, cmd, sw_w, sw_h);
+
+            // Per-camera rendering (persistent query — no per-frame allocation)
+            var cam_qit = ecs.query_iter(self.world, self.camera_query.?);
 
             while (ecs.query_next(&cam_qit)) {
                 for (cam_qit.entities()) |cam_entity| {
                     const cam = ecs.get(self.world, cam_entity, core_components.Camera) orelse continue;
 
                 // Phase 2: Shadow map rendering (uploads its own instance data per cascade)
-                const shadow_uniforms = renderer.executeShadowPass(self, cmd, cam_entity, sw_w, sw_h, frame);
+                const shadow_uniforms = renderer.executeShadowPass(self, cmd, cam_entity, sw_w, sw_h, frame_with_draws);
 
-                // Phase 2.5: Instance data for scene (re-upload after shadow pass overwrote buffer)
+                // Phase 2.5: Compute dispatch for scene instance data (after shadow pass overwrote buffer)
                 const ti0 = c.SDL_GetPerformanceCounter();
-                renderer.uploadInstanceData(self, cmd, cam_entity, sw_w, sw_h, frame);
+                renderer.dispatchInstanceData(self, cmd, cam_entity, sw_w, sw_h, frame_with_draws);
                 const ti1 = c.SDL_GetPerformanceCounter();
                 self.stats.time_instances_us = (ti1 - ti0) * 1_000_000 / pf;
 
@@ -686,7 +763,7 @@ pub const Engine = struct {
 
                 // Phase 3: Scene render pass
                 const ts0 = c.SDL_GetPerformanceCounter();
-                renderer.executeScenePass(self, cmd, cam_entity, hdr_tex, sw_w, sw_h, frame, cam.exposure, shadow_uniforms);
+                renderer.executeScenePass(self, cmd, cam_entity, hdr_tex, sw_w, sw_h, frame_with_draws, cam.exposure, shadow_uniforms);
                 const ts1 = c.SDL_GetPerformanceCounter();
                 self.stats.time_scene_us = (ts1 - ts0) * 1_000_000 / pf;
 
@@ -888,16 +965,67 @@ pub const Engine = struct {
         // Pipeline + render targets
         try renderer.initPipeline(self, config);
 
-        // Instance buffer for batched rendering
+        // Merged geometry buffers: all mesh vertex/index data lives in these.
+        // Created once at init, appended to by createMesh().
+        self.merged_vertex_buffer = c.SDL_CreateGPUBuffer(self.gpu_device.?, &c.SDL_GPUBufferCreateInfo{
+            .usage = c.SDL_GPU_BUFFERUSAGE_VERTEX,
+            .size = max_merged_vertices * @sizeOf(geometry.Vertex),
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        self.merged_index_buffer = c.SDL_CreateGPUBuffer(self.gpu_device.?, &c.SDL_GPUBufferCreateInfo{
+            .usage = c.SDL_GPU_BUFFERUSAGE_INDEX,
+            .size = max_merged_indices * @sizeOf(u32),
+            .props = 0,
+        }) orelse return error.BufferFailed;
+
+        // Indirect draw: batch info (readonly by compute) and indirect draw commands
+        // (written by compute via atomics, consumed by indirect draw calls).
+        self.batch_info_buffer = c.SDL_CreateGPUBuffer(self.gpu_device.?, &c.SDL_GPUBufferCreateInfo{
+            .usage = c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ,
+            .size = renderer.max_batches * @sizeOf(renderer.BatchInfo),
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        self.indirect_draw_buffer = c.SDL_CreateGPUBuffer(self.gpu_device.?, &c.SDL_GPUBufferCreateInfo{
+            .usage = c.SDL_GPU_BUFFERUSAGE_INDIRECT | c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE,
+            .size = renderer.max_batches * @sizeOf(renderer.IndirectDrawCommand),
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        // Single transfer buffer for both batch info + indirect commands (uploaded together)
+        const batch_transfer_size = renderer.max_batches * (@sizeOf(renderer.BatchInfo) + @sizeOf(renderer.IndirectDrawCommand));
+        self.batch_transfer = c.SDL_CreateGPUTransferBuffer(self.gpu_device.?, &c.SDL_GPUTransferBufferCreateInfo{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = batch_transfer_size,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+
+        // Instance buffer for batched rendering.
+        // Readable by the vertex shader (GRAPHICS_STORAGE_READ) and writable by
+        // the instance setup compute shader (COMPUTE_STORAGE_WRITE).
         const instance_buf_size: u32 = renderer.max_renderables * @sizeOf(renderer.InstanceData);
         self.instance_buffer = c.SDL_CreateGPUBuffer(self.gpu_device.?, &c.SDL_GPUBufferCreateInfo{
-            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ | c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE,
             .size = instance_buf_size,
             .props = 0,
         }) orelse return error.BufferFailed;
         self.instance_transfer = c.SDL_CreateGPUTransferBuffer(self.gpu_device.?, &c.SDL_GPUTransferBufferCreateInfo{
             .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
             .size = instance_buf_size,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+
+        // Entity data buffer for GPU-driven instance setup.
+        // Raw per-entity transforms uploaded from CPU, read by the compute shader.
+        const entity_buf_size: u32 = renderer.max_renderables * @sizeOf(renderer.EntityData);
+        self.entity_data_buffer = c.SDL_CreateGPUBuffer(self.gpu_device.?, &c.SDL_GPUBufferCreateInfo{
+            .usage = c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ,
+            .size = entity_buf_size,
+            .props = 0,
+        }) orelse return error.BufferFailed;
+        // Transfer buffer holds entity data + batch info + indirect commands + culling stats (single map/unmap)
+        const batch_data_size = renderer.max_batches * (@sizeOf(renderer.BatchInfo) + @sizeOf(renderer.IndirectDrawCommand));
+        self.entity_data_transfer = c.SDL_CreateGPUTransferBuffer(self.gpu_device.?, &c.SDL_GPUTransferBufferCreateInfo{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = entity_buf_size + batch_data_size + @sizeOf(renderer.CullingStats),
             .props = 0,
         }) orelse return error.BufferFailed;
         self.instance_capacity = renderer.max_renderables;
@@ -976,6 +1104,15 @@ pub const Engine = struct {
             .props = 0,
         }) orelse return error.BufferFailed;
         try renderer.initShadowPipeline(self);
+        try renderer.initComputePipeline(self);
+
+        // Persistent ECS queries — created once, reused every frame.
+        // Flecs automatically maintains these as entities are added/removed.
+        self.renderable_query = renderer.createRenderableQuery(self.world);
+        self.dir_light_query = queryInit(self.world, &.{ecs.id(core_components.DirectionalLight)}, &.{});
+        self.point_light_query = queryInit(self.world, &.{ ecs.id(core_components.Position), ecs.id(core_components.PointLight) }, &.{});
+        self.spot_light_query = queryInit(self.world, &.{ ecs.id(core_components.Position), ecs.id(core_components.SpotLight) }, &.{});
+        self.camera_query = queryInit(self.world, &.{ ecs.id(core_components.Position), ecs.id(core_components.Camera) }, &.{});
 
         // Dear ImGui
         _ = c.igCreateContext(null);
@@ -1071,16 +1208,24 @@ pub const Engine = struct {
     /// Pass a name for built-in meshes (accessible via `lunatic.mesh.*` in Lua), or null.
     pub fn createMesh(self: *Engine, name: ?[*:0]const u8, vertices: []const Vertex, indices: ?[]const u32) !u32 {
         const device = self.gpu_device orelse return error.NotInitialized;
-        const vbuf = uploadGPUBuffer(device, std.mem.sliceAsBytes(vertices), c.SDL_GPU_BUFFERUSAGE_VERTEX) orelse return error.BufferFailed;
+        const vcount: u32 = @intCast(vertices.len);
+        const icount: u32 = if (indices) |idx| @as(u32, @intCast(idx.len)) else 0;
 
-        var ibuf: ?*c.SDL_GPUBuffer = null;
-        var icount: u32 = 0;
+        // Check merged buffer capacity
+        if (self.merged_vertex_offset + vcount > max_merged_vertices) return error.TooManyVertices;
+        if (indices != null and self.merged_index_offset + icount > max_merged_indices) return error.TooManyIndices;
+
+        const base_vertex = self.merged_vertex_offset;
+        const first_index = self.merged_index_offset;
+
+        // Upload vertices to merged vertex buffer at current offset
+        uploadToBufferRegion(device, self.merged_vertex_buffer.?, std.mem.sliceAsBytes(vertices), base_vertex * @sizeOf(Vertex));
+        self.merged_vertex_offset += vcount;
+
+        // Upload indices to merged index buffer at current offset
         if (indices) |idx| {
-            ibuf = uploadGPUBuffer(device, std.mem.sliceAsBytes(idx), c.SDL_GPU_BUFFERUSAGE_INDEX) orelse {
-                c.SDL_ReleaseGPUBuffer(device, vbuf);
-                return error.BufferFailed;
-            };
-            icount = @intCast(idx.len);
+            uploadToBufferRegion(device, self.merged_index_buffer.?, std.mem.sliceAsBytes(idx), first_index * @sizeOf(u32));
+            self.merged_index_offset += icount;
         }
 
         // Try to reuse a freed slot
@@ -1092,32 +1237,26 @@ pub const Engine = struct {
             }
         }
         if (id == self.assets.mesh_count) {
-            if (self.assets.mesh_count >= max_meshes) {
-                c.SDL_ReleaseGPUBuffer(device, vbuf);
-                if (ibuf) |ib| c.SDL_ReleaseGPUBuffer(device, ib);
-                return error.TooManyMeshes;
-            }
+            if (self.assets.mesh_count >= max_meshes) return error.TooManyMeshes;
             self.assets.mesh_count += 1;
         }
 
         self.assets.mesh_registry[id] = .{
-            .vertex_buffer = vbuf,
-            .vertex_count = @intCast(vertices.len),
-            .index_buffer = ibuf,
+            .vertex_count = vcount,
             .index_count = icount,
+            .base_vertex = base_vertex,
+            .first_index = first_index,
+            .indexed = indices != null,
         };
         self.assets.mesh_names[id] = name;
         return id;
     }
 
-    /// Destroy a mesh, releasing its GPU buffers and freeing the registry slot.
+    /// Destroy a mesh, freeing the registry slot.
+    /// The vertex/index data remains in the merged buffers (no compaction).
+    /// The slot can be reused by a future createMesh call.
     pub fn destroyMesh(self: *Engine, id: u32) void {
         if (id >= self.assets.mesh_count) return;
-        if (self.assets.mesh_registry[id]) |mesh| {
-            const device = self.gpu_device orelse return;
-            c.SDL_ReleaseGPUBuffer(device, mesh.vertex_buffer);
-            if (mesh.index_buffer) |ib| c.SDL_ReleaseGPUBuffer(device, ib);
-        }
         self.assets.mesh_registry[id] = null;
         self.assets.mesh_names[id] = null;
     }
@@ -1582,7 +1721,8 @@ pub const Engine = struct {
         const display_w: f32 = if (io) |i| i.*.DisplaySize.x else 800;
 
         c.igSetNextWindowPosEx(.{ .x = display_w - 16, .y = 16 }, c.ImGuiCond_Always, .{ .x = 1, .y = 0 });
-        _ = c.igBegin("##stats", null, c.ImGuiWindowFlags_NoTitleBar | c.ImGuiWindowFlags_NoResize | c.ImGuiWindowFlags_NoMove | c.ImGuiWindowFlags_AlwaysAutoResize | c.ImGuiWindowFlags_NoSavedSettings | c.ImGuiWindowFlags_NoFocusOnAppearing | c.ImGuiWindowFlags_NoNav);
+        c.igSetNextWindowSizeConstraints(.{ .x = 280, .y = 0 }, .{ .x = 280, .y = 10000 }, null, null);
+        _ = c.igBegin("##stats", null, c.ImGuiWindowFlags_NoTitleBar | c.ImGuiWindowFlags_NoResize | c.ImGuiWindowFlags_NoMove | c.ImGuiWindowFlags_AlwaysAutoResize | c.ImGuiWindowFlags_NoFocusOnAppearing | c.ImGuiWindowFlags_NoNav);
 
         var buf: [128]u8 = undefined;
         const line1 = std.fmt.bufPrintZ(&buf, "{d:.0} fps | {d} draws ({d} entities)", .{ if (io) |i| i.*.Framerate else 0, s.draw_calls, s.entities_rendered }) catch "???";
@@ -1596,27 +1736,39 @@ pub const Engine = struct {
         }) catch "???";
         c.igTextUnformatted(line2);
 
-        // Per-system timing is available in the Flecs Explorer
-        // (https://www.flecs.dev/explorer) which tracks all registered systems.
+        // GPU culling breakdown (from previous frame's compute shader readback)
+        {
+            const total = s.visible_after_cull + s.frustum_culled + s.occlusion_culled;
+            if (total > 0 and c.igCollapsingHeader("Culling", 0)) {
+                var cb1: [64]u8 = undefined;
+                c.igTextUnformatted(std.fmt.bufPrintZ(&cb1, "total {d}", .{total}) catch "???");
+                var cb2: [64]u8 = undefined;
+                c.igTextUnformatted(std.fmt.bufPrintZ(&cb2, "visible {d}", .{s.visible_after_cull}) catch "???");
+                var cb3: [64]u8 = undefined;
+                c.igTextUnformatted(std.fmt.bufPrintZ(&cb3, "frustum culled {d}", .{s.frustum_culled}) catch "???");
+                var cb4: [64]u8 = undefined;
+                c.igTextUnformatted(std.fmt.bufPrintZ(&cb4, "occlusion culled {d}", .{s.occlusion_culled}) catch "???");
+            }
+        }
 
         // Render sub-phases
-        c.igSeparatorText("Render");
+        if (c.igCollapsingHeader("Render", 0)) {
+            const render_phases = [_]struct { name: []const u8, avg: f64 }{
+                .{ .name = "prepare", .avg = s.avg_prepare },
+                .{ .name = "instances", .avg = s.avg_instances },
+                .{ .name = "scene", .avg = s.avg_scene },
+                .{ .name = "postprocess", .avg = s.avg_postprocess },
+                .{ .name = "imgui", .avg = s.avg_imgui },
+            };
 
-        const render_phases = [_]struct { name: []const u8, avg: f64 }{
-            .{ .name = "prepare", .avg = s.avg_prepare },
-            .{ .name = "instances", .avg = s.avg_instances },
-            .{ .name = "scene", .avg = s.avg_scene },
-            .{ .name = "postprocess", .avg = s.avg_postprocess },
-            .{ .name = "imgui", .avg = s.avg_imgui },
-        };
-
-        for (render_phases) |phase| {
-            var phase_buf: [128]u8 = undefined;
-            const phase_line = std.fmt.bufPrintZ(&phase_buf, "{d:.2}ms {s}", .{
-                phase.avg / 1000.0,
-                phase.name,
-            }) catch "???";
-            c.igTextUnformatted(phase_line);
+            for (render_phases) |phase| {
+                var phase_buf: [128]u8 = undefined;
+                const phase_line = std.fmt.bufPrintZ(&phase_buf, "{d:.2}ms {s}", .{
+                    phase.avg / 1000.0,
+                    phase.name,
+                }) catch "???";
+                c.igTextUnformatted(phase_line);
+            }
         }
 
         c.igEnd();
@@ -1698,6 +1850,47 @@ fn uploadGPUBuffer(device: *c.SDL_GPUDevice, data: []const u8, usage: c.SDL_GPUB
     _ = c.SDL_SubmitGPUCommandBuffer(cmd);
     c.SDL_ReleaseGPUTransferBuffer(device, transfer);
     return buf;
+}
+
+/// Upload data to a specific byte offset within an existing GPU buffer.
+/// Used by createMesh to append vertex/index data to the merged geometry buffers.
+fn uploadToBufferRegion(device: *c.SDL_GPUDevice, buffer: *c.SDL_GPUBuffer, data: []const u8, dest_offset: u32) void {
+    const data_size: u32 = @intCast(data.len);
+    if (data_size == 0) return;
+
+    const transfer = c.SDL_CreateGPUTransferBuffer(device, &c.SDL_GPUTransferBufferCreateInfo{
+        .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+        .size = data_size,
+        .props = 0,
+    }) orelse return;
+
+    const ptr = c.SDL_MapGPUTransferBuffer(device, transfer, false) orelse {
+        c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+        return;
+    };
+    @memcpy(@as([*]u8, @ptrCast(ptr))[0..data_size], data);
+    c.SDL_UnmapGPUTransferBuffer(device, transfer);
+
+    const cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse {
+        c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+        return;
+    };
+    const copy_pass = c.SDL_BeginGPUCopyPass(cmd) orelse {
+        _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+        c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+        return;
+    };
+    c.SDL_UploadToGPUBuffer(copy_pass, &c.SDL_GPUTransferBufferLocation{
+        .transfer_buffer = transfer,
+        .offset = 0,
+    }, &c.SDL_GPUBufferRegion{
+        .buffer = buffer,
+        .offset = dest_offset,
+        .size = data_size,
+    }, false);
+    c.SDL_EndGPUCopyPass(copy_pass);
+    _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+    c.SDL_ReleaseGPUTransferBuffer(device, transfer);
 }
 
 // ============================================================

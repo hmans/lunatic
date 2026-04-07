@@ -150,13 +150,16 @@ pub const DebugServer = struct {
         const fps: f32 = if (io) |i| i.*.Framerate else 0;
 
         const json = std.fmt.allocPrint(std.heap.c_allocator,
-            \\{{"fps":{d:.1},"entities_rendered":{d},"draw_calls":{d},"physics_active":{d},"physics_total":{d},"frame":{d},"avg_us":{{"prepare":{d:.0},"instances":{d:.0},"scene":{d:.0},"postprocess":{d:.0},"imgui":{d:.0}}}}}
+            \\{{"fps":{d:.1},"entities_rendered":{d},"draw_calls":{d},"physics_active":{d},"physics_total":{d},"culling":{{"visible":{d},"frustum_culled":{d},"occlusion_culled":{d}}},"frame":{d},"avg_us":{{"prepare":{d:.0},"instances":{d:.0},"scene":{d:.0},"postprocess":{d:.0},"imgui":{d:.0}}}}}
         , .{
             fps,
             s.entities_rendered,
             s.draw_calls,
             s.physics_active,
             s.physics_total,
+            s.visible_after_cull,
+            s.frustum_culled,
+            s.occlusion_culled,
             engine.current_frame,
             s.avg_prepare,
             s.avg_instances,

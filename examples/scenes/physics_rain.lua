@@ -152,9 +152,12 @@ function scene.setup(cam)
     for _, e in ipairs(entities) do
       pcall(lunatic.destroy, e)
     end
-    for i = 1, #body_ring do
+    -- body_ring is a sparse table indexed 1..max_bodies; ipairs/#
+    -- won't traverse it reliably, so iterate the full range.
+    for i = 1, max_bodies do
       if body_ring[i] then
         pcall(lunatic.destroy, body_ring[i])
+        body_ring[i] = nil
       end
     end
     for _, m in ipairs(materials) do

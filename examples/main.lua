@@ -58,6 +58,27 @@ local function load_scene(index)
   scene_cleanup = scenes[index].setup(cam)
 end
 
+-- Expose scene switching for agent access (via /lua endpoint or MCP eval_lua)
+function switch_scene(name_or_index)
+  if type(name_or_index) == "number" then
+    if name_or_index >= 1 and name_or_index <= #scenes then
+      load_scene(name_or_index)
+      return scenes[name_or_index].name
+    end
+  elseif type(name_or_index) == "string" then
+    for i, s in ipairs(scenes) do
+      if s.name:lower():find(name_or_index:lower()) then
+        load_scene(i)
+        return s.name
+      end
+    end
+  end
+  -- Return available scenes if no match
+  local names = {}
+  for i, s in ipairs(scenes) do names[i] = s.name end
+  return names
+end
+
 -- Load the first scene
 load_scene(1)
 
