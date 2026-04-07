@@ -12,8 +12,13 @@ pub fn main() !void {
 
     var engine: Engine = undefined;
     try engine.init(.{ .width = 1280, .height = 720, .debug_stats = debug });
-    defer engine.deinit();
 
     try engine.loadScript("examples/main.lua");
     try engine.run();
+
+    // run() returned normally — the player quit cleanly. Call deinit
+    // explicitly then exit(0), because background threads (debug server,
+    // flecs REST) can panic during teardown and produce a non-zero exit code.
+    engine.deinit();
+    std.process.exit(0);
 }
