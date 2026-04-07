@@ -65,28 +65,26 @@ pub const max_meshes = 64;
 pub const max_materials = 64;
 pub const max_textures = 64;
 pub const max_lua_systems = 64;
-pub const max_zig_systems = 64;
-pub const max_systems = max_zig_systems + max_lua_systems;
+pub const max_zig_systems = 16;
 pub const ZigSystemFn = *const fn (*Engine, f32) void;
 
-pub const SystemKind = enum { zig, lua };
+const ZigSystemEntry = struct { func: ?ZigSystemFn = null };
 
-pub const SystemEntry = struct {
+/// A Lua system callback registered via lunatic.system().
+/// Zig systems are registered directly with flecs's pipeline scheduler.
+pub const LuaSystemEntry = struct {
     name_buf: [31:0]u8 = .{0} ** 31,
-    kind: SystemKind = .zig,
-    time_us: u64 = 0,
-    acc_us: u64 = 0, // accumulated for averaging
-    avg_us: f64 = 0, // display average
-    // Payload
-    zig_fn: ?ZigSystemFn = null,
     lua_ref: c_int = 0,
     disabled: bool = false,
+    time_us: u64 = 0,
+    acc_us: u64 = 0,
+    avg_us: f64 = 0,
 
-    pub fn name(self: *const SystemEntry) [*:0]const u8 {
+    pub fn name(self: *const LuaSystemEntry) [*:0]const u8 {
         return @ptrCast(&self.name_buf);
     }
 
-    pub fn setName(self: *SystemEntry, src: [*:0]const u8) void {
+    pub fn setName(self: *LuaSystemEntry, src: [*:0]const u8) void {
         const s = std.mem.span(src);
         const len = @min(s.len, 31);
         @memcpy(self.name_buf[0..len], s[0..len]);
@@ -262,6 +260,24 @@ fn registerStructMeta(world: *ecs.world_t, comptime T: type) void {
     _ = ecs.struct_init(world, &desc);
 }
 
+/// C-callable flecs system callback that dispatches all engine systems.
+/// Registered as a single flecs `run` system so everything participates
+/// in ecs.progress(). Must call iter_fini to prevent iterator leaks.
+/// Flecs system callback that dispatches all engine systems.
+/// Uses `callback` (not `run`) with `immediate=true` — for zero-term systems,
+/// flecs calls the callback once and handles iterator cleanup. Using `run`
+/// with zero terms causes double iterator finalization (flecs issue #905).
+fn engineSystemsCallback(it: *ecs.iter_t) callconv(.c) void {
+    const engine: *Engine = @ptrCast(@alignCast(it.ctx));
+    const dt = it.delta_time;
+    // Suspend deferred mode so mutations (ecs.set/add) apply immediately.
+    // Our systems read-after-write in the same frame (e.g. Lua adds a
+    // Position then physics_add_sphere reads it right away).
+    ecs.defer_suspend(engine.world);
+    engine.runAllRegisteredSystems(dt);
+    ecs.defer_resume(engine.world);
+}
+
 /// Build a flecs query from slices of include/exclude component IDs.
 /// Simpler than filling out query_desc_t manually each time.
 pub fn queryInit(world: *ecs.world_t, includes: []const ecs.id_t, excludes: []const ecs.id_t) *ecs.query_t {
@@ -342,9 +358,11 @@ pub const Engine = struct {
     live_queries: [lua_api.max_live_queries]lua_api.LiveQuery = .{lua_api.LiveQuery{}} ** lua_api.max_live_queries,
     live_query_count: u32 = 0,
 
-    // All systems (Zig + Lua, unified, ordered)
-    systems: [max_systems]SystemEntry = .{SystemEntry{}} ** max_systems,
-    system_count: u32 = 0,
+    // Systems — Zig functions and Lua callbacks, dispatched by a single flecs system
+    zig_systems: [max_zig_systems]ZigSystemEntry = .{ZigSystemEntry{}} ** max_zig_systems,
+    zig_system_count: u32 = 0,
+    lua_systems: [max_lua_systems]LuaSystemEntry = .{LuaSystemEntry{}} ** max_lua_systems,
+    lua_system_count: u32 = 0,
 
     // Lua
     lua_state: ?*lc.lua_State = null,
@@ -386,16 +404,6 @@ pub const Engine = struct {
             }
         }
 
-        // Enable flecs REST API for the Explorer debug UI.
-        // Connect at https://www.flecs.dev/explorer to inspect entities,
-        // components, and queries in real-time. Requires ecs.progress()
-        // to be called each frame (done in the main loop).
-        // EcsRest is a C-level flecs component — both entity and component IDs
-        // come from C externs, bypassing the Zig COMPONENT() registration path.
-        const rest_comp_id = @as(ecs.id_t, @extern(*const ecs.entity_t, .{ .name = "FLECS_IDEcsRestID_" }).*);
-        const rest_val = ecs.EcsRest{ .port = 27750 };
-        _ = ecs.set_id(world, rest_comp_id, rest_comp_id, @sizeOf(ecs.EcsRest), @ptrCast(&rest_val));
-
         // Lua
         const L = lc.luaL_newstate() orelse return error.LuaInitFailed;
         self.lua_state = L;
@@ -406,19 +414,51 @@ pub const Engine = struct {
         lc.luaL_openlibs(L);
         lua_api.registerLuaApi(self);
 
+        // Register the single flecs pipeline system that dispatches all
+        // engine systems (Zig + Lua). Runs in all modes including headless tests.
+        {
+            var sys_desc = std.mem.zeroes(ecs.system_desc_t);
+            sys_desc.callback = &engineSystemsCallback;
+            sys_desc.ctx = self;
+            sys_desc.phase = ecs.OnUpdate;
+            // immediate=true so the callback runs in a non-readonly context
+            // where ecs.set/add mutations apply instantly (no deferred queue).
+            sys_desc.immediate = true;
+            _ = ecs.SYSTEM(self.world, "engine_systems", &sys_desc);
+        }
+
         if (!config.headless) {
             try self.initGpu(config);
             lua_api.publishHandlesToLua(self);
+
+            // Enable flecs REST API for the Explorer debug UI.
+            // Connect at https://www.flecs.dev/explorer to inspect entities,
+            // components, and queries in real-time. Requires ecs.progress()
+            // to be called each frame (done in the main loop).
+            const rest_comp_id = @as(ecs.id_t, @extern(*const ecs.entity_t, .{ .name = "FLECS_IDEcsRestID_" }).*);
+            const rest_val = ecs.EcsRest{ .port = 27750 };
+            _ = ecs.set_id(world, rest_comp_id, rest_comp_id, @sizeOf(ecs.EcsRest), @ptrCast(&rest_val));
         }
     }
 
     /// Release all GPU resources, Lua state, and ECS storage.
     pub fn deinit(self: *Engine) void {
         for (self.live_queries[0..self.live_query_count]) |*lq| lq.deinit();
-        if (self.lua_state) |L| lc.lua_close(L);
 
         self.dbg_server.stop();
         physics.deinitPhysics(self);
+
+        if (self.lua_state) |L| lc.lua_close(L);
+
+        // Skip ecs_fini in non-headless mode. The flecs REST server keeps
+        // internal iterators alive between frames, and ecs_fini asserts on
+        // those as "leaked". This is harmless at process exit — the OS
+        // reclaims all memory. Headless mode (tests) has no REST server
+        // and shuts down cleanly.
+        if (self.gpu_device == null) {
+            _ = ecs.fini(self.world);
+        }
+
         if (self.gpu_device) |_| {
             c.cImGui_ImplSDLGPU3_Shutdown();
             c.cImGui_ImplSDL3_Shutdown();
@@ -444,13 +484,6 @@ pub const Engine = struct {
             c.SDL_DestroyGPUDevice(device);
             c.SDL_Quit();
         }
-
-        // Signal orderly shutdown to flecs and run one final tick so the
-        // REST server and other internal systems can clean up their iterators.
-        // Without this, ecs_fini asserts on leaked stack allocator cursors.
-        ecs.quit(self.world);
-        _ = ecs.progress(self.world, 0);
-        _ = ecs.fini(self.world);
     }
 
     /// Load and execute a Lua script file. Sets the Lua package path to the
@@ -516,13 +549,13 @@ pub const Engine = struct {
             c.cImGui_ImplSDL3_NewFrame();
             c.igNewFrame();
 
-            self.runAllSystems(dt);
+            // Run all systems via the flecs pipeline scheduler.
+            // This ticks both game systems (age, physics, fly_camera, lua)
+            // and internal flecs modules (REST API, stats).
+            _ = ecs.progress(self.world, dt);
 
             // Process debug server requests (after systems, before rendering)
             self.dbg_server.drainRequests();
-
-            // Tick flecs internal systems (REST API, stats, etc.)
-            _ = ecs.progress(self.world, dt);
 
             // Physics stats
             if (self.physics.system) |phys_sys| {
@@ -732,12 +765,10 @@ pub const Engine = struct {
             s.avg_imgui / 1000.0,
         });
 
-        for (self.systems[0..self.system_count]) |sys| {
+        for (self.lua_systems[0..self.lua_system_count]) |sys| {
             if (sys.disabled) continue;
-            const kind_label: []const u8 = if (sys.kind == .zig) "zig" else "lua";
-            std.debug.print("  {d:.2}ms [{s}] {s}\n", .{
+            std.debug.print("  {d:.2}ms [lua] {s}\n", .{
                 sys.avg_us / 1000.0,
-                kind_label,
                 sys.name(),
             });
         }
@@ -939,11 +970,11 @@ pub const Engine = struct {
         // Physics
         try physics.initPhysics(self);
 
-        // Built-in systems
-        self.addSystem("age", &Engine.ageSystem);
-        self.addSystem("physics", &physics.physicsSystem);
-        self.addSystem("fly_camera", &Engine.flyCameraSystem);
-        self.addSystem("stats_overlay", &Engine.statsOverlaySystem);
+        // Built-in Zig systems
+        self.addSystem("age", &Engine.ageSystem, ecs.OnUpdate);
+        self.addSystem("physics", &physics.physicsSystem, ecs.OnUpdate);
+        self.addSystem("fly_camera", &Engine.flyCameraSystem, ecs.OnUpdate);
+        self.addSystem("stats_overlay", &Engine.statsOverlaySystem, ecs.OnStore);
     }
 
     // ---- Mesh API ----
@@ -1378,48 +1409,50 @@ pub const Engine = struct {
         return state[scancode];
     }
 
-    // ---- Zig systems ----
+    // ---- System management ----
 
-    /// Register a named Zig system function.
-    pub fn addSystem(self: *Engine, name: [*:0]const u8, func: ZigSystemFn) void {
-        if (self.system_count >= max_systems) return;
-        self.systems[self.system_count] = .{ .kind = .zig, .zig_fn = func };
-        self.systems[self.system_count].setName(name);
-        self.system_count += 1;
+    pub fn addSystem(self: *Engine, _: [*:0]const u8, func: ZigSystemFn, _: ecs.entity_t) void {
+        if (self.zig_system_count >= max_zig_systems) return;
+        self.zig_systems[self.zig_system_count] = .{ .func = func };
+        self.zig_system_count += 1;
     }
 
-    /// Register a Lua system (called from lua_api).
     pub fn addLuaSystem(self: *Engine, name: [*:0]const u8, lua_ref: c_int) void {
-        if (self.system_count >= max_systems) return;
-        self.systems[self.system_count] = .{ .kind = .lua, .lua_ref = lua_ref };
-        self.systems[self.system_count].setName(name);
-        self.system_count += 1;
+        if (self.lua_system_count >= max_lua_systems) return;
+        self.lua_systems[self.lua_system_count] = .{ .lua_ref = lua_ref };
+        self.lua_systems[self.lua_system_count].setName(name);
+        self.lua_system_count += 1;
     }
 
-    pub fn runAllSystems(self: *Engine, dt: f32) void {
-        const L = self.lua_state;
+    /// Run all Zig + Lua systems for one frame. Called by the flecs pipeline
+    /// via engineSystemsRun, or directly by tickSystems in headless mode.
+    fn runAllRegisteredSystems(self: *Engine, dt: f32) void {
+        for (self.zig_systems[0..self.zig_system_count]) |entry| {
+            if (entry.func) |func| func(self, dt);
+        }
+        self.runLuaSystems(dt);
+    }
+
+    /// Tick all systems via the flecs pipeline. Used by the main loop and tests.
+    pub fn tickSystems(self: *Engine, dt: f32) void {
+        _ = ecs.progress(self.world, dt);
+    }
+
+    fn runLuaSystems(self: *Engine, dt: f32) void {
+        const L = self.lua_state orelse return;
         const perf_freq = c.SDL_GetPerformanceFrequency();
 
-        for (self.systems[0..self.system_count]) |*sys| {
+        for (self.lua_systems[0..self.lua_system_count]) |*sys| {
             if (sys.disabled) continue;
             const t_start = c.SDL_GetPerformanceCounter();
 
-            switch (sys.kind) {
-                .zig => {
-                    if (sys.zig_fn) |func| func(self, dt);
-                },
-                .lua => {
-                    if (L) |state| {
-                        lc.lua_rawgeti(state, lc.LUA_REGISTRYINDEX, sys.lua_ref);
-                        lc.lua_pushnumber(state, dt);
-                        if (lc.lua_pcall(state, 1, 0, 0) != 0) {
-                            const err = lc.lua_tolstring(state, -1, null);
-                            std.debug.print("Lua system '{s}' error: {s}\n", .{ sys.name(), err });
-                            lc.lua_pop(state, 1);
-                            sys.disabled = true;
-                        }
-                    }
-                },
+            lc.lua_rawgeti(L, lc.LUA_REGISTRYINDEX, sys.lua_ref);
+            lc.lua_pushnumber(L, dt);
+            if (lc.lua_pcall(L, 1, 0, 0) != 0) {
+                const err = lc.lua_tolstring(L, -1, null);
+                std.debug.print("Lua system '{s}' error: {s}\n", .{ sys.name(), err });
+                lc.lua_pop(L, 1);
+                sys.disabled = true;
             }
 
             const t_end = c.SDL_GetPerformanceCounter();
@@ -1427,10 +1460,10 @@ pub const Engine = struct {
             sys.acc_us += sys.time_us;
         }
 
-        // Snapshot system averages on the same cadence as render stats
+        // Snapshot Lua system averages on the same cadence as render stats
         if (self.stats.acc_frames == 0) {
             const n: f64 = @floatFromInt(@max(self.stats.snapshot_frames, 1));
-            for (self.systems[0..self.system_count]) |*sys2| {
+            for (self.lua_systems[0..self.lua_system_count]) |*sys2| {
                 sys2.avg_us = @as(f64, @floatFromInt(sys2.acc_us)) / n;
                 sys2.acc_us = 0;
             }
@@ -1460,15 +1493,13 @@ pub const Engine = struct {
         }) catch "???";
         c.igTextUnformatted(line2);
 
-        c.igSeparatorText("Systems");
+        c.igSeparatorText("Lua Systems");
 
-        for (self.systems[0..self.system_count]) |*sys| {
+        for (self.lua_systems[0..self.lua_system_count]) |*sys| {
             if (sys.disabled) continue;
-            const kind_label: [*:0]const u8 = if (sys.kind == .zig) "zig" else "lua";
             var sys_buf: [128]u8 = undefined;
-            const sys_line = std.fmt.bufPrintZ(&sys_buf, "{d:.2}ms [{s}] {s}", .{
+            const sys_line = std.fmt.bufPrintZ(&sys_buf, "{d:.2}ms {s}", .{
                 sys.avg_us / 1000.0,
-                kind_label,
                 sys.name(),
             }) catch "???";
             c.igTextUnformatted(sys_line);
@@ -1571,17 +1602,17 @@ pub const Engine = struct {
         };
     }
 
-    /// Unregister all systems and free Lua registry references.
-    pub fn resetSystems(self: *Engine) void {
+    /// Unregister all Lua systems and free their Lua registry references.
+    pub fn resetLuaSystems(self: *Engine) void {
         if (self.lua_state) |L| {
-            for (self.systems[0..self.system_count]) |sys| {
-                if (sys.kind == .lua and sys.lua_ref != 0) {
+            for (self.lua_systems[0..self.lua_system_count]) |sys| {
+                if (sys.lua_ref != 0) {
                     lc.luaL_unref(L, lc.LUA_REGISTRYINDEX, sys.lua_ref);
                 }
             }
         }
-        self.system_count = 0;
-        self.systems = .{SystemEntry{}} ** max_systems;
+        self.lua_system_count = 0;
+        self.lua_systems = .{LuaSystemEntry{}} ** max_lua_systems;
     }
 };
 

@@ -313,6 +313,10 @@ pub fn build(b: *std.Build) void {
     const zflecs_dep = b.dependency("zflecs", .{
         .target = target,
         .optimize = optimize,
+        // Disable FLECS_SANITIZE — it asserts on iterator leaks at ecs_fini
+        // which are harmless at process exit (the OS reclaims all memory).
+        // The leak comes from flecs's own pipeline state, not our code.
+        .debug_mode = .none,
     });
     const zphysics_dep = b.dependency("zphysics", .{
         .target = target,

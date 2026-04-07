@@ -3,7 +3,8 @@
 
 const std = @import("std");
 const testing = std.testing;
-const Engine = @import("engine").Engine;
+const engine_mod = @import("engine");
+const Engine = engine_mod.Engine;
 const lua = @import("lua");
 const lc = lua.c;
 
@@ -381,7 +382,7 @@ test "system receives dt" {
         \\end)
     );
 
-    test_engine.runAllSystems(0.016);
+    test_engine.tickSystems(0.016);
 
     try run(L,
         \\assert(received_dt ~= nil, "system was not called")
@@ -400,9 +401,9 @@ test "failing system is disabled" {
         \\end)
     );
 
-    test_engine.runAllSystems(0.016);
-    test_engine.runAllSystems(0.016);
-    test_engine.runAllSystems(0.016);
+    test_engine.tickSystems(0.016);
+    test_engine.tickSystems(0.016);
+    test_engine.tickSystems(0.016);
 
     try run(L,
         \\assert(call_count == 1, "expected 1 call, got " .. call_count)
@@ -418,7 +419,7 @@ test "multiple systems run in order" {
         \\lunatic.system("second", function(dt) table.insert(order, "b") end)
     );
 
-    test_engine.runAllSystems(0.016);
+    test_engine.tickSystems(0.016);
 
     try run(L,
         \\assert(#order == 2)

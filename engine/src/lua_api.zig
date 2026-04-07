@@ -1124,8 +1124,8 @@ fn luaSystemRegister(L: ?*lc.lua_State) callconv(.c) c_int {
     lc.lua_pushvalue(L, 2);
     const ref = lc.luaL_ref(L, lc.LUA_REGISTRYINDEX);
 
-    if (self.system_count >= engine_mod.max_systems) {
-        _ = lc.luaL_error(L, "too many systems");
+    if (self.lua_system_count >= engine_mod.max_lua_systems) {
+        _ = lc.luaL_error(L, "too many lua systems");
         return 0;
     }
 

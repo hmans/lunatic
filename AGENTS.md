@@ -142,6 +142,8 @@ The engine must handle tens of thousands to hundreds of thousands of entities ef
 - Queries: use `queryInit(world, &.{id1, id2}, &.{exclude_id})` helper from `engine.zig`, iterate with `while (ecs.query_next(&it)) for (it.entities()) |entity| { ... };`, finalize with `ecs.query_fini(q)`.
 - **Important**: `ecs.query_next` calls `ecs.iter_fini` internally when returning false. Do NOT call `ecs.iter_fini` on a fully-consumed iterator — it causes a double-free crash. Only call it when breaking out of iteration early.
 - `ecs.id(T)` returns the runtime component ID — cannot be used at comptime (use `idFn` closures instead).
+- **System dispatch**: All Zig + Lua systems are dispatched by a single flecs `callback` system (`engineSystemsCallback`). It uses `ecs.defer_suspend`/`defer_resume` so mutations apply immediately (our systems read-after-write in the same frame). Do NOT use `run` callbacks for zero-term systems — it causes double iterator finalization (flecs issue #905).
+- **Shutdown**: `ecs_fini` is skipped in non-headless mode because the flecs REST server's internal iterators trigger a spurious stack leak assertion. Headless tests call `ecs_fini` normally.
 
 ## Gotchas
 
