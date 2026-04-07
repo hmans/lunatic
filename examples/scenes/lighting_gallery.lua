@@ -108,7 +108,7 @@ function scene.setup(cam)
   -- Animate the orbit lights
   local time = 0
   local orbit_active = true
-  lunatic.system("lighting_gallery_orbit", function(dt)
+  local orbit_system = lunatic.system("lighting_gallery_orbit", function(dt)
     if not orbit_active then return end
     time = time + dt * 0.3
     for i, light_info in ipairs(orbit_lights) do
@@ -125,6 +125,7 @@ function scene.setup(cam)
 
   return function()
     orbit_active = false
+    if orbit_system then lunatic.destroy(orbit_system) end
     for _, e in ipairs(entities) do
       pcall(lunatic.destroy, e)
     end

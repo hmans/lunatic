@@ -4,9 +4,11 @@
 
 const std = @import("std");
 const zp = @import("zphysics");
+const ecs = @import("zflecs");
 const engine_mod = @import("engine");
 const Engine = engine_mod.Engine;
 const core = engine_mod.core_components;
+const queryInit = engine_mod.queryInit;
 
 // ============================================================
 // Object layers (Jolt requires at least 2 for broad phase)
@@ -79,7 +81,6 @@ pub const PhysicsState = struct {
     obj_vs_bp_filter: ObjVsBPFilter = .{},
     obj_pair_filter: ObjPairFilter = .{},
     initialized: bool = false,
-    alpha: f32 = 1.0,
 };
 
 // ============================================================
@@ -136,126 +137,56 @@ pub fn getBodyInterface(self: *Engine) *zp.BodyInterface {
 // Built-in physics system
 // ============================================================
 
-const physics_timestep: f32 = 1.0 / 60.0;
-var physics_accumulator: f32 = 0;
+pub const physics_timestep: f32 = 1.0 / 60.0;
 
-const sdl = engine_mod.c;
-
-/// Step the physics simulation with fixed timestep and write interpolated
-/// transforms to ECS for smooth rendering.
-pub fn physicsSystem(self: *Engine, dt: f32) void {
+/// Step the physics simulation once at fixed timestep and sync transforms.
+/// Called by flecs at a fixed interval (physics_timestep) — flecs handles
+/// the accumulator and calls this multiple times per frame if needed.
+pub fn physicsSystem(self: *Engine, _: f32) void {
     const phys = self.physics.system orelse return;
     const body_iface = phys.getBodyInterfaceNoLock();
 
-    physics_accumulator += dt;
-    var steps: u32 = 0;
-    const budget_start = sdl.SDL_GetPerformanceCounter();
-    const budget_freq = sdl.SDL_GetPerformanceFrequency();
-    const max_budget_us: u64 = 8000;
-
-    while (physics_accumulator >= physics_timestep and steps < 4) {
-        // Save current → prev before stepping
-        if (steps == 0) {
-            savePrevTransforms(self);
-        }
-
-        phys.update(physics_timestep, .{}) catch break;
-        physics_accumulator -= physics_timestep;
-        steps += 1;
-
-        const elapsed_us = (sdl.SDL_GetPerformanceCounter() - budget_start) * 1_000_000 / budget_freq;
-        if (elapsed_us > max_budget_us) {
-            physics_accumulator = 0;
-            break;
-        }
-    }
-
-    // Sync current transforms from Jolt
-    if (steps > 0) {
-        syncCurrentTransforms(self, body_iface);
-    }
-
-    // Compute interpolation alpha and write lerped values to ECS
-    self.physics.alpha = if (physics_accumulator > 0 and physics_accumulator < physics_timestep)
-        physics_accumulator / physics_timestep
-    else
-        1.0;
-
-    writeInterpolatedTransforms(self);
+    phys.update(physics_timestep, .{}) catch return;
+    syncCurrentTransforms(self, body_iface);
 }
 
-/// Save current ECS position/rotation into RigidBody.prev_* fields.
-fn savePrevTransforms(self: *Engine) void {
-    var view = self.registry.view(.{ core.Position, core.Rotation, core.RigidBody }, .{});
-    var iter = view.entityIterator();
-    while (iter.next()) |entity| {
-        const pos = view.getConst(core.Position, entity);
-        const rot = view.getConst(core.Rotation, entity);
-        var rb = view.get(core.RigidBody, entity);
-        rb.prev_x = pos.x;
-        rb.prev_y = pos.y;
-        rb.prev_z = pos.z;
-        rb.prev_rx = rot.x;
-        rb.prev_ry = rot.y;
-        rb.prev_rz = rot.z;
-    }
+/// Build component IDs for the physics query at runtime.
+fn physicsQueryIds() [3]ecs.id_t {
+    return .{ ecs.id(core.Position), ecs.id(core.Rotation), ecs.id(core.RigidBody) };
 }
 
 /// Sync current Jolt transforms into ECS Position/Rotation.
 fn syncCurrentTransforms(self: *Engine, body_iface: *const zp.BodyInterface) void {
-    var view = self.registry.view(.{ core.Position, core.Rotation, core.RigidBody }, .{});
-    var iter = view.entityIterator();
-    while (iter.next()) |entity| {
-        const rb = view.getConst(core.RigidBody, entity);
+    const ids = physicsQueryIds();
+    const q = queryInit(self.world, &ids, &.{});
+    defer ecs.query_fini(q);
+    var it = ecs.query_iter(self.world, q);
+
+    while (ecs.query_next(&it)) for (it.entities()) |entity| {
+        const rb = ecs.get(self.world, entity, core.RigidBody) orelse continue;
         const body_id: zp.BodyId = @enumFromInt(rb.body_id);
         if (body_id == .invalid) continue;
 
-        const pos = body_iface.getPosition(body_id);
-        const rot = body_iface.getRotation(body_id);
-        const euler = quatToEuler(rot);
+        const jolt_pos = body_iface.getPosition(body_id);
+        const jolt_rot = body_iface.getRotation(body_id);
+        const euler = quatToEuler(jolt_rot);
 
-        var ecs_pos = view.get(core.Position, entity);
-        ecs_pos.x = pos[0];
-        ecs_pos.y = pos[1];
-        ecs_pos.z = pos[2];
+        var ecs_pos = ecs.get_mut(self.world, entity, core.Position) orelse continue;
+        ecs_pos.x = jolt_pos[0];
+        ecs_pos.y = jolt_pos[1];
+        ecs_pos.z = jolt_pos[2];
 
-        var ecs_rot = view.get(core.Rotation, entity);
+        var ecs_rot = ecs.get_mut(self.world, entity, core.Rotation) orelse continue;
         ecs_rot.x = euler[0];
         ecs_rot.y = euler[1];
         ecs_rot.z = euler[2];
-    }
+    };
 }
 
-/// Write interpolated transforms: lerp(prev, curr, alpha) → ECS.
-fn writeInterpolatedTransforms(self: *Engine) void {
-    const alpha = self.physics.alpha;
-    const inv = 1.0 - alpha;
-
-    var view = self.registry.view(.{ core.Position, core.Rotation, core.RigidBody }, .{});
-    var iter = view.entityIterator();
-    while (iter.next()) |entity| {
-        const rb = view.getConst(core.RigidBody, entity);
-        if (rb.body_id == 0) continue;
-
-        var pos = view.get(core.Position, entity);
-        var rot = view.get(core.Rotation, entity);
-
-        // Lerp between prev (stored in RigidBody) and current (in Position/Rotation)
-        const cx = pos.x;
-        const cy = pos.y;
-        const cz = pos.z;
-        pos.x = rb.prev_x * inv + cx * alpha;
-        pos.y = rb.prev_y * inv + cy * alpha;
-        pos.z = rb.prev_z * inv + cz * alpha;
-
-        const crx = rot.x;
-        const cry = rot.y;
-        const crz = rot.z;
-        rot.x = rb.prev_rx * inv + crx * alpha;
-        rot.y = rb.prev_ry * inv + cry * alpha;
-        rot.z = rb.prev_rz * inv + crz * alpha;
-    }
-}
+// Note: interpolation (lerp between prev and current transforms) was removed
+// when switching to flecs interval-based physics. If visual jitter becomes
+// noticeable at low frame rates, re-add interpolation as a separate PreStore
+// system that lerps between the last two physics states.
 
 // ============================================================
 // Helpers

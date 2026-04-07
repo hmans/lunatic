@@ -40,3 +40,13 @@ zig build run-examples   # Run the example scenes (examples/)
 zig build test
 ```
 
+## Flecs Explorer
+
+The engine includes a [flecs](https://github.com/SanderMertens/flecs) ECS with a built-in REST API. While the engine is running, open the **Flecs Explorer** to inspect and edit entities and components in real-time:
+
+1. Run the engine (`zig build run` or `zig build run-examples`)
+2. Open https://www.flecs.dev/explorer in a browser
+3. The Explorer auto-connects to `localhost:27750`
+
+You can browse all entities, view and edit component values live (positions, camera settings, light colors, etc.), and run queries against the ECS world.
+

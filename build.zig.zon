@@ -2,9 +2,9 @@
     .name = .lunatic,
     .version = "0.15.2",
     .dependencies = .{
-        .entt = .{
-            .url = "git+https://github.com/prime31/zig-ecs#3d28cf7441579782e082934c572c2e37a65c4519",
-            .hash = "entt-1.0.0-qJPtbP_fAgD9mULJ2bHjS85U0m2mHVmVuAdBdnQCupsV",
+        .zflecs = .{
+            .url = "git+https://github.com/zig-gamedev/zflecs",
+            .hash = "zflecs-0.2.0-dev-1PN3yg0OQQD8uFm8oLV-Bt-7rJGD8oTCso_X4i3dMmFm",
         },
         .zphysics = .{
             .url = "git+https://github.com/zig-gamedev/zphysics#9797d7bd08e4341410104876eb1896a71714277d",

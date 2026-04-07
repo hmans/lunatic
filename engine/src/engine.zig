@@ -4,7 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const math3d = @import("math3d");
 const Mat4 = math3d.Mat4;
-const ecs = @import("zig-ecs");
+const ecs = @import("zflecs");
 const geometry = @import("geometry");
 const renderer = @import("renderer");
 pub const postprocess = @import("postprocess");
@@ -65,34 +65,7 @@ pub const max_meshes = 64;
 pub const max_materials = 64;
 pub const max_textures = 64;
 pub const max_lua_systems = 64;
-pub const max_zig_systems = 64;
-pub const max_systems = max_zig_systems + max_lua_systems;
 pub const ZigSystemFn = *const fn (*Engine, f32) void;
-
-pub const SystemKind = enum { zig, lua };
-
-pub const SystemEntry = struct {
-    name_buf: [31:0]u8 = .{0} ** 31,
-    kind: SystemKind = .zig,
-    time_us: u64 = 0,
-    acc_us: u64 = 0, // accumulated for averaging
-    avg_us: f64 = 0, // display average
-    // Payload
-    zig_fn: ?ZigSystemFn = null,
-    lua_ref: c_int = 0,
-    disabled: bool = false,
-
-    pub fn name(self: *const SystemEntry) [*:0]const u8 {
-        return @ptrCast(&self.name_buf);
-    }
-
-    pub fn setName(self: *SystemEntry, src: [*:0]const u8) void {
-        const s = std.mem.span(src);
-        const len = @min(s.len, 31);
-        @memcpy(self.name_buf[0..len], s[0..len]);
-        self.name_buf[len] = 0;
-    }
-};
 
 // ============================================================
 // Asset store — groups mesh, material, and texture registries
@@ -234,9 +207,175 @@ pub const FrameStats = struct {
     }
 };
 
+// ============================================================
+// Flecs query helpers
+// ============================================================
+
+/// Flecs meta type IDs for f32 and u32, resolved at runtime from C externs.
+const flecs_f32_id = @extern(*const ecs.entity_t, .{ .name = "FLECS_IDecs_f32_tID_" });
+const flecs_u32_id = @extern(*const ecs.entity_t, .{ .name = "FLECS_IDecs_u32_tID_" });
+
+/// Register struct metadata with flecs so the Explorer can display and
+/// edit component fields. Maps Zig struct fields to flecs member descriptors.
+/// Only handles f32 and u32 fields (matching the Lua bridge constraint).
+fn registerStructMeta(world: *ecs.world_t, comptime T: type) void {
+    const fields = std.meta.fields(T);
+    var desc = std.mem.zeroes(ecs.struct_desc_t);
+    desc.entity = ecs.id(T);
+    inline for (fields, 0..) |field, i| {
+        if (i >= ecs.ECS_MEMBER_DESC_CACHE_SIZE) break;
+        desc.members[i].name = @ptrCast(field.name.ptr);
+        desc.members[i].type = if (field.type == f32)
+            flecs_f32_id.*
+        else if (field.type == u32)
+            flecs_u32_id.*
+        else
+            0;
+    }
+    _ = ecs.struct_init(world, &desc);
+}
+
+// ============================================================
+// Flecs system callbacks — proper query-driven systems
+// ============================================================
+
+/// Age system: increments Age.seconds. Fully parallelizable, no defer needed.
+fn ageSystemFlecs(it: *ecs.iter_t, ages: []core_components.Age) void {
+    for (ages) |*age| {
+        age.seconds += it.delta_time;
+    }
+}
+
+/// Fly camera system: reads FlyCamera config, writes Position + Rotation.
+/// Uses iter to access entities for per-entity component access since we
+/// need both mutable Position/Rotation and const FlyCamera simultaneously.
+fn flyCameraSystemFlecs(it: *ecs.iter_t, positions: []core_components.Position, rotations: []core_components.Rotation, fly_cams: []const core_components.FlyCamera) void {
+    const engine: *Engine = @ptrCast(@alignCast(it.ctx));
+    const io = c.igGetIO();
+    if (io != null and io.*.WantCaptureMouse) return;
+
+    var dx: f32 = 0;
+    var dy: f32 = 0;
+    const buttons = c.SDL_GetRelativeMouseState(&dx, &dy);
+    const rmb_held = (buttons & c.SDL_BUTTON_RMASK) != 0;
+
+    if (rmb_held) {
+        _ = c.SDL_HideCursor();
+    } else {
+        _ = c.SDL_ShowCursor();
+    }
+
+    if (!rmb_held) return;
+
+    for (positions, rotations, fly_cams) |*pos, *rot, fly| {
+        // Mouse look
+        rot.y += dx * fly.sensitivity;
+        rot.x += dy * fly.sensitivity;
+        rot.x = std.math.clamp(rot.x, -89, 89);
+
+        // Camera axes from pitch/yaw
+        const deg2rad = std.math.pi / 180.0;
+        const pitch = rot.x * deg2rad;
+        const yaw = rot.y * deg2rad;
+        const cp = @cos(pitch);
+        const sp = @sin(pitch);
+        const cy = @cos(yaw);
+        const sy = @sin(yaw);
+
+        const fx = sy * cp;
+        const fy = -sp;
+        const fz = -cy * cp;
+        const rx = cy;
+        const ry: f32 = 0;
+        const rz = sy;
+
+        const speed: f32 = if (engine.isKeyDown(c.SDL_SCANCODE_LSHIFT)) fly.fast_speed else fly.speed;
+        const dt = it.delta_time;
+        if (engine.isKeyDown(c.SDL_SCANCODE_W)) { pos.x += fx * speed * dt; pos.y += fy * speed * dt; pos.z += fz * speed * dt; }
+        if (engine.isKeyDown(c.SDL_SCANCODE_S)) { pos.x -= fx * speed * dt; pos.y -= fy * speed * dt; pos.z -= fz * speed * dt; }
+        if (engine.isKeyDown(c.SDL_SCANCODE_A)) { pos.x -= rx * speed * dt; pos.y -= ry * speed * dt; pos.z -= rz * speed * dt; }
+        if (engine.isKeyDown(c.SDL_SCANCODE_D)) { pos.x += rx * speed * dt; pos.y += ry * speed * dt; pos.z += rz * speed * dt; }
+        if (engine.isKeyDown(c.SDL_SCANCODE_SPACE)) pos.y += speed * dt;
+        if (engine.isKeyDown(c.SDL_SCANCODE_LCTRL)) pos.y -= speed * dt;
+    }
+}
+
+/// C-callable flecs callback wrapper for Zig systems that need immediate mode
+/// (physics, stats overlay). These systems have complex access patterns that
+/// can't be expressed as simple query terms.
+fn zigSystemCallback(comptime func: ZigSystemFn) ecs.iter_action_t {
+    return &struct {
+        fn callback(it: *ecs.iter_t) callconv(.c) void {
+            const engine: *Engine = @ptrCast(@alignCast(it.ctx));
+            ecs.defer_suspend(engine.world);
+            func(engine, it.delta_time);
+            ecs.defer_resume(engine.world);
+        }
+    }.callback;
+}
+
+/// C-callable flecs callback for imperative Lua systems (no query terms).
+/// Called once per frame. Uses defer_suspend for read-after-write safety.
+fn luaSystemCallback(it: *ecs.iter_t) callconv(.c) void {
+    const engine: *Engine = @ptrCast(@alignCast(it.ctx));
+    const lua_ref: c_int = @intCast(@intFromPtr(it.callback_ctx));
+    const L = engine.lua_state orelse return;
+
+    ecs.defer_suspend(engine.world);
+    lc.lua_rawgeti(L, lc.LUA_REGISTRYINDEX, lua_ref);
+    lc.lua_pushnumber(L, it.delta_time);
+    if (lc.lua_pcall(L, 1, 0, 0) != 0) {
+        const err = lc.lua_tolstring(L, -1, null);
+        std.debug.print("Lua system error: {s}\n", .{err});
+        lc.lua_pop(L, 1);
+        ecs.defer_resume(engine.world);
+        ecs.enable(engine.world, it.system, false);
+        return;
+    }
+    ecs.defer_resume(engine.world);
+}
+
+/// C-callable flecs callback for query-driven Lua systems.
+/// Called per archetype table with matched entities. Iterates entities
+/// and calls the Lua callback with (dt, entity) for each.
+/// No defer_suspend — flecs manages data dependencies via query terms.
+fn luaQuerySystemCallback(it: *ecs.iter_t) callconv(.c) void {
+    const engine: *Engine = @ptrCast(@alignCast(it.ctx));
+    const lua_ref: c_int = @intCast(@intFromPtr(it.callback_ctx));
+    const L = engine.lua_state orelse return;
+
+    for (it.entities()) |entity| {
+        lc.lua_rawgeti(L, lc.LUA_REGISTRYINDEX, lua_ref);
+        lc.lua_pushnumber(L, it.delta_time);
+        lc.lua_pushinteger(L, @intCast(entity));
+        if (lc.lua_pcall(L, 2, 0, 0) != 0) {
+            const err = lc.lua_tolstring(L, -1, null);
+            std.debug.print("Lua system error: {s}\n", .{err});
+            lc.lua_pop(L, 1);
+            ecs.enable(engine.world, it.system, false);
+            return;
+        }
+    }
+}
+
+/// Build a flecs query from slices of include/exclude component IDs.
+/// Simpler than filling out query_desc_t manually each time.
+pub fn queryInit(world: *ecs.world_t, includes: []const ecs.id_t, excludes: []const ecs.id_t) *ecs.query_t {
+    var desc = std.mem.zeroes(ecs.query_desc_t);
+    for (includes, 0..) |comp_id, i| {
+        desc.terms[i].id = comp_id;
+    }
+    for (excludes, 0..) |comp_id, j| {
+        desc.terms[includes.len + j].id = comp_id;
+        desc.terms[includes.len + j].oper = .Not;
+    }
+    return ecs.query_init(world, &desc) catch
+        std.debug.panic("Failed to create flecs query", .{});
+}
+
 pub const Engine = struct {
-    // ECS
-    registry: ecs.Registry,
+    // ECS (flecs world — replaces zig-ecs Registry)
+    world: *ecs.world_t,
 
     // GPU (null when headless)
     gpu_device: ?*c.SDL_GPUDevice = null,
@@ -299,9 +438,9 @@ pub const Engine = struct {
     live_queries: [lua_api.max_live_queries]lua_api.LiveQuery = .{lua_api.LiveQuery{}} ** lua_api.max_live_queries,
     live_query_count: u32 = 0,
 
-    // All systems (Zig + Lua, unified, ordered)
-    systems: [max_systems]SystemEntry = .{SystemEntry{}} ** max_systems,
-    system_count: u32 = 0,
+    // Lua system entity IDs (for cleanup on scene reset)
+    lua_system_entities: [max_lua_systems]ecs.entity_t = .{0} ** max_lua_systems,
+    lua_system_count: u32 = 0,
 
     // Lua
     lua_state: ?*lc.lua_State = null,
@@ -324,12 +463,24 @@ pub const Engine = struct {
     /// Initialize the engine: ECS, Lua, GPU device, pipeline, built-in resources.
     /// Must be called on a pointer-stable location (e.g. `var engine: Engine = undefined;`).
     pub fn init(self: *Engine, config: Config) !void {
+        const world = ecs.init();
         self.* = Engine{
-            .registry = ecs.Registry.init(std.heap.c_allocator),
+            .world = world,
             .headless = config.headless,
             .debug_stats = config.debug_stats,
         };
-        errdefer self.registry.deinit();
+        errdefer _ = ecs.fini(world);
+
+        // Register all component types with flecs (required before use),
+        // then register their struct metadata for the Explorer's reflection UI.
+        inline for (lua_api.componentTypes()) |T| {
+            if (@sizeOf(T) == 0) {
+                ecs.TAG(world, T);
+            } else {
+                ecs.COMPONENT(world, T);
+                registerStructMeta(world, T);
+            }
+        }
 
         // Lua
         const L = lc.luaL_newstate() orelse return error.LuaInitFailed;
@@ -344,16 +495,35 @@ pub const Engine = struct {
         if (!config.headless) {
             try self.initGpu(config);
             lua_api.publishHandlesToLua(self);
+
+            // Enable flecs REST API for the Explorer debug UI.
+            // Connect at https://www.flecs.dev/explorer to inspect entities,
+            // components, and queries in real-time. Requires ecs.progress()
+            // to be called each frame (done in the main loop).
+            const rest_comp_id = @as(ecs.id_t, @extern(*const ecs.entity_t, .{ .name = "FLECS_IDEcsRestID_" }).*);
+            const rest_val = ecs.EcsRest{ .port = 27750 };
+            _ = ecs.set_id(world, rest_comp_id, rest_comp_id, @sizeOf(ecs.EcsRest), @ptrCast(&rest_val));
         }
     }
 
     /// Release all GPU resources, Lua state, and ECS storage.
     pub fn deinit(self: *Engine) void {
         for (self.live_queries[0..self.live_query_count]) |*lq| lq.deinit();
-        if (self.lua_state) |L| lc.lua_close(L);
 
         self.dbg_server.stop();
         physics.deinitPhysics(self);
+
+        if (self.lua_state) |L| lc.lua_close(L);
+
+        // Skip ecs_fini in non-headless mode. The flecs REST server keeps
+        // internal iterators alive between frames, and ecs_fini asserts on
+        // those as "leaked". This is harmless at process exit — the OS
+        // reclaims all memory. Headless mode (tests) has no REST server
+        // and shuts down cleanly.
+        if (self.gpu_device == null) {
+            _ = ecs.fini(self.world);
+        }
+
         if (self.gpu_device) |_| {
             c.cImGui_ImplSDLGPU3_Shutdown();
             c.cImGui_ImplSDL3_Shutdown();
@@ -379,8 +549,6 @@ pub const Engine = struct {
             c.SDL_DestroyGPUDevice(device);
             c.SDL_Quit();
         }
-
-        self.registry.deinit();
     }
 
     /// Load and execute a Lua script file. Sets the Lua package path to the
@@ -446,7 +614,10 @@ pub const Engine = struct {
             c.cImGui_ImplSDL3_NewFrame();
             c.igNewFrame();
 
-            self.runAllSystems(dt);
+            // Run all systems via the flecs pipeline scheduler.
+            // This ticks both game systems (age, physics, fly_camera, lua)
+            // and internal flecs modules (REST API, stats).
+            _ = ecs.progress(self.world, dt);
 
             // Process debug server requests (after systems, before rendering)
             self.dbg_server.drainRequests();
@@ -493,10 +664,13 @@ pub const Engine = struct {
             const hdr_tex = self.postprocess.hdr_texture.?;
 
             // Per-camera rendering
-            var cam_view = self.registry.view(.{ core_components.Position, core_components.Camera }, .{});
-            var cam_iter = cam_view.entityIterator();
-            while (cam_iter.next()) |cam_entity| {
-                const cam = cam_view.getConst(core_components.Camera, cam_entity);
+            const cam_q = queryInit(self.world, &.{ecs.id(core_components.Position), ecs.id(core_components.Camera)}, &.{});
+            defer ecs.query_fini(cam_q);
+            var cam_qit = ecs.query_iter(self.world, cam_q);
+
+            while (ecs.query_next(&cam_qit)) {
+                for (cam_qit.entities()) |cam_entity| {
+                    const cam = ecs.get(self.world, cam_entity, core_components.Camera) orelse continue;
 
                 // Phase 2: Shadow map rendering (uploads its own instance data per cascade)
                 const shadow_uniforms = renderer.executeShadowPass(self, cmd, cam_entity, sw_w, sw_h, frame);
@@ -545,6 +719,7 @@ pub const Engine = struct {
                 postprocess.executePostProcess(self, cmd, render_target, sw_w, sw_h, settings);
                 const tpp1 = c.SDL_GetPerformanceCounter();
                 self.stats.time_postprocess_us = (tpp1 - tpp0) * 1_000_000 / pf;
+                }
             }
 
             // Phase 5: ImGui overlay
@@ -655,15 +830,7 @@ pub const Engine = struct {
             s.avg_imgui / 1000.0,
         });
 
-        for (self.systems[0..self.system_count]) |sys| {
-            if (sys.disabled) continue;
-            const kind_label: []const u8 = if (sys.kind == .zig) "zig" else "lua";
-            std.debug.print("  {d:.2}ms [{s}] {s}\n", .{
-                sys.avg_us / 1000.0,
-                kind_label,
-                sys.name(),
-            });
-        }
+        // Per-system timing available via Flecs Explorer
     }
 
     // ---- GPU init ----
@@ -862,11 +1029,40 @@ pub const Engine = struct {
         // Physics
         try physics.initPhysics(self);
 
-        // Built-in systems
-        self.addSystem("age", &Engine.ageSystem);
-        self.addSystem("physics", &physics.physicsSystem);
-        self.addSystem("fly_camera", &Engine.flyCameraSystem);
-        self.addSystem("stats_overlay", &Engine.statsOverlaySystem);
+        // Built-in Zig systems.
+        // Systems with known component dependencies use proper flecs query terms
+        // so the scheduler can manage sync points and parallelism automatically.
+        // Systems with complex/external access patterns (physics, ImGui) use
+        // immediate + defer_suspend as a justified escape hatch.
+        {
+            // age: increments Age.seconds. Pure ECS, fully parallelizable.
+            _ = ecs.ADD_SYSTEM(self.world, "age", ecs.OnUpdate, ageSystemFlecs);
+
+            // fly_camera: reads FlyCamera, writes Position+Rotation. Pure ECS.
+            // Needs Engine ctx for keyboard input, so use SYSTEM_DESC + set ctx.
+            {
+                var fc_desc = ecs.SYSTEM_DESC(flyCameraSystemFlecs);
+                fc_desc.phase = ecs.OnUpdate;
+                fc_desc.ctx = self;
+                _ = ecs.SYSTEM(self.world, "fly_camera", &fc_desc);
+            }
+
+            // physics: complex Jolt interop — needs immediate + defer_suspend.
+            // Uses flecs interval for fixed timestep (1/60s). Flecs handles the
+            // accumulator and calls the system multiple times per frame if needed.
+            {
+                var phys_desc = std.mem.zeroes(ecs.system_desc_t);
+                phys_desc.callback = zigSystemCallback(&physics.physicsSystem);
+                phys_desc.ctx = self;
+                phys_desc.phase = ecs.OnUpdate;
+                phys_desc.immediate = true;
+                phys_desc.interval = physics.physics_timestep;
+                _ = ecs.SYSTEM(self.world, "physics", &phys_desc);
+            }
+
+            // stats_overlay: ImGui overlay, no ECS deps — needs immediate (ImGui context).
+            self.addSystem("stats_overlay", &Engine.statsOverlaySystem, ecs.OnStore);
+        }
     }
 
     // ---- Mesh API ----
@@ -1301,63 +1497,80 @@ pub const Engine = struct {
         return state[scancode];
     }
 
-    // ---- Zig systems ----
+    // ---- System management ----
 
-    /// Register a named Zig system function.
-    pub fn addSystem(self: *Engine, name: [*:0]const u8, func: ZigSystemFn) void {
-        if (self.system_count >= max_systems) return;
-        self.systems[self.system_count] = .{ .kind = .zig, .zig_fn = func };
-        self.systems[self.system_count].setName(name);
-        self.system_count += 1;
+    /// Register a Zig system as its own flecs pipeline system.
+    /// Each gets a comptime-specialized callback. `immediate=true` so
+    /// mutations apply instantly (no deferred queue).
+    pub fn addSystem(self: *Engine, name: [*:0]const u8, comptime func: ZigSystemFn, phase: ecs.entity_t) void {
+        var desc = std.mem.zeroes(ecs.system_desc_t);
+        desc.callback = zigSystemCallback(func);
+        desc.ctx = self;
+        desc.phase = phase;
+        desc.immediate = true;
+        _ = ecs.SYSTEM(self.world, name, &desc);
     }
 
-    /// Register a Lua system (called from lua_api).
-    pub fn addLuaSystem(self: *Engine, name: [*:0]const u8, lua_ref: c_int) void {
-        if (self.system_count >= max_systems) return;
-        self.systems[self.system_count] = .{ .kind = .lua, .lua_ref = lua_ref };
-        self.systems[self.system_count].setName(name);
-        self.system_count += 1;
+    /// Register a Lua system as its own flecs pipeline system.
+    /// `multi_threaded=false` because LuaJIT is single-threaded.
+    /// `immediate=true` because Lua systems read-after-write (e.g. add
+    /// position then immediately call physics_add_sphere which reads it).
+    pub fn addLuaSystem(self: *Engine, name: [*:0]const u8, lua_ref: c_int, phase: ecs.entity_t) ecs.entity_t {
+        if (self.lua_system_count >= max_lua_systems) return 0;
+        var desc = std.mem.zeroes(ecs.system_desc_t);
+        desc.callback = &luaSystemCallback;
+        desc.ctx = self;
+        desc.callback_ctx = @ptrFromInt(@as(usize, @intCast(lua_ref)));
+        desc.phase = phase;
+        desc.immediate = true;
+        desc.multi_threaded = false;
+        const entity = ecs.SYSTEM(self.world, name, &desc);
+        self.lua_system_entities[self.lua_system_count] = entity;
+        self.lua_system_count += 1;
+        return entity;
     }
 
-    pub fn runAllSystems(self: *Engine, dt: f32) void {
-        const L = self.lua_state;
-        const perf_freq = c.SDL_GetPerformanceFrequency();
+    /// Resolve a phase name string to a flecs phase entity.
+    /// Supports: "on_load", "post_load", "pre_update", "on_update" (default),
+    ///           "post_update", "pre_store", "on_store".
+    pub fn resolvePhase(phase_name: ?[]const u8) ecs.entity_t {
+        const name = phase_name orelse return ecs.OnUpdate;
+        if (std.mem.eql(u8, name, "on_load")) return ecs.OnLoad;
+        if (std.mem.eql(u8, name, "post_load")) return ecs.PostLoad;
+        if (std.mem.eql(u8, name, "pre_update")) return ecs.PreUpdate;
+        if (std.mem.eql(u8, name, "on_update")) return ecs.OnUpdate;
+        if (std.mem.eql(u8, name, "post_update")) return ecs.PostUpdate;
+        if (std.mem.eql(u8, name, "pre_store")) return ecs.PreStore;
+        if (std.mem.eql(u8, name, "on_store")) return ecs.OnStore;
+        return ecs.OnUpdate; // fallback
+    }
 
-        for (self.systems[0..self.system_count]) |*sys| {
-            if (sys.disabled) continue;
-            const t_start = c.SDL_GetPerformanceCounter();
-
-            switch (sys.kind) {
-                .zig => {
-                    if (sys.zig_fn) |func| func(self, dt);
-                },
-                .lua => {
-                    if (L) |state| {
-                        lc.lua_rawgeti(state, lc.LUA_REGISTRYINDEX, sys.lua_ref);
-                        lc.lua_pushnumber(state, dt);
-                        if (lc.lua_pcall(state, 1, 0, 0) != 0) {
-                            const err = lc.lua_tolstring(state, -1, null);
-                            std.debug.print("Lua system '{s}' error: {s}\n", .{ sys.name(), err });
-                            lc.lua_pop(state, 1);
-                            sys.disabled = true;
-                        }
-                    }
-                },
-            }
-
-            const t_end = c.SDL_GetPerformanceCounter();
-            sys.time_us = (t_end - t_start) * 1_000_000 / perf_freq;
-            sys.acc_us += sys.time_us;
+    /// Register a query-driven Lua system. The system has proper flecs query
+    /// terms so the scheduler knows its data dependencies. The Lua callback
+    /// is called with (dt, entity) for each matching entity.
+    pub fn addLuaQuerySystem(self: *Engine, name: [*:0]const u8, lua_ref: c_int, phase: ecs.entity_t, comp_ids: []const ecs.id_t) ecs.entity_t {
+        if (self.lua_system_count >= max_lua_systems) return 0;
+        var desc = std.mem.zeroes(ecs.system_desc_t);
+        desc.callback = &luaQuerySystemCallback;
+        desc.ctx = self;
+        desc.callback_ctx = @ptrFromInt(@as(usize, @intCast(lua_ref)));
+        desc.phase = phase;
+        desc.multi_threaded = false;
+        // Set query terms from component IDs
+        for (comp_ids, 0..) |comp_id, i| {
+            if (i >= ecs.ECS_MEMBER_DESC_CACHE_SIZE) break;
+            desc.query.terms[i].id = comp_id;
+            desc.query.terms[i].inout = .InOut;
         }
+        const entity = ecs.SYSTEM(self.world, name, &desc);
+        self.lua_system_entities[self.lua_system_count] = entity;
+        self.lua_system_count += 1;
+        return entity;
+    }
 
-        // Snapshot system averages on the same cadence as render stats
-        if (self.stats.acc_frames == 0) {
-            const n: f64 = @floatFromInt(@max(self.stats.snapshot_frames, 1));
-            for (self.systems[0..self.system_count]) |*sys2| {
-                sys2.avg_us = @as(f64, @floatFromInt(sys2.acc_us)) / n;
-                sys2.acc_us = 0;
-            }
-        }
+    /// Tick all systems via the flecs pipeline.
+    pub fn tickSystems(self: *Engine, dt: f32) void {
+        _ = ecs.progress(self.world, dt);
     }
 
     // ---- Built-in systems ----
@@ -1383,19 +1596,8 @@ pub const Engine = struct {
         }) catch "???";
         c.igTextUnformatted(line2);
 
-        c.igSeparatorText("Systems");
-
-        for (self.systems[0..self.system_count]) |*sys| {
-            if (sys.disabled) continue;
-            const kind_label: [*:0]const u8 = if (sys.kind == .zig) "zig" else "lua";
-            var sys_buf: [128]u8 = undefined;
-            const sys_line = std.fmt.bufPrintZ(&sys_buf, "{d:.2}ms [{s}] {s}", .{
-                sys.avg_us / 1000.0,
-                kind_label,
-                sys.name(),
-            }) catch "???";
-            c.igTextUnformatted(sys_line);
-        }
+        // Per-system timing is available in the Flecs Explorer
+        // (https://www.flecs.dev/explorer) which tracks all registered systems.
 
         // Render sub-phases
         c.igSeparatorText("Render");
@@ -1420,84 +1622,27 @@ pub const Engine = struct {
         c.igEnd();
     }
 
-    /// Increment Age.seconds for all entities with the Age component.
-    pub fn ageSystem(self: *Engine, dt: f32) void {
-        var view = self.registry.view(.{core_components.Age}, .{});
-        var iter = view.entityIterator();
-        while (iter.next()) |entity| {
-            var age = view.get(entity);
-            age.seconds += dt;
-        }
-    }
+    // ageSystem and flyCameraSystem are now proper flecs systems with query
+    // terms (see ageSystemFlecs / flyCameraSystemFlecs at file scope).
 
-    /// FPS-style fly camera. Processes entities with FlyCamera + Position + Rotation.
-    /// Right-click activates (hides cursor + enables look/move), release to interact with UI.
-    pub fn flyCameraSystem(self: *Engine, dt: f32) void {
-        const io = c.igGetIO();
-        if (io != null and io.*.WantCaptureMouse) return;
-
-        var dx: f32 = 0;
-        var dy: f32 = 0;
-        const buttons = c.SDL_GetRelativeMouseState(&dx, &dy);
-        const rmb_held = (buttons & c.SDL_BUTTON_RMASK) != 0;
-
-        if (rmb_held) {
-            _ = c.SDL_HideCursor();
-        } else {
-            _ = c.SDL_ShowCursor();
-        }
-
-        var view = self.registry.view(.{ core_components.Position, core_components.Rotation, core_components.FlyCamera }, .{});
-        var iter = view.entityIterator();
-        while (iter.next()) |entity| {
-            var pos = view.get(core_components.Position, entity);
-            var rot = view.get(core_components.Rotation, entity);
-            const fly = view.getConst(core_components.FlyCamera, entity);
-
-            if (!rmb_held) continue;
-
-            // Mouse look
-            rot.y += dx * fly.sensitivity;
-            rot.x += dy * fly.sensitivity;
-            rot.x = std.math.clamp(rot.x, -89, 89);
-
-            // Camera axes from pitch/yaw
-            const deg2rad = std.math.pi / 180.0;
-            const pitch = rot.x * deg2rad;
-            const yaw = rot.y * deg2rad;
-            const cp = @cos(pitch);
-            const sp = @sin(pitch);
-            const cy = @cos(yaw);
-            const sy = @sin(yaw);
-
-            const fx = sy * cp;
-            const fy = -sp;
-            const fz = -cy * cp;
-            const rx = cy;
-            const ry: f32 = 0;
-            const rz = sy;
-
-            const speed: f32 = if (self.isKeyDown(c.SDL_SCANCODE_LSHIFT)) fly.fast_speed else fly.speed;
-            if (self.isKeyDown(c.SDL_SCANCODE_W)) { pos.x += fx * speed * dt; pos.y += fy * speed * dt; pos.z += fz * speed * dt; }
-            if (self.isKeyDown(c.SDL_SCANCODE_S)) { pos.x -= fx * speed * dt; pos.y -= fy * speed * dt; pos.z -= fz * speed * dt; }
-            if (self.isKeyDown(c.SDL_SCANCODE_A)) { pos.x -= rx * speed * dt; pos.y -= ry * speed * dt; pos.z -= rz * speed * dt; }
-            if (self.isKeyDown(c.SDL_SCANCODE_D)) { pos.x += rx * speed * dt; pos.y += ry * speed * dt; pos.z += rz * speed * dt; }
-            if (self.isKeyDown(c.SDL_SCANCODE_SPACE)) pos.y += speed * dt;
-            if (self.isKeyDown(c.SDL_SCANCODE_LCTRL)) pos.y -= speed * dt;
-        }
-    }
-
-    /// Unregister all systems and free Lua registry references.
-    pub fn resetSystems(self: *Engine) void {
-        if (self.lua_state) |L| {
-            for (self.systems[0..self.system_count]) |sys| {
-                if (sys.kind == .lua and sys.lua_ref != 0) {
-                    lc.luaL_unref(L, lc.LUA_REGISTRYINDEX, sys.lua_ref);
+    /// Unregister all Lua systems — deletes their flecs system entities
+    /// and frees Lua registry references.
+    pub fn resetLuaSystems(self: *Engine) void {
+        const L = self.lua_state;
+        for (self.lua_system_entities[0..self.lua_system_count]) |entity| {
+            if (entity != 0) {
+                // Recover lua_ref from the system to unref it
+                if (L) |state| {
+                    // The lua_ref was stored as callback_ctx; we can't easily
+                    // recover it from a deleted entity, so just delete the entity.
+                    // Lua refs will be cleaned up when the Lua state is closed.
+                    _ = state;
                 }
+                ecs.delete(self.world, entity);
             }
         }
-        self.system_count = 0;
-        self.systems = .{SystemEntry{}} ** max_systems;
+        self.lua_system_count = 0;
+        self.lua_system_entities = .{0} ** max_lua_systems;
     }
 };
 
