@@ -235,18 +235,78 @@ fn registerStructMeta(world: *ecs.world_t, comptime T: type) void {
     _ = ecs.struct_init(world, &desc);
 }
 
-/// C-callable flecs callback for Zig systems. Each Zig system is registered
-/// as its own flecs system via addSystem() with a comptime-specialized wrapper
-/// that captures the function pointer. Engine pointer comes from it.ctx.
-/// Uses `callback` (not `run`) with `immediate=true` to avoid deferred mode
-/// and the zero-term double-finalization issue (flecs issue #905).
+// ============================================================
+// Flecs system callbacks — proper query-driven systems
+// ============================================================
+
+/// Age system: increments Age.seconds. Fully parallelizable, no defer needed.
+fn ageSystemFlecs(it: *ecs.iter_t, ages: []core_components.Age) void {
+    for (ages) |*age| {
+        age.seconds += it.delta_time;
+    }
+}
+
+/// Fly camera system: reads FlyCamera config, writes Position + Rotation.
+/// Uses iter to access entities for per-entity component access since we
+/// need both mutable Position/Rotation and const FlyCamera simultaneously.
+fn flyCameraSystemFlecs(it: *ecs.iter_t, positions: []core_components.Position, rotations: []core_components.Rotation, fly_cams: []const core_components.FlyCamera) void {
+    const engine: *Engine = @ptrCast(@alignCast(it.ctx));
+    const io = c.igGetIO();
+    if (io != null and io.*.WantCaptureMouse) return;
+
+    var dx: f32 = 0;
+    var dy: f32 = 0;
+    const buttons = c.SDL_GetRelativeMouseState(&dx, &dy);
+    const rmb_held = (buttons & c.SDL_BUTTON_RMASK) != 0;
+
+    if (rmb_held) {
+        _ = c.SDL_HideCursor();
+    } else {
+        _ = c.SDL_ShowCursor();
+    }
+
+    if (!rmb_held) return;
+
+    for (positions, rotations, fly_cams) |*pos, *rot, fly| {
+        // Mouse look
+        rot.y += dx * fly.sensitivity;
+        rot.x += dy * fly.sensitivity;
+        rot.x = std.math.clamp(rot.x, -89, 89);
+
+        // Camera axes from pitch/yaw
+        const deg2rad = std.math.pi / 180.0;
+        const pitch = rot.x * deg2rad;
+        const yaw = rot.y * deg2rad;
+        const cp = @cos(pitch);
+        const sp = @sin(pitch);
+        const cy = @cos(yaw);
+        const sy = @sin(yaw);
+
+        const fx = sy * cp;
+        const fy = -sp;
+        const fz = -cy * cp;
+        const rx = cy;
+        const ry: f32 = 0;
+        const rz = sy;
+
+        const speed: f32 = if (engine.isKeyDown(c.SDL_SCANCODE_LSHIFT)) fly.fast_speed else fly.speed;
+        const dt = it.delta_time;
+        if (engine.isKeyDown(c.SDL_SCANCODE_W)) { pos.x += fx * speed * dt; pos.y += fy * speed * dt; pos.z += fz * speed * dt; }
+        if (engine.isKeyDown(c.SDL_SCANCODE_S)) { pos.x -= fx * speed * dt; pos.y -= fy * speed * dt; pos.z -= fz * speed * dt; }
+        if (engine.isKeyDown(c.SDL_SCANCODE_A)) { pos.x -= rx * speed * dt; pos.y -= ry * speed * dt; pos.z -= rz * speed * dt; }
+        if (engine.isKeyDown(c.SDL_SCANCODE_D)) { pos.x += rx * speed * dt; pos.y += ry * speed * dt; pos.z += rz * speed * dt; }
+        if (engine.isKeyDown(c.SDL_SCANCODE_SPACE)) pos.y += speed * dt;
+        if (engine.isKeyDown(c.SDL_SCANCODE_LCTRL)) pos.y -= speed * dt;
+    }
+}
+
+/// C-callable flecs callback wrapper for Zig systems that need immediate mode
+/// (physics, stats overlay). These systems have complex access patterns that
+/// can't be expressed as simple query terms.
 fn zigSystemCallback(comptime func: ZigSystemFn) ecs.iter_action_t {
     return &struct {
         fn callback(it: *ecs.iter_t) callconv(.c) void {
             const engine: *Engine = @ptrCast(@alignCast(it.ctx));
-            // Suspend deferred mode so mutations apply immediately.
-            // `immediate=true` alone only permits mutation calls — it does NOT
-            // flush them. defer_suspend is required for read-after-write.
             ecs.defer_suspend(engine.world);
             func(engine, it.delta_time);
             ecs.defer_resume(engine.world);
@@ -947,11 +1007,30 @@ pub const Engine = struct {
         // Physics
         try physics.initPhysics(self);
 
-        // Built-in Zig systems
-        self.addSystem("age", &Engine.ageSystem, ecs.OnUpdate);
-        self.addSystem("physics", &physics.physicsSystem, ecs.OnUpdate);
-        self.addSystem("fly_camera", &Engine.flyCameraSystem, ecs.OnUpdate);
-        self.addSystem("stats_overlay", &Engine.statsOverlaySystem, ecs.OnStore);
+        // Built-in Zig systems.
+        // Systems with known component dependencies use proper flecs query terms
+        // so the scheduler can manage sync points and parallelism automatically.
+        // Systems with complex/external access patterns (physics, ImGui) use
+        // immediate + defer_suspend as a justified escape hatch.
+        {
+            // age: increments Age.seconds. Pure ECS, fully parallelizable.
+            _ = ecs.ADD_SYSTEM(self.world, "age", ecs.OnUpdate, ageSystemFlecs);
+
+            // fly_camera: reads FlyCamera, writes Position+Rotation. Pure ECS.
+            // Needs Engine ctx for keyboard input, so use SYSTEM_DESC + set ctx.
+            {
+                var fc_desc = ecs.SYSTEM_DESC(flyCameraSystemFlecs);
+                fc_desc.phase = ecs.OnUpdate;
+                fc_desc.ctx = self;
+                _ = ecs.SYSTEM(self.world, "fly_camera", &fc_desc);
+            }
+
+            // physics: complex Jolt interop — needs immediate + defer_suspend.
+            self.addSystem("physics", &physics.physicsSystem, ecs.OnUpdate);
+
+            // stats_overlay: ImGui overlay, no ECS deps — needs immediate (ImGui context).
+            self.addSystem("stats_overlay", &Engine.statsOverlaySystem, ecs.OnStore);
+        }
     }
 
     // ---- Mesh API ----
@@ -1472,79 +1551,8 @@ pub const Engine = struct {
         c.igEnd();
     }
 
-    /// Increment Age.seconds for all entities with the Age component.
-    pub fn ageSystem(self: *Engine, dt: f32) void {
-        const q = queryInit(self.world, &.{ecs.id(core_components.Age)}, &.{});
-        defer ecs.query_fini(q);
-        var it = ecs.query_iter(self.world, q);
-
-        while (ecs.query_next(&it)) {
-            if (ecs.field(&it, core_components.Age, 0)) |ages| {
-                for (ages) |*age| {
-                    age.seconds += dt;
-                }
-            }
-        }
-    }
-
-    /// FPS-style fly camera. Processes entities with FlyCamera + Position + Rotation.
-    /// Right-click activates (hides cursor + enables look/move), release to interact with UI.
-    pub fn flyCameraSystem(self: *Engine, dt: f32) void {
-        const io = c.igGetIO();
-        if (io != null and io.*.WantCaptureMouse) return;
-
-        var dx: f32 = 0;
-        var dy: f32 = 0;
-        const buttons = c.SDL_GetRelativeMouseState(&dx, &dy);
-        const rmb_held = (buttons & c.SDL_BUTTON_RMASK) != 0;
-
-        if (rmb_held) {
-            _ = c.SDL_HideCursor();
-        } else {
-            _ = c.SDL_ShowCursor();
-        }
-
-        const q = queryInit(self.world, &.{ ecs.id(core_components.Position), ecs.id(core_components.Rotation), ecs.id(core_components.FlyCamera) }, &.{});
-        defer ecs.query_fini(q);
-        var it = ecs.query_iter(self.world, q);
-
-        while (ecs.query_next(&it)) for (it.entities()) |entity| {
-            var pos = ecs.get_mut(self.world, entity, core_components.Position) orelse continue;
-            var rot = ecs.get_mut(self.world, entity, core_components.Rotation) orelse continue;
-            const fly = ecs.get(self.world, entity, core_components.FlyCamera) orelse continue;
-
-            if (!rmb_held) continue;
-
-            // Mouse look
-            rot.y += dx * fly.sensitivity;
-            rot.x += dy * fly.sensitivity;
-            rot.x = std.math.clamp(rot.x, -89, 89);
-
-            // Camera axes from pitch/yaw
-            const deg2rad = std.math.pi / 180.0;
-            const pitch = rot.x * deg2rad;
-            const yaw = rot.y * deg2rad;
-            const cp = @cos(pitch);
-            const sp = @sin(pitch);
-            const cy = @cos(yaw);
-            const sy = @sin(yaw);
-
-            const fx = sy * cp;
-            const fy = -sp;
-            const fz = -cy * cp;
-            const rx = cy;
-            const ry: f32 = 0;
-            const rz = sy;
-
-            const speed: f32 = if (self.isKeyDown(c.SDL_SCANCODE_LSHIFT)) fly.fast_speed else fly.speed;
-            if (self.isKeyDown(c.SDL_SCANCODE_W)) { pos.x += fx * speed * dt; pos.y += fy * speed * dt; pos.z += fz * speed * dt; }
-            if (self.isKeyDown(c.SDL_SCANCODE_S)) { pos.x -= fx * speed * dt; pos.y -= fy * speed * dt; pos.z -= fz * speed * dt; }
-            if (self.isKeyDown(c.SDL_SCANCODE_A)) { pos.x -= rx * speed * dt; pos.y -= ry * speed * dt; pos.z -= rz * speed * dt; }
-            if (self.isKeyDown(c.SDL_SCANCODE_D)) { pos.x += rx * speed * dt; pos.y += ry * speed * dt; pos.z += rz * speed * dt; }
-            if (self.isKeyDown(c.SDL_SCANCODE_SPACE)) pos.y += speed * dt;
-            if (self.isKeyDown(c.SDL_SCANCODE_LCTRL)) pos.y -= speed * dt;
-        };
-    }
+    // ageSystem and flyCameraSystem are now proper flecs systems with query
+    // terms (see ageSystemFlecs / flyCameraSystemFlecs at file scope).
 
     /// Unregister all Lua systems — deletes their flecs system entities
     /// and frees Lua registry references.
