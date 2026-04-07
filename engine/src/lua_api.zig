@@ -99,6 +99,7 @@ pub fn registerLuaApi(self: *Engine) void {
         .{ "destroy_mesh", &luaDestroyMesh },
         .{ "load_gltf", &luaLoadGltf },
         .{ "system", &luaSystemRegister },
+        .{ "reset_systems", &luaResetSystems },
         .{ "get_stats", &luaGetStats },
         .{ "physics_add_box", &luaPhysicsAddBox },
         .{ "physics_add_sphere", &luaPhysicsAddSphere },
@@ -1140,6 +1141,15 @@ fn luaSystemRegister(L: ?*lc.lua_State) callconv(.c) c_int {
         return 0;
     }
 
-    self.addLuaSystem(name, ref, phase);
+    const entity = self.addLuaSystem(name, ref, phase);
+    lc.lua_pushinteger(L, @intCast(entity));
+    return 1;
+}
+
+/// lunatic.reset_systems() — remove all Lua-registered systems.
+/// Call before loading a new scene to prevent stale systems from running.
+fn luaResetSystems(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    self.resetLuaSystems();
     return 0;
 }

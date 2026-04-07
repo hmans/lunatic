@@ -1493,8 +1493,8 @@ pub const Engine = struct {
     /// `multi_threaded=false` because LuaJIT is single-threaded.
     /// `immediate=true` because Lua systems read-after-write (e.g. add
     /// position then immediately call physics_add_sphere which reads it).
-    pub fn addLuaSystem(self: *Engine, name: [*:0]const u8, lua_ref: c_int, phase: ecs.entity_t) void {
-        if (self.lua_system_count >= max_lua_systems) return;
+    pub fn addLuaSystem(self: *Engine, name: [*:0]const u8, lua_ref: c_int, phase: ecs.entity_t) ecs.entity_t {
+        if (self.lua_system_count >= max_lua_systems) return 0;
         var desc = std.mem.zeroes(ecs.system_desc_t);
         desc.callback = &luaSystemCallback;
         desc.ctx = self;
@@ -1505,6 +1505,7 @@ pub const Engine = struct {
         const entity = ecs.SYSTEM(self.world, name, &desc);
         self.lua_system_entities[self.lua_system_count] = entity;
         self.lua_system_count += 1;
+        return entity;
     }
 
     /// Resolve a phase name string to a flecs phase entity.

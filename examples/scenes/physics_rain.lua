@@ -123,7 +123,7 @@ function scene.setup(cam)
 
   -- Spawner system (guarded — keeps creating entities so needs an off switch)
   local spawner_active = true
-  lunatic.system("physics_rain_spawner", function(dt)
+  local spawner_system = lunatic.system("physics_rain_spawner", function(dt)
     if not spawner_active then return end
     spawn_timer = spawn_timer + dt
     while spawn_timer >= spawn_interval do
@@ -147,6 +147,8 @@ function scene.setup(cam)
   -- Cleanup
   return function()
     spawner_active = false
+    -- Destroy the spawner flecs system entity
+    if spawner_system then lunatic.destroy(spawner_system) end
     for _, e in ipairs(entities) do
       pcall(lunatic.destroy, e)
     end
