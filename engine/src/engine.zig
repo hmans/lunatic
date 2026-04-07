@@ -1026,7 +1026,17 @@ pub const Engine = struct {
             }
 
             // physics: complex Jolt interop — needs immediate + defer_suspend.
-            self.addSystem("physics", &physics.physicsSystem, ecs.OnUpdate);
+            // Uses flecs interval for fixed timestep (1/60s). Flecs handles the
+            // accumulator and calls the system multiple times per frame if needed.
+            {
+                var phys_desc = std.mem.zeroes(ecs.system_desc_t);
+                phys_desc.callback = zigSystemCallback(&physics.physicsSystem);
+                phys_desc.ctx = self;
+                phys_desc.phase = ecs.OnUpdate;
+                phys_desc.immediate = true;
+                phys_desc.interval = physics.physics_timestep;
+                _ = ecs.SYSTEM(self.world, "physics", &phys_desc);
+            }
 
             // stats_overlay: ImGui overlay, no ECS deps — needs immediate (ImGui context).
             self.addSystem("stats_overlay", &Engine.statsOverlaySystem, ecs.OnStore);
@@ -1483,18 +1493,33 @@ pub const Engine = struct {
     /// `multi_threaded=false` because LuaJIT is single-threaded.
     /// `immediate=true` because Lua systems read-after-write (e.g. add
     /// position then immediately call physics_add_sphere which reads it).
-    pub fn addLuaSystem(self: *Engine, name: [*:0]const u8, lua_ref: c_int) void {
+    pub fn addLuaSystem(self: *Engine, name: [*:0]const u8, lua_ref: c_int, phase: ecs.entity_t) void {
         if (self.lua_system_count >= max_lua_systems) return;
         var desc = std.mem.zeroes(ecs.system_desc_t);
         desc.callback = &luaSystemCallback;
         desc.ctx = self;
         desc.callback_ctx = @ptrFromInt(@as(usize, @intCast(lua_ref)));
-        desc.phase = ecs.OnUpdate;
+        desc.phase = phase;
         desc.immediate = true;
         desc.multi_threaded = false;
         const entity = ecs.SYSTEM(self.world, name, &desc);
         self.lua_system_entities[self.lua_system_count] = entity;
         self.lua_system_count += 1;
+    }
+
+    /// Resolve a phase name string to a flecs phase entity.
+    /// Supports: "on_load", "post_load", "pre_update", "on_update" (default),
+    ///           "post_update", "pre_store", "on_store".
+    pub fn resolvePhase(phase_name: ?[]const u8) ecs.entity_t {
+        const name = phase_name orelse return ecs.OnUpdate;
+        if (std.mem.eql(u8, name, "on_load")) return ecs.OnLoad;
+        if (std.mem.eql(u8, name, "post_load")) return ecs.PostLoad;
+        if (std.mem.eql(u8, name, "pre_update")) return ecs.PreUpdate;
+        if (std.mem.eql(u8, name, "on_update")) return ecs.OnUpdate;
+        if (std.mem.eql(u8, name, "post_update")) return ecs.PostUpdate;
+        if (std.mem.eql(u8, name, "pre_store")) return ecs.PreStore;
+        if (std.mem.eql(u8, name, "on_store")) return ecs.OnStore;
+        return ecs.OnUpdate; // fallback
     }
 
     /// Tick all systems via the flecs pipeline.

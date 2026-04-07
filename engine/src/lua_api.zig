@@ -1116,10 +1116,21 @@ fn luaLoadGltf(L: ?*lc.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+/// lunatic.system(name, callback [, phase])
+/// Register a Lua system. Optional phase argument controls when the system
+/// runs in the flecs pipeline: "on_load", "post_load", "pre_update",
+/// "on_update" (default), "post_update", "pre_store", "on_store".
 fn luaSystemRegister(L: ?*lc.lua_State) callconv(.c) c_int {
     const self = getEngine(L);
     const name = lc.luaL_checklstring(L, 1, null);
     lc.luaL_checktype(L, 2, lc.LUA_TFUNCTION);
+
+    // Optional 3rd arg: phase name string
+    const phase_name: ?[]const u8 = if (lc.lua_gettop(L) >= 3 and lc.lua_type(L, 3) == lc.LUA_TSTRING)
+        std.mem.span(lc.lua_tolstring(L, 3, null))
+    else
+        null;
+    const phase = Engine.resolvePhase(phase_name);
 
     lc.lua_pushvalue(L, 2);
     const ref = lc.luaL_ref(L, lc.LUA_REGISTRYINDEX);
@@ -1129,6 +1140,6 @@ fn luaSystemRegister(L: ?*lc.lua_State) callconv(.c) c_int {
         return 0;
     }
 
-    self.addLuaSystem(name, ref);
+    self.addLuaSystem(name, ref, phase);
     return 0;
 }
