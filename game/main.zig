@@ -12,7 +12,6 @@ pub fn main() !void {
     var engine: Engine = undefined;
     try engine.init(.{ .width = 1280, .height = 720, .debug_stats = debug });
 
-    try engine.loadScript("game/main.lua");
     try engine.run();
 
     // run() returned normally — the player quit cleanly. Call deinit

@@ -1,7 +1,7 @@
 // debug_server.zig — Embedded HTTP debug server for engine inspection.
 //
 // Runs on a background thread, accepts HTTP requests on localhost:19840.
-// Requests that need main-thread access (Lua eval, screenshots) are queued
+// Requests that need main-thread access (screenshots) are queued
 // and processed once per frame. The HTTP handler blocks until the main thread
 // signals completion.
 
@@ -18,15 +18,12 @@ const max_pending_requests = 4;
 // ============================================================
 
 pub const RequestKind = enum {
-    lua_eval,
     screenshot,
     stats,
 };
 
 pub const Request = struct {
     kind: RequestKind,
-    /// Lua code to evaluate (owned by the request, freed after response)
-    lua_code: ?[]const u8 = null,
     /// Response data written by the main thread
     response: Response = .{},
     /// Signaled by the main thread when the response is ready
@@ -138,7 +135,6 @@ pub const DebugServer = struct {
     fn processOnMainThread(self: *DebugServer, req: *Request) void {
         switch (req.kind) {
             .stats => self.handleStats(req),
-            .lua_eval => self.handleLuaEval(req),
             .screenshot => self.handleScreenshot(req),
         }
     }
@@ -172,85 +168,6 @@ pub const DebugServer = struct {
             return;
         };
         req.response.body = json;
-    }
-
-    fn handleLuaEval(self: *DebugServer, req: *Request) void {
-        const lua_code = req.lua_code orelse {
-            req.response.status = .bad_request;
-            req.response.body = "{\"error\":\"no code provided\"}";
-            return;
-        };
-        const L = self.engine.lua_state orelse {
-            req.response.status = .internal_server_error;
-            req.response.body = "{\"error\":\"lua not initialized\"}";
-            return;
-        };
-
-        const lc = @import("lua").c;
-
-        // Load and execute the chunk
-        // Null-terminate the code for luaL_loadbuffer
-        const code_z = std.heap.c_allocator.dupeZ(u8, lua_code) catch {
-            req.response.status = .internal_server_error;
-            req.response.body = "{\"error\":\"alloc failed\"}";
-            return;
-        };
-        defer std.heap.c_allocator.free(code_z);
-
-        const load_result = lc.luaL_loadbuffer(L, code_z.ptr, lua_code.len, "=debug");
-        if (load_result != 0) {
-            const err_msg = lc.lua_tolstring(L, -1, null);
-            const err_str = if (err_msg != null) std.mem.span(err_msg) else "unknown error";
-            const json = std.fmt.allocPrint(std.heap.c_allocator,
-                \\{{"error":"compile: {s}"}}
-            , .{err_str}) catch {
-                req.response.status = .bad_request;
-                req.response.body = "{\"error\":\"compile error\"}";
-                lc.lua_settop(L, -2); // pop error
-                return;
-            };
-            req.response.status = .bad_request;
-            req.response.body = json;
-            lc.lua_settop(L, -2); // pop error
-            return;
-        }
-
-        // pcall(chunk, 0 args, 1 result)
-        const top_before = lc.lua_gettop(L) - 1; // stack before the chunk
-        const call_result = lc.lua_pcall(L, 0, lc.LUA_MULTRET, 0);
-        if (call_result != 0) {
-            const err_msg = lc.lua_tolstring(L, -1, null);
-            const err_str = if (err_msg != null) std.mem.span(err_msg) else "unknown error";
-            const json = std.fmt.allocPrint(std.heap.c_allocator,
-                \\{{"error":"runtime: {s}"}}
-            , .{err_str}) catch {
-                req.response.status = .internal_server_error;
-                req.response.body = "{\"error\":\"runtime error\"}";
-                lc.lua_settop(L, top_before);
-                return;
-            };
-            req.response.status = .internal_server_error;
-            req.response.body = json;
-            lc.lua_settop(L, top_before);
-            return;
-        }
-
-        // Convert the top-of-stack result to a string
-        const nresults = lc.lua_gettop(L) - top_before;
-        if (nresults > 0) {
-            const result_str = luaValueToJson(L, -1);
-            const json = std.fmt.allocPrint(std.heap.c_allocator,
-                \\{{"result":{s}}}
-            , .{result_str}) catch {
-                req.response.body = "{\"result\":null}";
-                lc.lua_settop(L, top_before);
-                return;
-            };
-            req.response.body = json;
-            lc.lua_settop(L, top_before);
-        } else {
-            req.response.body = "{\"result\":null}";
-        }
     }
 
     fn handleScreenshot(self: *DebugServer, req: *Request) void {
@@ -353,32 +270,12 @@ fn handleConnection(server: *DebugServer, conn: net.Server.Connection) !void {
         const target = request.head.target;
 
         if (std.mem.eql(u8, target, "/stats")) {
-            try handleHttpRequest(server, &request, .stats, null);
+            try handleHttpRequest(server, &request, .stats);
         } else if (std.mem.eql(u8, target, "/screenshot")) {
-            try handleHttpRequest(server, &request, .screenshot, null);
-        } else if (std.mem.eql(u8, target, "/lua") or std.mem.startsWith(u8, target, "/lua")) {
-            // Read request body for Lua code
-            var body_buf: [16384]u8 = undefined;
-            const body_reader = request.readerExpectNone(&body_buf);
-            const body = body_reader.allocRemaining(std.heap.c_allocator, @enumFromInt(16384)) catch {
-                try request.respond("{\"error\":\"body too large\"}", .{
-                    .status = .bad_request,
-                    .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
-                });
-                continue;
-            };
-            defer std.heap.c_allocator.free(body);
-            if (body.len == 0) {
-                try request.respond("{\"error\":\"empty body\"}", .{
-                    .status = .bad_request,
-                    .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
-                });
-                continue;
-            }
-            try handleHttpRequest(server, &request, .lua_eval, body);
+            try handleHttpRequest(server, &request, .screenshot);
         } else {
             // 404
-            try request.respond("{\"error\":\"not found\",\"endpoints\":[\"/stats\",\"/lua\",\"/screenshot\"]}", .{
+            try request.respond("{\"error\":\"not found\",\"endpoints\":[\"/stats\",\"/screenshot\"]}", .{
                 .status = .not_found,
                 .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
             });
@@ -390,11 +287,17 @@ fn handleHttpRequest(
     server: *DebugServer,
     request: *http.Server.Request,
     kind: RequestKind,
-    lua_code: ?[]const u8,
 ) !void {
+    // Drain any request body before responding. std.http.Server.respond()
+    // calls discardBody() internally, which asserts if the body hasn't been
+    // consumed. POST requests (e.g. /screenshot) may arrive with no body
+    // and no Content-Length header, so we drain defensively.
+    var discard_buf: [4096]u8 = undefined;
+    var body_reader = request.readerExpectNone(&discard_buf);
+    _ = body_reader.allocRemaining(std.heap.c_allocator, @enumFromInt(4096)) catch {};
+
     var req = Request{
         .kind = kind,
-        .lua_code = lua_code,
     };
 
     if (!server.queue.push(&req)) {
@@ -418,96 +321,4 @@ fn handleHttpRequest(
             .{ .name = "access-control-allow-origin", .value = "*" },
         },
     });
-
-    // Free allocated response body (stats and lua_eval allocate)
-    if (resp.body) |b| {
-        // Don't free string literals (they point into static data)
-        if (b.len > 0 and @intFromPtr(b.ptr) > 0x1000000) {
-            // Heuristic: allocated strings will have high addresses.
-            // A proper solution would use a flag, but this works for now.
-            // Actually, let's just not free and accept the small leak for simplicity.
-            // The MCP server is the only client and requests are infrequent.
-            // TODO: use a proper ownership flag
-        }
-    }
-}
-
-// ============================================================
-// Lua → JSON helpers
-// ============================================================
-
-fn luaValueToJson(L: *@import("lua").c.lua_State, idx: i32) []const u8 {
-    const lc = @import("lua").c;
-    const t = lc.lua_type(L, idx);
-    switch (t) {
-        lc.LUA_TSTRING => {
-            const s = lc.lua_tolstring(L, idx, null);
-            if (s != null) {
-                // Wrap in quotes for JSON
-                const str = std.mem.span(s);
-                const json = std.fmt.allocPrint(std.heap.c_allocator, "\"{s}\"", .{str}) catch return "null";
-                return json;
-            }
-            return "null";
-        },
-        lc.LUA_TNUMBER => {
-            const n = lc.lua_tonumber(L, idx);
-            const json = std.fmt.allocPrint(std.heap.c_allocator, "{d}", .{n}) catch return "0";
-            return json;
-        },
-        lc.LUA_TBOOLEAN => {
-            return if (lc.lua_toboolean(L, idx) != 0) "true" else "false";
-        },
-        lc.LUA_TNIL => return "null",
-        lc.LUA_TTABLE => {
-            return tableToJson(L, idx);
-        },
-        else => return "null",
-    }
-}
-
-fn tableToJson(L: *@import("lua").c.lua_State, idx: i32) []const u8 {
-    const lc = @import("lua").c;
-    const allocator = std.heap.c_allocator;
-
-    // Check if it's an array (sequential integer keys starting at 1)
-    const len = lc.lua_objlen(L, idx);
-    const is_array = len > 0;
-
-    // Build JSON string by concatenating parts
-    var result: []const u8 = allocator.dupe(u8, if (is_array) "[" else "{") catch return if (is_array) "[]" else "{}";
-
-    if (is_array) {
-        for (1..len + 1) |i| {
-            if (i > 1) {
-                result = std.fmt.allocPrint(allocator, "{s},", .{result}) catch return "[]";
-            }
-            lc.lua_rawgeti(L, idx, @intCast(i));
-            const val = luaValueToJson(L, -1);
-            result = std.fmt.allocPrint(allocator, "{s}{s}", .{ result, val }) catch return "[]";
-            lc.lua_settop(L, -2); // pop value
-        }
-        result = std.fmt.allocPrint(allocator, "{s}]", .{result}) catch return "[]";
-    } else {
-        var first = true;
-        lc.lua_pushnil(L);
-        const abs_idx: i32 = if (idx < 0) lc.lua_gettop(L) + idx else idx;
-        while (lc.lua_next(L, abs_idx) != 0) {
-            const sep: []const u8 = if (first) "" else ",";
-            first = false;
-            // Key at -2, value at -1
-            const key = luaValueToJson(L, -2);
-            const val = luaValueToJson(L, -1);
-            // If key isn't already quoted, wrap it
-            if (key.len > 0 and key[0] != '"') {
-                result = std.fmt.allocPrint(allocator, "{s}{s}\"{s}\":{s}", .{ result, sep, key, val }) catch return "{}";
-            } else {
-                result = std.fmt.allocPrint(allocator, "{s}{s}{s}:{s}", .{ result, sep, key, val }) catch return "{}";
-            }
-            lc.lua_settop(L, -2); // pop value, keep key for next iteration
-        }
-        result = std.fmt.allocPrint(allocator, "{s}}}", .{result}) catch return "{}";
-    }
-
-    return result;
 }

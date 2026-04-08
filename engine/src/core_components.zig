@@ -5,31 +5,26 @@ pub const Position = struct {
     x: f32 = 0,
     y: f32 = 0,
     z: f32 = 0,
-    pub const lua = .{ .name = "position" };
 };
 
 pub const Rotation = struct {
     x: f32 = 0,
     y: f32 = 0,
     z: f32 = 0,
-    pub const lua = .{ .name = "rotation" };
 };
 
 pub const Scale = struct {
     x: f32 = 1,
     y: f32 = 1,
     z: f32 = 1,
-    pub const lua = .{ .name = "scale" };
 };
 
 pub const MeshHandle = struct {
     id: u32 = 0,
-    pub const lua = .{ .name = "mesh", .resolve = .mesh };
 };
 
 pub const MaterialHandle = struct {
     id: u32 = 0,
-    pub const lua = .{ .name = "material", .resolve = .material };
 };
 
 pub const Camera = struct {
@@ -60,7 +55,6 @@ pub const Camera = struct {
     flare_halo_width: f32 = 0.5, // Halo ring radius (0.1-0.9)
     flare_chroma_distortion: f32 = 0.005, // Per-ghost chromatic shift (0.0-0.02)
     flare_dirt_intensity: f32 = 0.5, // Lens dirt overlay (0=off, 1=full)
-    pub const lua = .{ .name = "camera" };
 };
 
 pub const DirectionalLight = struct {
@@ -70,7 +64,6 @@ pub const DirectionalLight = struct {
     r: f32 = 1.0,
     g: f32 = 1.0,
     b: f32 = 1.0,
-    pub const lua = .{ .name = "directional_light" };
 };
 
 pub const PointLight = struct {
@@ -79,7 +72,6 @@ pub const PointLight = struct {
     g: f32 = 1.0,
     b: f32 = 1.0,
     intensity: f32 = 1.0,
-    pub const lua = .{ .name = "point_light" };
 };
 
 pub const SpotLight = struct {
@@ -93,12 +85,10 @@ pub const SpotLight = struct {
     dir_z: f32 = 0.0,
     inner_cone: f32 = 30.0,
     outer_cone: f32 = 45.0,
-    pub const lua = .{ .name = "spot_light" };
 };
 
 pub const LookAt = struct {
     target: u32 = 0,
-    pub const lua = .{ .name = "look_at" };
 };
 
 /// FPS-style fly camera controller. Attach to a camera entity with Position + Rotation.
@@ -107,30 +97,23 @@ pub const FlyCamera = struct {
     speed: f32 = 10,
     fast_speed: f32 = 30,
     sensitivity: f32 = 0.15,
-    pub const lua = .{ .name = "fly_camera" };
 };
 
 /// Tracks entity lifetime in seconds. Incremented automatically by the engine.
 pub const Age = struct {
     seconds: f32 = 0,
-    pub const lua = .{ .name = "age" };
 };
 
 /// Rigid body physics (Jolt). body_id is managed by the physics system.
 pub const RigidBody = struct {
     body_id: u32 = 0,
-    pub const lua = .{ .name = "rigid_body" };
 };
 
 /// Tag: entity's mesh is rendered into the shadow map.
-pub const ShadowCaster = struct {
-    pub const lua = .{ .name = "shadow_caster" };
-};
+pub const ShadowCaster = struct {};
 
 /// Tag: entity's mesh receives shadows from the shadow map.
-pub const ShadowReceiver = struct {
-    pub const lua = .{ .name = "shadow_receiver" };
-};
+pub const ShadowReceiver = struct {};
 
 /// Core component tuple — engine modules reference these directly.
 pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, PointLight, SpotLight, LookAt, FlyCamera, Age, RigidBody, ShadowCaster, ShadowReceiver };

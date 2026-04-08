@@ -1,6 +1,8 @@
-// Tiny C helper to safely call lua_error from Zig.
-// lua_error does a longjmp which is undefined behavior through Zig stack frames.
-// By calling it from C, the longjmp only unwinds C frames which is safe.
+// lua_error_helper.c — C shim for lua_error/luaL_error.
+//
+// lua_error() does longjmp, which is undefined behavior when unwinding through
+// Zig stack frames. These wrappers ensure longjmp only unwinds C frames.
+
 #include <lua.h>
 #include <lauxlib.h>
 

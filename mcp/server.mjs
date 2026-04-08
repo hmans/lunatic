@@ -21,27 +21,8 @@ async function engineFetch(path, options = {}) {
 
 const server = new McpServer({
   name: "lunatic-engine",
-  version: "0.1.0",
+  version: "0.2.0",
 });
-
-// --- Tool: eval_lua ---
-server.tool(
-  "eval_lua",
-  "Evaluate Lua code in the running Lunatic engine. Returns the result as JSON. " +
-    "Use this to inspect or modify engine state: query entities, change camera parameters, " +
-    "spawn/destroy objects, read component values, etc. The code runs on the main thread " +
-    "with full access to the `lunatic` API table.",
-  { code: z.string().describe("Lua code to evaluate. The return value (if any) is sent back as JSON.") },
-  async ({ code }) => {
-    const resp = await engineFetch("/lua", {
-      method: "POST",
-      headers: { "Content-Type": "text/plain" },
-      body: code,
-    });
-    const json = await resp.json();
-    return { content: [{ type: "text", text: JSON.stringify(json, null, 2) }] };
-  }
-);
 
 // --- Tool: screenshot ---
 server.tool(

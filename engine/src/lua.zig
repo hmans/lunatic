@@ -1,12 +1,10 @@
-// lua.zig — shared Lua C import and binding utilities.
+// lua.zig — shared LuaJIT C import.
+//
+// Separate module to avoid merging LuaJIT types into engine.zig's @cImport
+// block (which would create type conflicts with SDL — see "Shared @cImport" gotcha).
 
 pub const c = @cImport({
     @cInclude("lua.h");
     @cInclude("lualib.h");
     @cInclude("lauxlib.h");
 });
-
-/// Get the Lua name for any component type.
-pub fn nameOf(comptime T: type) []const u8 {
-    return T.lua.name;
-}

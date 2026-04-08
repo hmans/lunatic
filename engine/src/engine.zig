@@ -4,18 +4,17 @@ const std = @import("std");
 const builtin = @import("builtin");
 const math3d = @import("math3d");
 const Mat4 = math3d.Mat4;
-const ecs = @import("zflecs");
+pub const ecs = @import("zflecs");
 const geometry = @import("geometry");
 const renderer = @import("renderer");
 pub const postprocess = @import("postprocess");
 pub const physics = @import("physics");
-const lua_api = @import("lua_api");
 pub const gltf = @import("gltf");
 pub const debug_server = @import("debug_server");
+pub const lua_systems = @import("lua_systems");
 
 pub const core_components = @import("core_components");
-const lua = @import("lua");
-const lc = lua.c;
+pub const components = @import("components");
 pub const HandleKind = enum { mesh, material };
 pub const c = @cImport({
     @cInclude("SDL3/SDL.h");
@@ -32,7 +31,7 @@ const stbiw = @cImport({
 const Vertex = geometry.Vertex;
 
 // ============================================================
-// Types (pub for use by renderer and lua_api)
+// Types (pub for use by renderer and other modules)
 // ============================================================
 
 pub const MeshData = struct {
@@ -75,7 +74,6 @@ pub const MaterialData = struct {
 pub const max_meshes = 64;
 pub const max_materials = 64;
 pub const max_textures = 64;
-pub const max_lua_systems = 64;
 pub const ZigSystemFn = *const fn (*Engine, f32) void;
 
 // ============================================================
@@ -227,7 +225,7 @@ const flecs_u32_id = @extern(*const ecs.entity_t, .{ .name = "FLECS_IDecs_u32_tI
 
 /// Register struct metadata with flecs so the Explorer can display and
 /// edit component fields. Maps Zig struct fields to flecs member descriptors.
-/// Only handles f32 and u32 fields (matching the Lua bridge constraint).
+/// Only handles f32 and u32 fields.
 fn registerStructMeta(world: *ecs.world_t, comptime T: type) void {
     const fields = std.meta.fields(T);
     var desc = std.mem.zeroes(ecs.struct_desc_t);
@@ -322,50 +320,6 @@ fn zigSystemCallback(comptime func: ZigSystemFn) ecs.iter_action_t {
             ecs.defer_resume(engine.world);
         }
     }.callback;
-}
-
-/// C-callable flecs callback for imperative Lua systems (no query terms).
-/// Called once per frame. Uses defer_suspend for read-after-write safety.
-fn luaSystemCallback(it: *ecs.iter_t) callconv(.c) void {
-    const engine: *Engine = @ptrCast(@alignCast(it.ctx));
-    const lua_ref: c_int = @intCast(@intFromPtr(it.callback_ctx));
-    const L = engine.lua_state orelse return;
-
-    ecs.defer_suspend(engine.world);
-    lc.lua_rawgeti(L, lc.LUA_REGISTRYINDEX, lua_ref);
-    lc.lua_pushnumber(L, it.delta_time);
-    if (lc.lua_pcall(L, 1, 0, 0) != 0) {
-        const err = lc.lua_tolstring(L, -1, null);
-        std.debug.print("Lua system error: {s}\n", .{err});
-        lc.lua_pop(L, 1);
-        ecs.defer_resume(engine.world);
-        ecs.enable(engine.world, it.system, false);
-        return;
-    }
-    ecs.defer_resume(engine.world);
-}
-
-/// C-callable flecs callback for query-driven Lua systems.
-/// Called per archetype table with matched entities. Iterates entities
-/// and calls the Lua callback with (dt, entity) for each.
-/// No defer_suspend — flecs manages data dependencies via query terms.
-fn luaQuerySystemCallback(it: *ecs.iter_t) callconv(.c) void {
-    const engine: *Engine = @ptrCast(@alignCast(it.ctx));
-    const lua_ref: c_int = @intCast(@intFromPtr(it.callback_ctx));
-    const L = engine.lua_state orelse return;
-
-    for (it.entities()) |entity| {
-        lc.lua_rawgeti(L, lc.LUA_REGISTRYINDEX, lua_ref);
-        lc.lua_pushnumber(L, it.delta_time);
-        lc.lua_pushinteger(L, @intCast(entity));
-        if (lc.lua_pcall(L, 2, 0, 0) != 0) {
-            const err = lc.lua_tolstring(L, -1, null);
-            std.debug.print("Lua system error: {s}\n", .{err});
-            lc.lua_pop(L, 1);
-            ecs.enable(engine.world, it.system, false);
-            return;
-        }
-    }
 }
 
 /// Build a flecs query from slices of include/exclude component IDs.
@@ -500,19 +454,11 @@ pub const Engine = struct {
     current_frame: u64 = 0,
     stats: FrameStats = .{},
 
-    // Live queries (persistent entity sets, managed by lua_api)
-    live_queries: [lua_api.max_live_queries]lua_api.LiveQuery = .{lua_api.LiveQuery{}} ** lua_api.max_live_queries,
-    live_query_count: u32 = 0,
-
-    // Lua system entity IDs (for cleanup on scene reset)
-    lua_system_entities: [max_lua_systems]ecs.entity_t = .{0} ** max_lua_systems,
-    lua_system_count: u32 = 0,
-
-    // Lua
-    lua_state: ?*lc.lua_State = null,
-
     // Debug server (HTTP API for external tools)
     dbg_server: debug_server.DebugServer = .{},
+
+    // Lua systems (optional per-system LuaJIT VMs with hot-reload)
+    lua_sys: lua_systems.LuaSystemManager = .{},
 
     // State
     headless: bool = false,
@@ -526,7 +472,7 @@ pub const Engine = struct {
 
     // ---- Lifecycle ----
 
-    /// Initialize the engine: ECS, Lua, GPU device, pipeline, built-in resources.
+    /// Initialize the engine: ECS, GPU device, pipeline, built-in resources.
     /// Must be called on a pointer-stable location (e.g. `var engine: Engine = undefined;`).
     pub fn init(self: *Engine, config: Config) !void {
         const world = ecs.init();
@@ -539,7 +485,7 @@ pub const Engine = struct {
 
         // Register all component types with flecs (required before use),
         // then register their struct metadata for the Explorer's reflection UI.
-        inline for (lua_api.componentTypes()) |T| {
+        inline for (components.all) |T| {
             if (@sizeOf(T) == 0) {
                 ecs.TAG(world, T);
             } else {
@@ -548,19 +494,8 @@ pub const Engine = struct {
             }
         }
 
-        // Lua
-        const L = lc.luaL_newstate() orelse return error.LuaInitFailed;
-        self.lua_state = L;
-        errdefer {
-            lc.lua_close(L);
-            self.lua_state = null;
-        }
-        lc.luaL_openlibs(L);
-        lua_api.registerLuaApi(self);
-
         if (!config.headless) {
             try self.initGpu(config);
-            lua_api.publishHandlesToLua(self);
 
             // Enable flecs REST API for the Explorer debug UI.
             // Connect at https://www.flecs.dev/explorer to inspect entities,
@@ -572,14 +507,11 @@ pub const Engine = struct {
         }
     }
 
-    /// Release all GPU resources, Lua state, and ECS storage.
+    /// Release all GPU resources and ECS storage.
     pub fn deinit(self: *Engine) void {
-        for (self.live_queries[0..self.live_query_count]) |*lq| lq.deinit();
-
+        self.lua_sys.deinit();
         self.dbg_server.stop();
         physics.deinitPhysics(self);
-
-        if (self.lua_state) |L| lc.lua_close(L);
 
         // Skip ecs_fini in non-headless mode. The flecs REST server keeps
         // internal iterators alive between frames, and ecs_fini asserts on
@@ -625,29 +557,7 @@ pub const Engine = struct {
         }
     }
 
-    /// Load and execute a Lua script file. Sets the Lua package path to the
-    /// script's directory so that `require("scenes.foo")` resolves relative to it.
-    pub fn loadScript(self: *Engine, path: [*:0]const u8) !void {
-        const L = self.lua_state.?;
-
-        // Extract directory from the script path and prepend to package.path
-        const path_slice = std.mem.span(path);
-        if (std.mem.lastIndexOfScalar(u8, path_slice, '/')) |sep| {
-            const dir = path_slice[0..sep];
-            var buf: [512]u8 = undefined;
-            const lua_code = std.fmt.bufPrint(buf[0..511], "package.path = '{s}/?.lua;' .. package.path", .{dir}) catch return;
-            buf[lua_code.len] = 0;
-            _ = lc.luaL_dostring(L, @as([*:0]const u8, @ptrCast(lua_code.ptr)));
-        }
-
-        if (lc.luaL_loadfile(L, path) != 0 or lc.lua_pcall(L, 0, 0, 0) != 0) {
-            const err = lc.lua_tolstring(L, -1, null);
-            std.debug.print("Lua error: {s}\n", .{err});
-            return error.LuaLoadFailed;
-        }
-    }
-
-    /// Enter the main loop: polls events, runs Lua systems, renders. Returns on quit.
+    /// Enter the main loop: polls events, runs systems, renders. Returns on quit.
     pub fn run(self: *Engine) !void {
         const device = self.gpu_device orelse return error.NotInitialized;
 
@@ -689,12 +599,15 @@ pub const Engine = struct {
             c.igNewFrame();
 
             // Run all systems via the flecs pipeline scheduler.
-            // This ticks both game systems (age, physics, fly_camera, lua)
+            // This ticks game systems (age, physics, fly_camera, user systems)
             // and internal flecs modules (REST API, stats).
             _ = ecs.progress(self.world, dt);
 
             // Process debug server requests (after systems, before rendering)
             self.dbg_server.drainRequests();
+
+            // Check for Lua system hot-reload (mtime polling)
+            self.lua_sys.checkHotReload();
 
             // Physics stats
             if (self.physics.system) |phys_sys| {
@@ -976,6 +889,9 @@ pub const Engine = struct {
             return error.ClaimWindowFailed;
         }
 
+        // Enable vsync to avoid burning CPU/GPU at uncapped frame rates.
+        _ = c.SDL_SetGPUSwapchainParameters(self.gpu_device.?, self.sdl_window, c.SDL_GPU_SWAPCHAINCOMPOSITION_SDR, c.SDL_GPU_PRESENTMODE_VSYNC);
+
         // Default sampler (linear filtering, repeat wrap)
         self.assets.default_sampler = c.SDL_CreateGPUSampler(self.gpu_device.?, &c.SDL_GPUSamplerCreateInfo{
             .min_filter = c.SDL_GPU_FILTER_LINEAR,
@@ -1246,7 +1162,7 @@ pub const Engine = struct {
     // ---- Mesh API ----
 
     /// Upload vertex (and optional index) data to the GPU. Returns a mesh handle.
-    /// Pass a name for built-in meshes (accessible via `lunatic.mesh.*` in Lua), or null.
+    /// Pass a name for built-in meshes (used for name-based lookup), or null.
     pub fn createMesh(self: *Engine, name: ?[*:0]const u8, vertices: []const Vertex, indices: ?[]const u32) !u32 {
         const device = self.gpu_device orelse return error.NotInitialized;
         const vcount: u32 = @intCast(vertices.len);
@@ -1332,7 +1248,7 @@ pub const Engine = struct {
         return self.createNamedMaterial(null, data);
     }
 
-    /// Create a material with an optional name (accessible via `lunatic.material.*` in Lua).
+    /// Create a material with an optional name (used for name-based lookup).
     pub fn createNamedMaterial(self: *Engine, name: ?[*:0]const u8, data: MaterialData) !u32 {
         // First try to reuse a freed slot
         for (0..self.assets.material_count) |i| {
@@ -1361,26 +1277,6 @@ pub const Engine = struct {
     /// Look up a named material by string. Returns the handle or null.
     pub fn findMaterial(self: *Engine, name: [*:0]const u8) ?u32 {
         return self.assets.findMaterial(name);
-    }
-
-    /// Resolve a Lua argument to an asset handle ID. Accepts either a numeric ID
-    /// or a string name (e.g. "cube", "default") that gets looked up in the registry.
-    pub fn resolveHandle(self: *Engine, L: ?*lc.lua_State, idx: c_int, kind: HandleKind) u32 {
-        if (lc.lua_type(L, idx) == lc.LUA_TNUMBER) {
-            return @intCast(lc.lua_tointeger(L, idx));
-        }
-        const name = lc.luaL_checklstring(L, idx, null);
-        const id = switch (kind) {
-            .mesh => self.assets.findMesh(name),
-            .material => self.assets.findMaterial(name),
-        };
-        if (id) |found| return found;
-        const label = switch (kind) {
-            .mesh => "unknown mesh: %s",
-            .material => "unknown material: %s",
-        };
-        _ = lc.luaL_error(L, label, name);
-        unreachable;
     }
 
     fn createDummyTexture(self: *Engine, pixel: *const [4]u8) !*c.SDL_GPUTexture {
@@ -1632,8 +1528,6 @@ pub const Engine = struct {
         }
     }
 
-    // ---- Lua systems ----
-
     // ---- Input API ----
 
     /// Get relative mouse movement since the last call. Requires mouse grab to be enabled.
@@ -1691,61 +1585,16 @@ pub const Engine = struct {
         _ = ecs.SYSTEM(self.world, name, &desc);
     }
 
-    /// Register a Lua system as its own flecs pipeline system.
-    /// `multi_threaded=false` because LuaJIT is single-threaded.
-    /// `immediate=true` because Lua systems read-after-write (e.g. add
-    /// position then immediately call physics_add_sphere which reads it).
-    pub fn addLuaSystem(self: *Engine, name: [*:0]const u8, lua_ref: c_int, phase: ecs.entity_t) ecs.entity_t {
-        if (self.lua_system_count >= max_lua_systems) return 0;
-        var desc = std.mem.zeroes(ecs.system_desc_t);
-        desc.callback = &luaSystemCallback;
-        desc.ctx = self;
-        desc.callback_ctx = @ptrFromInt(@as(usize, @intCast(lua_ref)));
-        desc.phase = phase;
-        desc.immediate = true;
-        desc.multi_threaded = false;
-        const entity = ecs.SYSTEM(self.world, name, &desc);
-        self.lua_system_entities[self.lua_system_count] = entity;
-        self.lua_system_count += 1;
-        return entity;
+    /// Scan a directory for .lua files and auto-register each as a Lua system.
+    /// Each .lua file must declare a `terms` table and a `system()` function.
+    /// Component names are resolved automatically from the engine's component registry.
+    pub fn loadLuaSystems(self: *Engine, dir_path: []const u8) void {
+        self.lua_sys.scanDirectory(self, dir_path);
     }
 
-    /// Resolve a phase name string to a flecs phase entity.
-    /// Supports: "on_load", "post_load", "pre_update", "on_update" (default),
-    ///           "post_update", "pre_store", "on_store".
-    pub fn resolvePhase(phase_name: ?[]const u8) ecs.entity_t {
-        const name = phase_name orelse return ecs.OnUpdate;
-        if (std.mem.eql(u8, name, "on_load")) return ecs.OnLoad;
-        if (std.mem.eql(u8, name, "post_load")) return ecs.PostLoad;
-        if (std.mem.eql(u8, name, "pre_update")) return ecs.PreUpdate;
-        if (std.mem.eql(u8, name, "on_update")) return ecs.OnUpdate;
-        if (std.mem.eql(u8, name, "post_update")) return ecs.PostUpdate;
-        if (std.mem.eql(u8, name, "pre_store")) return ecs.PreStore;
-        if (std.mem.eql(u8, name, "on_store")) return ecs.OnStore;
-        return ecs.OnUpdate; // fallback
-    }
-
-    /// Register a query-driven Lua system. The system has proper flecs query
-    /// terms so the scheduler knows its data dependencies. The Lua callback
-    /// is called with (dt, entity) for each matching entity.
-    pub fn addLuaQuerySystem(self: *Engine, name: [*:0]const u8, lua_ref: c_int, phase: ecs.entity_t, comp_ids: []const ecs.id_t) ecs.entity_t {
-        if (self.lua_system_count >= max_lua_systems) return 0;
-        var desc = std.mem.zeroes(ecs.system_desc_t);
-        desc.callback = &luaQuerySystemCallback;
-        desc.ctx = self;
-        desc.callback_ctx = @ptrFromInt(@as(usize, @intCast(lua_ref)));
-        desc.phase = phase;
-        desc.multi_threaded = false;
-        // Set query terms from component IDs
-        for (comp_ids, 0..) |comp_id, i| {
-            if (i >= ecs.ECS_MEMBER_DESC_CACHE_SIZE) break;
-            desc.query.terms[i].id = comp_id;
-            desc.query.terms[i].inout = .InOut;
-        }
-        const entity = ecs.SYSTEM(self.world, name, &desc);
-        self.lua_system_entities[self.lua_system_count] = entity;
-        self.lua_system_count += 1;
-        return entity;
+    /// Register a Lua system with explicit terms (manual API).
+    pub fn addLuaSystem(self: *Engine, desc: lua_systems.LuaSystemDesc) void {
+        self.lua_sys.register(self, desc);
     }
 
     /// Tick all systems via the flecs pipeline.
@@ -1818,25 +1667,6 @@ pub const Engine = struct {
     // ageSystem and flyCameraSystem are now proper flecs systems with query
     // terms (see ageSystemFlecs / flyCameraSystemFlecs at file scope).
 
-    /// Unregister all Lua systems — deletes their flecs system entities
-    /// and frees Lua registry references.
-    pub fn resetLuaSystems(self: *Engine) void {
-        const L = self.lua_state;
-        for (self.lua_system_entities[0..self.lua_system_count]) |entity| {
-            if (entity != 0) {
-                // Recover lua_ref from the system to unref it
-                if (L) |state| {
-                    // The lua_ref was stored as callback_ctx; we can't easily
-                    // recover it from a deleted entity, so just delete the entity.
-                    // Lua refs will be cleaned up when the Lua state is closed.
-                    _ = state;
-                }
-                ecs.delete(self.world, entity);
-            }
-        }
-        self.lua_system_count = 0;
-        self.lua_system_entities = .{0} ** max_lua_systems;
-    }
 };
 
 // ============================================================

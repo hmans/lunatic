@@ -6,7 +6,7 @@ A highly experimental toy 3D game engine designed for agentic engineering.
 
 - Core engine written in Zig
 - Fully ECS-driven architecture
-- Games can be authored in Zig, hot-reloadable Lua, or a mix of both
+- Games are authored in pure Zig — one language, one type system, one debugger
 - Builds on top of SDL3 for windowing, input, rendering, and more
 - 3D physics simulation powered by [Jolt Physics](https://github.com/jrouwe/JoltPhysics)
 - Built-in HTTP API and MCP server for agentic control and debugging

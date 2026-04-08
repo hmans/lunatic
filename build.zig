@@ -150,7 +150,6 @@ const EngineModules = struct {
     engine: *std.Build.Module,
     renderer: *std.Build.Module,
     postprocess: *std.Build.Module,
-    lua: *std.Build.Module,
     joltc: *std.Build.Step.Compile,
     flecs: *std.Build.Step.Compile,
 };
@@ -166,14 +165,6 @@ fn buildEngineModules(
     const ecs_mod = zflecs_dep.module("root");
     const zphysics_mod = zphysics_dep.module("root");
     const vendor_path = b.path("engine/vendor");
-
-    const lua_mod = b.createModule(.{
-        .root_source_file = b.path("engine/src/lua.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    addCIncludes(b, lua_mod, vendor_path);
 
     const core_components_mod = b.createModule(.{
         .root_source_file = b.path("engine/src/core_components.zig"),
@@ -210,7 +201,7 @@ fn buildEngineModules(
         .imports = &.{
             .{ .name = "zflecs", .module = ecs_mod },
             .{ .name = "core_components", .module = core_components_mod },
-            .{ .name = "lua", .module = lua_mod },
+            .{ .name = "components", .module = components_mod },
             .{ .name = "geometry", .module = geometry_mod },
             .{ .name = "math3d", .module = math3d_mod },
         },
@@ -228,33 +219,6 @@ fn buildEngineModules(
             .{ .name = "engine", .module = engine_mod },
             .{ .name = "geometry", .module = geometry_mod },
             .{ .name = "math3d", .module = math3d_mod },
-        },
-    });
-
-    const component_ops_mod = b.createModule(.{
-        .root_source_file = b.path("engine/src/component_ops.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "zflecs", .module = ecs_mod },
-            .{ .name = "engine", .module = engine_mod },
-            .{ .name = "lua", .module = lua_mod },
-        },
-    });
-    addCIncludes(b, component_ops_mod, vendor_path);
-
-    const lua_api_mod = b.createModule(.{
-        .root_source_file = b.path("engine/src/lua_api.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "zflecs", .module = ecs_mod },
-            .{ .name = "components", .module = components_mod },
-            .{ .name = "component_ops", .module = component_ops_mod },
-            .{ .name = "engine", .module = engine_mod },
-            .{ .name = "lua", .module = lua_mod },
         },
     });
 
@@ -299,23 +263,42 @@ fn buildEngineModules(
         .link_libc = true,
         .imports = &.{
             .{ .name = "engine", .module = engine_mod },
-            .{ .name = "lua", .module = lua_mod },
         },
     });
+
+    const lua_mod = b.createModule(.{
+        .root_source_file = b.path("engine/src/lua.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addCIncludes(b, lua_mod, vendor_path);
+
+    const lua_systems_mod = b.createModule(.{
+        .root_source_file = b.path("engine/src/lua_systems.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zflecs", .module = ecs_mod },
+            .{ .name = "lua", .module = lua_mod },
+            .{ .name = "engine", .module = engine_mod },
+        },
+    });
+    addCIncludes(b, lua_systems_mod, vendor_path);
 
     // Wire cross-module deps
     engine_mod.addImport("renderer", renderer_mod);
     engine_mod.addImport("postprocess", postprocess_mod);
     engine_mod.addImport("physics", physics_mod);
-    engine_mod.addImport("lua_api", lua_api_mod);
     engine_mod.addImport("gltf", gltf_mod);
     engine_mod.addImport("debug_server", debug_server_mod);
+    engine_mod.addImport("lua_systems", lua_systems_mod);
 
     return .{
         .engine = engine_mod,
         .renderer = renderer_mod,
         .postprocess = postprocess_mod,
-        .lua = lua_mod,
         .joltc = zphysics_dep.artifact("joltc"),
         .flecs = zflecs_dep.artifact("flecs"),
     };
@@ -374,6 +357,26 @@ pub fn build(b: *std.Build) void {
     const examples_mods = buildEngineModules(b, target, optimize, zflecs_dep, zphysics_dep, "examples/components.zig");
     addShaders(b, examples_mods.renderer, examples_mods.postprocess);
 
+    // Scene modules (each imports "engine" for ECS access)
+    const scene_names = [_]struct { name: []const u8, path: []const u8 }{
+        .{ .name = "scene_physics_rain", .path = "examples/scenes/physics_rain.zig" },
+        .{ .name = "scene_lighting_gallery", .path = "examples/scenes/lighting_gallery.zig" },
+        .{ .name = "scene_material_showcase", .path = "examples/scenes/material_showcase.zig" },
+    };
+    var scene_imports: [scene_names.len + 1]std.Build.Module.Import = undefined;
+    scene_imports[0] = .{ .name = "engine", .module = examples_mods.engine };
+    for (scene_names, 0..) |s, i| {
+        const scene_mod = b.createModule(.{
+            .root_source_file = b.path(s.path),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "engine", .module = examples_mods.engine },
+            },
+        });
+        scene_imports[i + 1] = .{ .name = s.name, .module = scene_mod };
+    }
+
     const examples_exe = b.addExecutable(.{
         .name = "lunatic-examples",
         .root_module = b.createModule(.{
@@ -381,9 +384,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .imports = &.{
-                .{ .name = "engine", .module = examples_mods.engine },
-            },
+            .imports = &scene_imports,
         }),
     });
     examples_exe.linkLibrary(examples_mods.joltc);
@@ -427,7 +428,6 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .imports = &.{
                 .{ .name = "engine", .module = test_mods.engine },
-                .{ .name = "lua", .module = test_mods.lua },
             },
         }),
     });

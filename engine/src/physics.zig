@@ -133,6 +133,57 @@ pub fn getBodyInterface(self: *Engine) *zp.BodyInterface {
     return self.physics.system.?.getBodyInterfaceMut();
 }
 
+/// Optimize the broad phase after bulk-adding static bodies.
+pub fn optimizeBroadPhase(self: *Engine) void {
+    if (self.physics.system) |sys| sys.optimizeBroadPhase();
+}
+
+/// Add a box-shaped physics body to an entity. Reads Position from ECS.
+/// Half-extents (hx, hy, hz) define the box size. Sets RigidBody component.
+pub fn addPhysicsBox(self: *Engine, entity: ecs.entity_t, hx: f32, hy: f32, hz: f32, motion: MotionType, restitution: f32, friction: f32) void {
+    const pos = ecs.get(self.world, entity, core.Position) orelse return;
+    const shape_settings = BoxShapeSettings.create(.{ hx, hy, hz }) catch return;
+    const shape = shape_settings.asShapeSettings().createShape() catch return;
+    defer shape.release();
+
+    const body_iface = getBodyInterface(self);
+    const body_id = body_iface.createAndAddBody(.{
+        .position = .{ pos.x, pos.y, pos.z, 0 },
+        .shape = shape,
+        .motion_type = motion,
+        .object_layer = if (motion == .static) object_layers.non_moving else object_layers.moving,
+        .restitution = restitution,
+        .friction = friction,
+        .linear_damping = 0.2,
+        .angular_damping = 0.4,
+    }, .activate) catch return;
+
+    _ = ecs.set(self.world, entity, core.RigidBody, core.RigidBody{ .body_id = @intFromEnum(body_id) });
+}
+
+/// Add a sphere-shaped physics body to an entity. Reads Position from ECS.
+/// Sets RigidBody component.
+pub fn addPhysicsSphere(self: *Engine, entity: ecs.entity_t, radius: f32, motion: MotionType, restitution: f32, friction: f32) void {
+    const pos = ecs.get(self.world, entity, core.Position) orelse return;
+    const shape_settings = SphereShapeSettings.create(radius) catch return;
+    const shape = shape_settings.asShapeSettings().createShape() catch return;
+    defer shape.release();
+
+    const body_iface = getBodyInterface(self);
+    const body_id = body_iface.createAndAddBody(.{
+        .position = .{ pos.x, pos.y, pos.z, 0 },
+        .shape = shape,
+        .motion_type = motion,
+        .object_layer = if (motion == .static) object_layers.non_moving else object_layers.moving,
+        .restitution = restitution,
+        .friction = friction,
+        .linear_damping = 0.2,
+        .angular_damping = 0.4,
+    }, .activate) catch return;
+
+    _ = ecs.set(self.world, entity, core.RigidBody, core.RigidBody{ .body_id = @intFromEnum(body_id) });
+}
+
 // ============================================================
 // Built-in physics system
 // ============================================================
