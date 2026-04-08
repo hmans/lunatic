@@ -193,9 +193,12 @@ bool isOccluded(vec3 world_center, float radius) {
     float proj_radius_pixels = (radius / clip.w) * max(hiz_params.x, hiz_params.y) * 0.5;
     float diameter_pixels = proj_radius_pixels * 2.0;
 
-    // Pick mip level: we want the HiZ texel to cover roughly the projected diameter.
-    // Higher mip = coarser = covers more screen area.
-    float mip = ceil(log2(max(diameter_pixels, 1.0)));
+    // Pick mip level: we want the HiZ texel to cover at least the projected diameter.
+    // Higher mip = coarser = covers more screen area. We add +1 to use one level
+    // coarser than strictly necessary — this ensures the HiZ region fully contains
+    // the projected sphere even with slight camera movement between frames (the
+    // 1-frame latency means the projection is based on the previous frame's VP).
+    float mip = ceil(log2(max(diameter_pixels, 1.0))) + 1.0;
     mip = clamp(mip, 0.0, hiz_params.z);
 
     // Sample HiZ at the center of the projected sphere.
@@ -203,9 +206,11 @@ bool isOccluded(vec3 world_center, float radius) {
     float hiz_depth = textureLod(hiz_texture, uv, mip).r;
 
     // Entity is occluded if its nearest point is farther than the max depth
-    // stored in the HiZ region (with a small safety margin to prevent popping
-    // at depth boundaries due to the 1-frame latency).
-    return entity_nearest_depth > hiz_depth * 1.05;
+    // stored in the HiZ region. The 1.2x safety margin accounts for the
+    // 1-frame latency between depth capture and occlusion test — camera
+    // movement can shift what's behind an entity between frames, so we
+    // require a significant depth margin before culling.
+    return entity_nearest_depth > hiz_depth * 1.2;
 }
 
 void main() {

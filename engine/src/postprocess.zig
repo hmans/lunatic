@@ -40,6 +40,10 @@ const ssr_composite_frag_spv = @embedFile("shader_ssr_composite_frag_spv");
 const ssr_composite_frag_msl = @embedFile("shader_ssr_composite_frag_msl");
 const ssr_resolve_frag_spv = @embedFile("shader_ssr_resolve_frag_spv");
 const ssr_resolve_frag_msl = @embedFile("shader_ssr_resolve_frag_msl");
+const fog_integrate_frag_spv = @embedFile("shader_fog_integrate_frag_spv");
+const fog_integrate_frag_msl = @embedFile("shader_fog_integrate_frag_msl");
+const fog_blur_frag_spv = @embedFile("shader_fog_blur_frag_spv");
+const fog_blur_frag_msl = @embedFile("shader_fog_blur_frag_msl");
 
 // ============================================================
 // Uniform structs (must match GLSL layouts)
@@ -96,6 +100,36 @@ pub const max_hiz_levels: u32 = 12;
 
 const HizDownsampleParams = extern struct {
     params: [4]f32, // .xy = texel size of source, .z = is_first_pass (1.0 = read alpha), .w = unused
+};
+
+// Volumetric fog froxel grid dimensions
+pub const fog_froxel_w: u32 = 160;
+pub const fog_froxel_h: u32 = 90;
+pub const fog_froxel_d: u32 = 64;
+pub const fog_froxel_count: u32 = fog_froxel_w * fog_froxel_h * fog_froxel_d;
+
+/// Uniforms for the fog injection compute shader. Must match FogUniforms in fog_inject.comp.
+const FogInjectUniforms = extern struct {
+    inv_vp: [4][4]f32,
+    vp: [4][4]f32, // current frame VP for screen-space shadow projection
+    camera_pos: [4]f32,
+    light_dir: [4]f32,
+    light_color: [4]f32,
+    fog_params: [4]f32, // density, height_falloff, height_offset, anisotropy
+    fog_albedo: [4]f32, // rgb = albedo, w = scattering_coeff
+    volume_params: [4]f32, // froxel_w, froxel_h, depth_slices, near
+    depth_params: [4]f32, // far, unused, num_lights, unused
+    shadow_light_vp: [4][4][4]f32,
+    cascade_splits: [4]f32,
+    shadow_params: [4]f32,
+    ambient: [4]f32,
+    fog_shadow_params: [4]f32, // x = shadow steps, y = shadow softness
+};
+
+/// Uniforms for the fog integration fragment shader.
+const FogIntegrateParams = extern struct {
+    volume_params: [4]f32, // froxel_w, froxel_h, depth_slices, near
+    depth_params: [4]f32, // far, unused, unused, unused
 };
 
 /// Uniforms for the SSR temporal resolve shader. Must match ResolveParams in ssr_resolve.frag.
@@ -184,6 +218,14 @@ pub const PostProcessState = struct {
     hiz_sampler: ?*c.SDL_GPUSampler = null, // NEAREST filter (no depth averaging)
 
     // Screen-Space Reflections (SSR)
+    // Volumetric fog
+    fog_froxel_texture: ?*c.SDL_GPUTexture = null, // 2D RGBA16F (W*H wide, D tall): compute writes, fragment samples
+    fog_texture: ?*c.SDL_GPUTexture = null, // 2D RGBA16F integration result (full screen res)
+    fog_texture_blurred: ?*c.SDL_GPUTexture = null, // 2D RGBA16F bilateral blur output
+    fog_dummy_texture: ?*c.SDL_GPUTexture = null, // 1x1 (0,0,0,1) for when fog is disabled
+    fog_integrate_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    fog_blur_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+
     ssr_texture: ?*c.SDL_GPUTexture = null, // RGBA16F, full res — current frame raw SSR trace
     ssr_history: ?*c.SDL_GPUTexture = null, // RGBA16F, full res — previous frame's resolved SSR
     ssr_resolved: ?*c.SDL_GPUTexture = null, // RGBA16F, full res — temporal resolve output
@@ -225,6 +267,42 @@ pub const CameraPostSettings = struct {
 // ============================================================
 // Shader helper
 // ============================================================
+
+fn createShaderEx(device: *c.SDL_GPUDevice, spv: []const u8, msl: []const u8, stage: c.SDL_GPUShaderStage, num_uniform_buffers: u32, num_samplers: u32, num_storage_buffers: u32) ?*c.SDL_GPUShader {
+    const formats = c.SDL_GetGPUShaderFormats(device);
+
+    var code: [*]const u8 = undefined;
+    var code_size: usize = undefined;
+    var format: c.SDL_GPUShaderFormat = undefined;
+    var entrypoint: [*:0]const u8 = undefined;
+
+    if (formats & c.SDL_GPU_SHADERFORMAT_SPIRV != 0) {
+        code = spv.ptr;
+        code_size = spv.len;
+        format = c.SDL_GPU_SHADERFORMAT_SPIRV;
+        entrypoint = "main";
+    } else if (formats & c.SDL_GPU_SHADERFORMAT_MSL != 0) {
+        code = msl.ptr;
+        code_size = msl.len;
+        format = c.SDL_GPU_SHADERFORMAT_MSL;
+        entrypoint = "main0";
+    } else {
+        return null;
+    }
+
+    return c.SDL_CreateGPUShader(device, &c.SDL_GPUShaderCreateInfo{
+        .code_size = code_size,
+        .code = code,
+        .entrypoint = entrypoint,
+        .format = format,
+        .stage = stage,
+        .num_samplers = num_samplers,
+        .num_storage_textures = 0,
+        .num_storage_buffers = num_storage_buffers,
+        .num_uniform_buffers = num_uniform_buffers,
+        .props = 0,
+    });
+}
 
 fn createShader(device: *c.SDL_GPUDevice, spv: []const u8, msl: []const u8, stage: c.SDL_GPUShaderStage, num_uniform_buffers: u32, num_samplers: u32) ?*c.SDL_GPUShader {
     const formats = c.SDL_GetGPUShaderFormats(device);
@@ -283,6 +361,69 @@ fn createRenderTexture(device: *c.SDL_GPUDevice, format: c.SDL_GPUTextureFormat,
 // ============================================================
 // Pipeline creation
 // ============================================================
+
+fn createPostProcessPipelineEx(
+    device: *c.SDL_GPUDevice,
+    frag_spv: []const u8,
+    frag_msl: []const u8,
+    target_format: c.SDL_GPUTextureFormat,
+    num_frag_uniforms: u32,
+    num_frag_samplers: u32,
+    num_frag_storage_bufs: u32,
+) ?*c.SDL_GPUGraphicsPipeline {
+    const vert_shader = createShader(device, fullscreen_vert_spv, fullscreen_vert_msl, c.SDL_GPU_SHADERSTAGE_VERTEX, 0, 0) orelse return null;
+    defer c.SDL_ReleaseGPUShader(device, vert_shader);
+
+    const frag_shader = createShaderEx(device, frag_spv, frag_msl, c.SDL_GPU_SHADERSTAGE_FRAGMENT, num_frag_uniforms, num_frag_samplers, num_frag_storage_bufs) orelse return null;
+    defer c.SDL_ReleaseGPUShader(device, frag_shader);
+
+    const color_target_desc = [_]c.SDL_GPUColorTargetDescription{
+        .{ .format = target_format, .blend_state = std.mem.zeroes(c.SDL_GPUColorTargetBlendState) },
+    };
+
+    return c.SDL_CreateGPUGraphicsPipeline(device, &c.SDL_GPUGraphicsPipelineCreateInfo{
+        .vertex_shader = vert_shader,
+        .fragment_shader = frag_shader,
+        .vertex_input_state = .{
+            .vertex_buffer_descriptions = null,
+            .num_vertex_buffers = 0,
+            .vertex_attributes = null,
+            .num_vertex_attributes = 0,
+        },
+        .primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+        .rasterizer_state = .{
+            .fill_mode = c.SDL_GPU_FILLMODE_FILL,
+            .cull_mode = c.SDL_GPU_CULLMODE_NONE,
+            .front_face = c.SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE,
+            .depth_bias_constant_factor = 0,
+            .depth_bias_clamp = 0,
+            .depth_bias_slope_factor = 0,
+            .enable_depth_bias = false,
+            .enable_depth_clip = false,
+            .padding1 = 0,
+            .padding2 = 0,
+        },
+        .multisample_state = .{
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .sample_mask = 0,
+            .enable_mask = false,
+            .enable_alpha_to_coverage = false,
+            .padding2 = 0,
+            .padding3 = 0,
+        },
+        .depth_stencil_state = std.mem.zeroes(c.SDL_GPUDepthStencilState),
+        .target_info = .{
+            .color_target_descriptions = &color_target_desc,
+            .num_color_targets = 1,
+            .depth_stencil_format = c.SDL_GPU_TEXTUREFORMAT_INVALID,
+            .has_depth_stencil_target = false,
+            .padding1 = 0,
+            .padding2 = 0,
+            .padding3 = 0,
+        },
+        .props = 0,
+    });
+}
 
 fn createPostProcessPipeline(
     device: *c.SDL_GPUDevice,
@@ -475,7 +616,7 @@ pub fn initPostProcess(self: *Engine) !void {
         composite_frag_msl,
         self.swapchain_format,
         1,
-        4, // hdr_scene, bloom_tex, flare_tex, dirt_tex
+        5, // hdr_scene, bloom_tex, flare_tex, dirt_tex, fog_tex
     ) orelse return error.PipelineFailed;
 
     self.postprocess.flare_pipeline = createPostProcessPipeline(
@@ -519,6 +660,75 @@ pub fn initPostProcess(self: *Engine) !void {
         device, dof_tent_frag_spv, dof_tent_frag_msl,
         hdr_format, 1, 1,
     ) orelse return error.PipelineFailed;
+
+    // Fog integration pipeline: reads froxel texture + scene depth, outputs 2D fog texture
+    self.postprocess.fog_integrate_pipeline = createPostProcessPipeline(
+        device,
+        fog_integrate_frag_spv,
+        fog_integrate_frag_msl,
+        hdr_format,
+        1, // uniforms (volume_params + depth_params)
+        2, // samplers (froxel_tex, scene_tex)
+    ) orelse return error.PipelineFailed;
+
+    // Fog bilateral blur pipeline: smooths froxel grid artifacts
+    self.postprocess.fog_blur_pipeline = createPostProcessPipeline(
+        device,
+        fog_blur_frag_spv,
+        fog_blur_frag_msl,
+        hdr_format,
+        1, // uniforms (texel_size)
+        2, // samplers (fog_tex, scene_tex)
+    ) orelse return error.PipelineFailed;
+
+    // Fog dummy texture (1x1, transmittance=1.0, scatter=0.0 — used when fog is off)
+    self.postprocess.fog_dummy_texture = c.SDL_CreateGPUTexture(device, &c.SDL_GPUTextureCreateInfo{
+        .type = c.SDL_GPU_TEXTURETYPE_2D,
+        .format = hdr_format,
+        .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = 1,
+        .height = 1,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+        .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+        .props = 0,
+    }) orelse return error.TextureFailed;
+    // Clear to (0,0,0,1) = no scatter, full transmittance
+    {
+        const color_target = c.SDL_GPUColorTargetInfo{
+            .texture = self.postprocess.fog_dummy_texture.?,
+            .mip_level = 0,
+            .layer_or_depth_plane = 0,
+            .clear_color = .{ .r = 0, .g = 0, .b = 0, .a = 1 },
+            .load_op = c.SDL_GPU_LOADOP_CLEAR,
+            .store_op = c.SDL_GPU_STOREOP_STORE,
+            .resolve_texture = null,
+            .resolve_mip_level = 0,
+            .resolve_layer = 0,
+            .cycle = false,
+            .cycle_resolve_texture = false,
+            .padding1 = 0,
+            .padding2 = 0,
+        };
+        const dummy_cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse return error.CommandBufferFailed;
+        const pass = c.SDL_BeginGPURenderPass(dummy_cmd, &color_target, 1, null) orelse return error.RenderPassFailed;
+        c.SDL_EndGPURenderPass(pass);
+        _ = c.SDL_SubmitGPUCommandBuffer(dummy_cmd);
+    }
+
+    // Froxel 2D texture: width = W*H, height = D. Each row = one depth slice.
+    // Compute writes via imageStore, integration shader reads via sampler.
+    self.postprocess.fog_froxel_texture = c.SDL_CreateGPUTexture(device, &c.SDL_GPUTextureCreateInfo{
+        .type = c.SDL_GPU_TEXTURETYPE_2D,
+        .format = hdr_format,
+        .usage = c.SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = fog_froxel_w * fog_froxel_h,
+        .height = fog_froxel_d,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+        .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+        .props = 0,
+    }) orelse return error.TextureFailed;
 
     // SSR ray-march pipeline: reads scene HDR + HiZ pyramid, outputs reflection color + confidence
     self.postprocess.ssr_pipeline = createPostProcessPipeline(
@@ -636,6 +846,12 @@ pub fn ensureTextures(self: *Engine, w: u32, h: u32) !void {
         pp.flare_texture = null;
     }
 
+    // Fog integration texture + blur target (full screen resolution)
+    if (pp.fog_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
+    pp.fog_texture = createRenderTexture(device, hdr_format, w, h) orelse return error.TextureFailed;
+    if (pp.fog_texture_blurred) |t| c.SDL_ReleaseGPUTexture(device, t);
+    pp.fog_texture_blurred = createRenderTexture(device, hdr_format, w, h) orelse return error.TextureFailed;
+
     // SSR textures (full resolution, RGBA16F)
     if (pp.ssr_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
     if (pp.ssr_history) |t| c.SDL_ReleaseGPUTexture(device, t);
@@ -713,6 +929,13 @@ pub fn deinitPostProcess(self: *Engine) void {
     if (pp.dof_composite_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.dof_tent_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.sampler) |s| c.SDL_ReleaseGPUSampler(device, s);
+    // Fog cleanup
+    if (pp.fog_froxel_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.fog_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.fog_texture_blurred) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.fog_dummy_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.fog_integrate_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+    if (pp.fog_blur_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     // SSR cleanup
     if (pp.ssr_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
     if (pp.ssr_history) |t| c.SDL_ReleaseGPUTexture(device, t);
@@ -854,6 +1077,131 @@ pub fn buildHiZPyramid(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, w: u32, h: u
         );
     }
     c.SDL_EndGPUCopyPass(copy_pass);
+}
+
+// ============================================================
+// Volumetric fog dispatch
+// ============================================================
+
+/// Dispatch the volumetric fog compute + integration passes.
+/// Called after the scene render pass (needs shadow atlas) and before post-processing.
+pub const FogShadowData = struct {
+    light_vp: [4][4][4]f32,
+    cascade_splits: [4]f32,
+    shadow_params: [4]f32,
+};
+
+pub fn dispatchVolumetricFog(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, vp_mat: [4][4]f32, inv_vp_mat: [4][4]f32, cam_pos: [4]f32, cam_near: f32, cam_far: f32, sw_w: u32, sw_h: u32, shadow_data: FogShadowData) void {
+    const pp = &self.postprocess;
+    const inject_pipeline = self.fog_inject_pipeline orelse return;
+    const froxel_tex = pp.fog_froxel_texture orelse return;
+    const fog_tex = pp.fog_texture orelse return;
+    const light_buf = self.cluster_light_buffer orelse return;
+    const hdr_tex = pp.hdr_texture orelse return;
+    const c_ = engine_mod.c;
+
+    // --- Compute pass: fog injection (writes to froxel 2D texture via imageStore) ---
+    const rw_tex_bindings = [1]c_.SDL_GPUStorageTextureReadWriteBinding{
+        .{ .texture = froxel_tex, .mip_level = 0, .layer = 0, .cycle = true, .padding1 = 0, .padding2 = 0, .padding3 = 0 },
+    };
+    const compute_pass = c_.SDL_BeginGPUComputePass(cmd, &rw_tex_bindings, 1, null, 0) orelse return;
+    c_.SDL_BindGPUComputePipeline(compute_pass, inject_pipeline);
+
+    // Bind readonly: light buffer
+    const ro_bufs = [1]*c_.SDL_GPUBuffer{light_buf};
+    c_.SDL_BindGPUComputeStorageBuffers(compute_pass, 0, &ro_bufs, 1);
+
+    // Bind samplers: shadow atlas (set 3, binding 0) + scene depth (set 3, binding 1).
+    // Scene depth (HDR alpha) enables screen-space shadow testing for point/spot lights.
+    if (self.shadow_atlas) |atlas| {
+        if (self.shadow_sampler) |samp| {
+            const sampler = pp.sampler orelse return; // LINEAR sampler for scene depth
+            const tex_samplers = [2]c_.SDL_GPUTextureSamplerBinding{
+                .{ .texture = atlas, .sampler = samp },
+                .{ .texture = hdr_tex, .sampler = sampler },
+            };
+            c_.SDL_BindGPUComputeSamplers(compute_pass, 0, &tex_samplers, 2);
+        }
+    }
+
+    const uniforms = FogInjectUniforms{
+        .inv_vp = inv_vp_mat,
+        .vp = vp_mat,
+        .camera_pos = cam_pos,
+        .light_dir = .{ 0.4, 0.8, 0.4, 0 }, // TODO: pass from scene
+        .light_color = .{ 1, 1, 1, 0 }, // TODO: pass from scene
+        .fog_params = .{ self.vol_fog_density, self.vol_fog_height_falloff, self.vol_fog_height_offset, self.vol_fog_anisotropy },
+        .fog_albedo = .{ self.vol_fog_albedo[0], self.vol_fog_albedo[1], self.vol_fog_albedo[2], self.vol_fog_scattering },
+        .volume_params = .{ @floatFromInt(fog_froxel_w), @floatFromInt(fog_froxel_h), @floatFromInt(fog_froxel_d), cam_near },
+        .depth_params = .{ cam_far, 0, @floatFromInt(self.cluster_light_count), 0 },
+        .shadow_light_vp = shadow_data.light_vp,
+        .cascade_splits = shadow_data.cascade_splits,
+        .shadow_params = shadow_data.shadow_params,
+        .ambient = self.ambient_color,
+        .fog_shadow_params = .{ self.vol_fog_shadow_steps, self.vol_fog_shadow_softness, 0, 0 },
+    };
+    c_.SDL_PushGPUComputeUniformData(cmd, 0, &uniforms, @sizeOf(FogInjectUniforms));
+
+    // Dispatch: ceil(W/8) x ceil(H/8) x D
+    c_.SDL_DispatchGPUCompute(compute_pass, (fog_froxel_w + 7) / 8, (fog_froxel_h + 7) / 8, fog_froxel_d);
+    c_.SDL_EndGPUComputePass(compute_pass);
+
+    // --- Fullscreen pass: fog integration ---
+    const sampler = pp.sampler orelse return;
+    const integrate_pipeline = pp.fog_integrate_pipeline orelse return;
+
+    const pass = beginFullscreenPass(cmd, fog_tex) orelse return;
+    setFullscreenViewport(pass, sw_w, sw_h);
+    c_.SDL_BindGPUGraphicsPipeline(pass, integrate_pipeline);
+
+    // Bind froxel texture + scene texture as samplers.
+    // Use LINEAR filtering on the froxel texture — bilinear interpolation between
+    // adjacent froxels smooths out the coarse 160×90 grid instead of showing blocks.
+    const frag_samplers = [2]c_.SDL_GPUTextureSamplerBinding{
+        .{ .texture = froxel_tex, .sampler = sampler }, // LINEAR for smooth interpolation
+        .{ .texture = hdr_tex, .sampler = sampler },
+    };
+    c_.SDL_BindGPUFragmentSamplers(pass, 0, &frag_samplers, 2);
+
+    const froxel_tex_w: f32 = @floatFromInt(fog_froxel_w * fog_froxel_h);
+    const froxel_tex_h: f32 = @floatFromInt(fog_froxel_d);
+
+    // Push integration params
+    const integrate_params = FogIntegrateParams{
+        .volume_params = .{ @floatFromInt(fog_froxel_w), @floatFromInt(fog_froxel_h), @floatFromInt(fog_froxel_d), cam_near },
+        .depth_params = .{ cam_far, froxel_tex_w, froxel_tex_h, @as(f32, @floatFromInt(self.current_frame % 256)) },
+    };
+    c_.SDL_PushGPUFragmentUniformData(cmd, 0, &integrate_params, @sizeOf(FogIntegrateParams));
+
+    drawFullscreenTriangle(pass);
+    c_.SDL_EndGPURenderPass(pass);
+
+    // --- Bilateral blur: smooth froxel grid artifacts ---
+    // The 160×90 froxel XY grid creates visible blocky patterns, especially
+    // around point light halos. A depth-aware bilateral blur smooths these
+    // while preserving sharp fog boundaries at geometry edges.
+    const blur_pipeline = pp.fog_blur_pipeline orelse return;
+    const fog_blurred = pp.fog_texture_blurred orelse return;
+
+    const blur_pass = beginFullscreenPass(cmd, fog_blurred) orelse return;
+    setFullscreenViewport(blur_pass, sw_w, sw_h);
+    c_.SDL_BindGPUGraphicsPipeline(blur_pass, blur_pipeline);
+
+    const blur_samplers = [2]c_.SDL_GPUTextureSamplerBinding{
+        .{ .texture = fog_tex, .sampler = sampler }, // Integrated fog
+        .{ .texture = hdr_tex, .sampler = sampler }, // Scene depth (alpha)
+    };
+    c_.SDL_BindGPUFragmentSamplers(blur_pass, 0, &blur_samplers, 2);
+
+    const blur_params = [4]f32{
+        1.0 / @as(f32, @floatFromInt(sw_w)),
+        1.0 / @as(f32, @floatFromInt(sw_h)),
+        0, 0,
+    };
+    c_.SDL_PushGPUFragmentUniformData(cmd, 0, &blur_params, @sizeOf([4]f32));
+
+    drawFullscreenTriangle(blur_pass);
+    c_.SDL_EndGPURenderPass(blur_pass);
 }
 
 // ============================================================
@@ -1024,7 +1372,7 @@ pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain
                 .{ .texture = pp.dof_bokeh.?, .sampler = sampler },
             };
             c.SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
-            const tent_params = TentParams{ .params = .{ 1.0 / half_wf, 1.0 / half_hf, 0, 0 } };
+            const tent_params = TentParams{ .params = .{ 1.0 / half_wf, 1.0 / half_hf, settings.dof_blur_radius * 0.5, 0 } };
             c.SDL_PushGPUFragmentUniformData(cmd, 0, &tent_params, @sizeOf(TentParams));
             drawFullscreenTriangle(pass);
             c.SDL_EndGPURenderPass(pass);
@@ -1187,13 +1535,16 @@ pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain
         const dirt_tex = pp.lens_dirt_texture orelse pp.hdr_texture.?;
         const dirt_intensity: f32 = if (pp.lens_dirt_texture != null) settings.flare_dirt_intensity else 0;
 
-        const bindings = [4]c.SDL_GPUTextureSamplerBinding{
+        // Fog texture: use the blurred fog result, or the dummy (no scatter, full transmittance)
+        const fog_tex_bind = if (self.vol_fog_enabled) (pp.fog_texture_blurred orelse pp.fog_dummy_texture.?) else pp.fog_dummy_texture.?;
+        const bindings = [5]c.SDL_GPUTextureSamplerBinding{
             .{ .texture = pp.hdr_texture.?, .sampler = sampler },
             .{ .texture = bloom_tex, .sampler = sampler },
             .{ .texture = flare_tex, .sampler = sampler },
             .{ .texture = dirt_tex, .sampler = sampler },
+            .{ .texture = fog_tex_bind, .sampler = sampler },
         };
-        c.SDL_BindGPUFragmentSamplers(pass, 0, &bindings, 4);
+        c.SDL_BindGPUFragmentSamplers(pass, 0, &bindings, 5);
 
         const grain_time: f32 = @floatFromInt(self.current_frame);
         const params = CompositeParams{

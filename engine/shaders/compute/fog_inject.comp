@@ -1,0 +1,323 @@
+#version 450
+
+// ============================================================================
+// Volumetric Fog Injection — Lunatic Engine
+// ============================================================================
+//
+// Computes per-froxel scattering and extinction for the volumetric fog volume.
+// Each thread processes one froxel (a small region of the view frustum).
+//
+// For each froxel:
+//   1. Map froxel coordinates to world position (exponential depth distribution)
+//   2. Evaluate fog density (global uniform + height falloff)
+//   3. Test directional light visibility via shadow cascade sampling
+//   4. Compute in-scattered light using Henyey-Greenstein phase function
+//   5. Add point/spot light contributions (with screen-space shadow test)
+//   6. Write scattering and extinction to the froxel buffer
+//
+// The froxel buffer is a flat vec4[] with manual 3D indexing:
+//   index = z * (W * H) + y * W + x
+//   .rgb = in-scattered light * slice_thickness
+//   .a   = extinction * slice_thickness
+//
+// Dispatch: ceil(W/8) x ceil(H/8) x D workgroups (one thread per froxel)
+// ============================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float PI = 3.14159265359;
+
+// ---------------------------------------------------------------------------
+// Uniforms
+// ---------------------------------------------------------------------------
+
+layout(std140, set = 2, binding = 0) uniform FogUniforms {
+    mat4 inv_vp;
+    mat4 vp;                // current frame VP (for screen-space shadow projection)
+    vec4 camera_pos;        // xyz = camera world position
+    vec4 light_dir;         // xyz = normalized direction TOWARD the light source
+    vec4 light_color;       // xyz = directional light color * intensity
+    vec4 fog_params;        // x = density, y = height_falloff, z = height_offset, w = anisotropy (g)
+    vec4 fog_albedo;        // xyz = fog color (linear), w = scattering coefficient
+    vec4 volume_params;     // x = froxel_w, y = froxel_h, z = depth_slices, w = near
+    vec4 depth_params;      // x = far, y = log(far/near), z = num_lights, w = unused
+    mat4 shadow_light_vp[4];
+    vec4 cascade_splits;    // view-space distances for cascade boundaries
+    vec4 shadow_params;     // x = atlas_size, y = cascade_size, z = bias, w = enabled
+    vec4 ambient;           // xyz = ambient light color
+    vec4 fog_shadow_params; // x = shadow steps, y = shadow softness (smoothstep range)
+};
+
+// ---------------------------------------------------------------------------
+// Buffers
+// ---------------------------------------------------------------------------
+
+// Readonly: point/spot lights (reusing the clustered lighting buffer)
+struct GPULight {
+    vec4 pos_radius;    // xyz = position, w = radius
+    vec4 color_type;    // xyz = color*intensity, w = type (0=point, 1=spot)
+    vec4 dir_spot;      // xyz = direction (spot only)
+    vec4 cone_params;   // x = cos(inner), y = cos(outer)
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer LightBuffer {
+    GPULight lights[];
+};
+
+// Readwrite: froxel volume as 2D image (width = W*H, height = D)
+// Each row is one depth slice. Pixel (iy*W+ix, z) = froxel at (ix, iy, z).
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D froxel_img;
+
+// Shadow atlas sampler (directional light cascades)
+layout(set = 3, binding = 0) uniform sampler2D shadow_atlas;
+
+// Scene depth buffer (HDR alpha = linear camera distance).
+// Used for screen-space shadow testing of point/spot lights in fog.
+layout(set = 3, binding = 1) uniform sampler2D scene_depth_tex;
+
+// ---------------------------------------------------------------------------
+// Henyey-Greenstein phase function
+// ---------------------------------------------------------------------------
+// Models the angular distribution of light scattered by fog particles.
+// g > 0 = forward scattering (bright halo around light source = god rays)
+// g = 0 = isotropic scattering (uniform in all directions)
+// g < 0 = back scattering
+
+float henyeyGreenstein(float cos_theta, float g) {
+    float g2 = g * g;
+    return (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * g * cos_theta, 1.5));
+}
+
+// ---------------------------------------------------------------------------
+// Froxel-to-world mapping (exponential depth distribution)
+// ---------------------------------------------------------------------------
+
+vec3 froxelToWorld(uvec3 coord) {
+    float u = (float(coord.x) + 0.5) / volume_params.x;
+    float v = (float(coord.y) + 0.5) / volume_params.y;
+    float z_norm = (float(coord.z) + 0.5) / volume_params.z;
+
+    // Exponential depth: near * (far/near)^z_norm
+    // Concentrates resolution near the camera where fog detail matters most.
+    float near = volume_params.w;
+    float far = depth_params.x;
+    float linear_depth = near * pow(far / near, z_norm);
+
+    // UV → NDC (Y-flipped to match the engine's convention)
+    vec2 ndc_xy = vec2(u * 2.0 - 1.0, -(v * 2.0 - 1.0));
+    vec4 clip_far = inv_vp * vec4(ndc_xy, 1.0, 1.0);
+    vec4 clip_near = inv_vp * vec4(ndc_xy, 0.0, 1.0);
+    vec3 world_far = clip_far.xyz / clip_far.w;
+    vec3 world_near = clip_near.xyz / clip_near.w;
+    vec3 view_dir = normalize(world_far - world_near);
+
+    return camera_pos.xyz + view_dir * linear_depth;
+}
+
+// Depth extent of a froxel slice (for integrating density over the slice)
+float froxelSliceThickness(uint z) {
+    float near = volume_params.w;
+    float far = depth_params.x;
+    float z0 = float(z) / volume_params.z;
+    float z1 = float(z + 1u) / volume_params.z;
+    return near * pow(far / near, z1) - near * pow(far / near, z0);
+}
+
+// ---------------------------------------------------------------------------
+// Fog density
+// ---------------------------------------------------------------------------
+
+float fogDensity(vec3 world_pos) {
+    float base_density = fog_params.x;
+    float falloff = fog_params.y;
+    float height_offset = fog_params.z;
+    float h = world_pos.y - height_offset;
+
+    // Exponential height falloff: dense near ground, fades with height
+    return base_density * exp(-falloff * max(h, 0.0));
+}
+
+// ---------------------------------------------------------------------------
+// Shadow cascade sampling (simplified single-tap for froxels)
+// ---------------------------------------------------------------------------
+
+float sampleShadow(vec3 world_pos) {
+    if (shadow_params.w < 0.5) return 1.0; // shadows disabled
+
+    float dist = length(world_pos - camera_pos.xyz);
+    float atlas_size = shadow_params.x;
+    float cascade_size = shadow_params.y;
+    float bias = shadow_params.z;
+
+    // Select cascade based on distance
+    int cascade = 3;
+    for (int i = 0; i < 4; i++) {
+        if (dist < cascade_splits[i]) { cascade = i; break; }
+    }
+
+    // Project into light space
+    vec4 light_clip = shadow_light_vp[cascade] * vec4(world_pos, 1.0);
+    vec3 light_ndc = light_clip.xyz / light_clip.w;
+
+    // NDC to shadow atlas UV
+    vec2 shadow_uv = light_ndc.xy * 0.5 + 0.5;
+    shadow_uv.y = 1.0 - shadow_uv.y; // Y-flip for texture coords
+
+    // Scale to cascade tile in atlas (2x2 grid)
+    float tile = cascade_size / atlas_size;
+    vec2 offset = vec2(float(cascade % 2), float(cascade / 2)) * tile;
+    shadow_uv = offset + shadow_uv * tile;
+
+    // Single-tap comparison (no PCF — froxel grid provides spatial filtering)
+    float shadow_depth = texture(shadow_atlas, shadow_uv).r;
+    float frag_depth = light_ndc.z * 0.5 + 0.5;
+
+    return (frag_depth - bias < shadow_depth) ? 1.0 : 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// Screen-space shadow test for point/spot lights
+// ---------------------------------------------------------------------------
+//
+// Without per-light shadow maps, we approximate light occlusion using the
+// scene depth buffer. For each froxel/light pair, we march a few steps along
+// the ray from the froxel toward the light in world space, project each step
+// to screen space, and compare against the scene depth.
+//
+// If scene geometry is closer to the camera than our sample point, there's
+// an occluder between the camera and that point on the froxel-to-light ray.
+// We additionally check that the occluder is between the froxel and the light
+// (not in front of the froxel) by verifying the depth ordering.
+//
+// Limitations (inherent to screen-space techniques):
+//   - Can't shadow lights that are off-screen
+//   - Can't shadow through occluders that are themselves off-screen
+//   - Thin occluders may be missed between sample steps
+// These are acceptable for volumetric fog where the effect is soft and diffuse.
+
+float screenSpaceLightShadow(vec3 froxel_pos, vec3 light_pos) {
+    int steps = int(fog_shadow_params.x);
+    float softness = fog_shadow_params.y;
+
+    // Skip shadow test if steps is 0 (shadows disabled)
+    if (steps <= 0) return 1.0;
+
+    float inv_steps = 1.0 / float(steps);
+
+    // March along the ray from froxel toward light, accumulating occlusion.
+    // Instead of a binary on/off shadow, each step contributes a fractional
+    // occlusion amount using smoothstep for soft depth transitions. This
+    // produces gradual shadow boundaries that span multiple froxels, allowing
+    // the bilateral blur to smooth them into clean shadow volumes rather than
+    // blocky froxel-grid artifacts.
+    float visibility = 1.0;
+
+    for (int s = 1; s <= steps; s++) {
+        float t = float(s) / float(steps + 1);
+        vec3 sample_pos = mix(froxel_pos, light_pos, t);
+
+        // Project sample to screen space
+        vec4 clip = vp * vec4(sample_pos, 1.0);
+        if (clip.w <= 0.0) continue; // behind camera — skip
+
+        vec3 ndc = clip.xyz / clip.w;
+        // Y-flip to match texture UV convention (see engine gotchas)
+        vec2 uv = vec2(ndc.x * 0.5 + 0.5, (-ndc.y) * 0.5 + 0.5);
+
+        // Off-screen samples can't be tested
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) continue;
+
+        // Scene depth at this screen position (linear camera distance)
+        float scene_depth = texture(scene_depth_tex, uv).a;
+        float sample_depth = length(sample_pos - camera_pos.xyz);
+
+        // Soft occlusion: smoothstep from 0.5 to the configurable softness value.
+        // Lower softness = sharper shadow edges (harder cutoff).
+        // Higher softness = wider penumbra-like transitions.
+        // The 0.5 lower bound ensures we don't shadow things that are only
+        // barely occluded (avoids noise from depth precision).
+        float depth_diff = sample_depth - scene_depth;
+        float occlusion = smoothstep(0.5, softness, depth_diff);
+
+        // Each step attenuates visibility proportionally. With N steps,
+        // a single occluded step reduces visibility by 1/N, two by 2/N, etc.
+        // This softens shadow edges where only some ray steps are blocked.
+        visibility -= occlusion * inv_steps;
+    }
+
+    return clamp(visibility, 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+void main() {
+    uvec3 coord = gl_GlobalInvocationID;
+
+    uint W = uint(volume_params.x);
+    uint H = uint(volume_params.y);
+    uint D = uint(volume_params.z);
+
+    if (coord.x >= W || coord.y >= H || coord.z >= D) return;
+
+    vec3 world_pos = froxelToWorld(coord);
+    float density = fogDensity(world_pos);
+    float dz = froxelSliceThickness(coord.z);
+
+    // Extinction = density * scattering coefficient * slice thickness
+    float scattering_coeff = fog_albedo.w;
+    float extinction = density * scattering_coeff;
+
+    // Skip empty froxels
+    if (extinction < 1e-6) {
+        imageStore(froxel_img, ivec2(int(coord.y * W + coord.x), int(coord.z)), vec4(0.0));
+        return;
+    }
+
+    // View direction (from froxel toward camera)
+    vec3 V = normalize(camera_pos.xyz - world_pos);
+
+    // --- Directional light scattering ---
+    float shadow = sampleShadow(world_pos);
+    float cos_theta = dot(normalize(light_dir.xyz), V);
+    float phase = henyeyGreenstein(cos_theta, fog_params.w);
+    vec3 in_scatter = fog_albedo.xyz * extinction * shadow * light_color.xyz * phase;
+
+    // --- Ambient scattering (non-directional, uniform) ---
+    in_scatter += fog_albedo.xyz * extinction * ambient.xyz;
+
+    // --- Point and spot light contributions (with screen-space shadows) ---
+    uint num_lights = uint(depth_params.z);
+    for (uint i = 0u; i < min(num_lights, 64u); i++) {
+        GPULight light = lights[i];
+        vec3 to_light = light.pos_radius.xyz - world_pos;
+        float dist = length(to_light);
+        float radius = light.pos_radius.w;
+
+        if (dist > radius) continue;
+
+        vec3 L = to_light / dist;
+        float attenuation = 1.0 - smoothstep(radius * 0.7, radius, dist);
+        attenuation *= attenuation; // Quadratic falloff
+
+        // Spot light cone
+        if (light.color_type.w > 0.5) {
+            float cos_angle = dot(-L, light.dir_spot.xyz);
+            float cos_outer = light.cone_params.y;
+            float cos_inner = light.cone_params.x;
+            attenuation *= smoothstep(cos_outer, cos_inner, cos_angle);
+        }
+
+        // Screen-space shadow: check if geometry blocks this light's
+        // contribution to this froxel. Creates visible shadow volumes
+        // in the fog where objects occlude point/spot lights.
+        float light_shadow = screenSpaceLightShadow(world_pos, light.pos_radius.xyz);
+
+        float light_phase = henyeyGreenstein(dot(L, V), fog_params.w);
+        in_scatter += fog_albedo.xyz * extinction * light.color_type.xyz * attenuation * light_phase * light_shadow;
+    }
+
+    // Write scattering and extinction (pre-multiplied by slice thickness)
+    imageStore(froxel_img, ivec2(int(coord.y * W + coord.x), int(coord.z)), vec4(in_scatter * dz, extinction * dz));
+}

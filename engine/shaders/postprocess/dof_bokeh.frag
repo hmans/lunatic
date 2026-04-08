@@ -39,7 +39,7 @@ layout(set = 3, binding = 0) uniform BokehParams {
 } bokeh;
 
 const float GOLDEN_ANGLE = 2.39996323;  // radians (= 137.508 degrees)
-const int SAMPLES = 48;                 // Total gather samples per pixel
+const int SAMPLES = 71;                 // Total gather samples per pixel
 
 void main() {
     vec2 texel = bokeh.params.xy;

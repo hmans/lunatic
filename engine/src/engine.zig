@@ -436,11 +436,23 @@ pub const Engine = struct {
     postprocess: postprocess.PostProcessState = .{},
     physics: physics.PhysicsState = .{},
 
-    // Fog
+    // Fog (legacy screen-space)
     fog_enabled: bool = false,
     fog_start: f32 = 10.0,
     fog_end: f32 = 30.0,
     fog_color: [3]f32 = .{ 0.08, 0.08, 0.12 },
+
+    // Volumetric fog (froxel-based)
+    vol_fog_enabled: bool = false,
+    vol_fog_density: f32 = 0.02, // base fog density
+    vol_fog_height_falloff: f32 = 0.5, // exponential height falloff rate
+    vol_fog_height_offset: f32 = 0.0, // world Y where fog starts
+    vol_fog_anisotropy: f32 = 0.6, // Henyey-Greenstein g (>0 = forward scatter = god rays)
+    vol_fog_albedo: [3]f32 = .{ 1.0, 1.0, 1.0 }, // fog color
+    vol_fog_scattering: f32 = 0.05, // scattering coefficient
+    vol_fog_shadow_steps: f32 = 4.0, // screen-space shadow ray march steps (1-8)
+    vol_fog_shadow_softness: f32 = 3.0, // shadow penumbra width (smoothstep upper bound)
+    fog_inject_pipeline: ?*c.SDL_GPUComputePipeline = null, // compute: froxel injection
 
     // Asset registries (meshes, materials, textures)
     assets: AssetStore = .{},
@@ -769,13 +781,24 @@ pub const Engine = struct {
                 const ts1 = c.SDL_GetPerformanceCounter();
                 self.stats.time_scene_us = (ts1 - ts0) * 1_000_000 / pf;
 
-                // Phase 4: Post-process (DoF + bloom + composite)
-                const tpp0 = c.SDL_GetPerformanceCounter();
+                // Phase 3.5: Volumetric fog (after scene, before post-process)
                 const vp = renderer.computeVPPublic(self, cam_entity, sw_w, sw_h);
-                const cam_pos = if (ecs.get(self.world, cam_entity, core_components.Position)) |p|
+                const cam_pos_arr = if (ecs.get(self.world, cam_entity, core_components.Position)) |p|
                     [4]f32{ p.x, p.y, p.z, 0 }
                 else
                     [4]f32{ 0, 0, 0, 0 };
+
+                if (self.vol_fog_enabled) {
+                    const fog_shadow = postprocess.FogShadowData{
+                        .light_vp = shadow_uniforms.light_vp,
+                        .cascade_splits = shadow_uniforms.cascade_splits,
+                        .shadow_params = shadow_uniforms.shadow_params,
+                    };
+                    postprocess.dispatchVolumetricFog(self, cmd, vp.m, vp.invert().m, cam_pos_arr, cam.near, cam.far, sw_w, sw_h, fog_shadow);
+                }
+
+                // Phase 4: Post-process (DoF + bloom + composite)
+                const tpp0 = c.SDL_GetPerformanceCounter();
 
                 const settings = postprocess.CameraPostSettings{
                     .exposure = cam.exposure,
@@ -789,7 +812,7 @@ pub const Engine = struct {
                     .ssr_thickness = cam.ssr_thickness,
                     .vp = vp.m,
                     .inv_vp = vp.invert().m,
-                    .camera_pos = cam_pos,
+                    .camera_pos = cam_pos_arr,
                     .camera_near = cam.near,
                     .prev_vp = self.prev_vp,
                     .frame_index = @floatFromInt(self.current_frame % 256),

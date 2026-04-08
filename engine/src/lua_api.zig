@@ -76,6 +76,7 @@ pub fn registerLuaApi(self: *Engine) void {
         .{ "camera_axes", &luaCameraAxes },
         .{ "set_clear_color", &luaSetClearColor },
         .{ "set_fog", &luaSetFog },
+        .{ "set_volumetric_fog", &luaSetVolumetricFog },
         .{ "set_ambient", &luaSetAmbient },
         .{ "set_bloom", &luaSetBloom },
         .{ "get_bloom_tints", &luaGetBloomTints },
@@ -685,6 +686,27 @@ fn luaSetFog(L: ?*lc.lua_State) callconv(.c) c_int {
     self.fog_start = checkFloat(L, 1);
     self.fog_end = checkFloat(L, 2);
     self.fog_color = optVec3(L, 3, .{ self.clear_color[0], self.clear_color[1], self.clear_color[2] });
+    return 0;
+}
+
+/// lunatic.set_volumetric_fog(density, height_falloff, anisotropy, r, g, b, scattering, shadow_steps, shadow_softness)
+/// or lunatic.set_volumetric_fog(false) to disable.
+fn luaSetVolumetricFog(L: ?*lc.lua_State) callconv(.c) c_int {
+    const self = getEngine(L);
+    if (lc.lua_isboolean(L, 1) and lc.lua_toboolean(L, 1) == 0) {
+        self.vol_fog_enabled = false;
+        return 0;
+    }
+    self.vol_fog_enabled = true;
+    self.vol_fog_density = checkFloat(L, 1);
+    if (lc.lua_gettop(L) >= 2) self.vol_fog_height_falloff = checkFloat(L, 2);
+    if (lc.lua_gettop(L) >= 3) self.vol_fog_anisotropy = checkFloat(L, 3);
+    if (lc.lua_gettop(L) >= 6) {
+        self.vol_fog_albedo = .{ checkFloat(L, 4), checkFloat(L, 5), checkFloat(L, 6) };
+    }
+    if (lc.lua_gettop(L) >= 7) self.vol_fog_scattering = checkFloat(L, 7);
+    if (lc.lua_gettop(L) >= 8) self.vol_fog_shadow_steps = checkFloat(L, 8);
+    if (lc.lua_gettop(L) >= 9) self.vol_fog_shadow_softness = checkFloat(L, 9);
     return 0;
 }
 

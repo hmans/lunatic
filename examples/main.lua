@@ -116,7 +116,7 @@ lunatic.system("debug_ui", function(dt)
     local cam_ref = lunatic.ref(cam, "camera")
     cam_ref.dof_focus_dist = ui.slider_float("Focus Distance", cam_ref.dof_focus_dist, 0, 50)
     cam_ref.dof_focus_range = ui.slider_float("Focus Range", cam_ref.dof_focus_range, 0.5, 30)
-    cam_ref.dof_blur_radius = ui.slider_float("Blur Radius", cam_ref.dof_blur_radius, 1, 20)
+    cam_ref.dof_blur_radius = ui.slider_float("Blur Radius", cam_ref.dof_blur_radius, 1, 60)
   end
 
   if ui.collapsing_header("Reflections (SSR)") then
@@ -157,6 +157,25 @@ lunatic.system("debug_ui", function(dt)
     t5 = ui.slider_float("1/32", t5, 0, 1)
     t6 = ui.slider_float("1/64 (haze)", t6, 0, 1)
     lunatic.set_bloom_tints(t1, t2, t3, t4, t5, t6)
+  end
+
+  if ui.collapsing_header("Volumetric Fog") then
+    if not _G._vfog then
+      _G._vfog = { density = 0.0, falloff = 0.3, aniso = 0.6, scatter = 0.05, shadow_steps = 4, shadow_softness = 3.0 }
+    end
+    local vf = _G._vfog
+    vf.density = ui.slider_float("Density", vf.density, 0, 0.3)
+    vf.falloff = ui.slider_float("Height Falloff", vf.falloff, 0, 2.0)
+    vf.aniso = ui.slider_float("Anisotropy (g)", vf.aniso, -0.5, 0.95)
+    vf.scatter = ui.slider_float("Scattering", vf.scatter, 0.01, 0.5)
+    ui.separator_text("Light Shadows")
+    vf.shadow_steps = ui.slider_float("Shadow Steps", vf.shadow_steps, 0, 8)
+    vf.shadow_softness = ui.slider_float("Shadow Softness", vf.shadow_softness, 0.5, 10.0)
+    if vf.density > 0.001 then
+      lunatic.set_volumetric_fog(vf.density, vf.falloff, vf.aniso, 1, 1, 1, vf.scatter, vf.shadow_steps, vf.shadow_softness)
+    else
+      lunatic.set_volumetric_fog(false)
+    end
   end
 
   ui.end_window()

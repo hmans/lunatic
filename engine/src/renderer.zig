@@ -40,6 +40,8 @@ const shadow_frag_spv = @embedFile("shader_shadow_frag_spv");
 const shadow_frag_msl = @embedFile("shader_shadow_frag_msl");
 const instance_setup_spv = @embedFile("shader_instance_setup_comp_spv");
 const instance_setup_msl = @embedFile("shader_instance_setup_comp_msl");
+const fog_inject_spv = @embedFile("shader_fog_inject_comp_spv");
+const fog_inject_msl = @embedFile("shader_fog_inject_comp_msl");
 
 // ============================================================
 // Uniform structs
@@ -377,6 +379,59 @@ fn createComputePipeline(
     });
 }
 
+fn createComputePipelineEx(
+    device: *c.SDL_GPUDevice,
+    spv: []const u8,
+    msl: []const u8,
+    num_readonly_storage_buffers: u32,
+    num_readwrite_storage_buffers: u32,
+    num_readwrite_storage_textures: u32,
+    num_uniform_buffers: u32,
+    num_samplers: u32,
+    threadcount_x: u32,
+    threadcount_y: u32,
+    threadcount_z: u32,
+) ?*c.SDL_GPUComputePipeline {
+    const formats = c.SDL_GetGPUShaderFormats(device);
+
+    var code: [*]const u8 = undefined;
+    var code_size: usize = undefined;
+    var format: c.SDL_GPUShaderFormat = undefined;
+    var entrypoint: [*:0]const u8 = undefined;
+
+    if (formats & c.SDL_GPU_SHADERFORMAT_SPIRV != 0) {
+        code = spv.ptr;
+        code_size = spv.len;
+        format = c.SDL_GPU_SHADERFORMAT_SPIRV;
+        entrypoint = "main";
+    } else if (formats & c.SDL_GPU_SHADERFORMAT_MSL != 0) {
+        code = msl.ptr;
+        code_size = msl.len;
+        format = c.SDL_GPU_SHADERFORMAT_MSL;
+        entrypoint = "main0";
+    } else {
+        std.debug.print("No supported shader format for compute pipeline\n", .{});
+        return null;
+    }
+
+    return c.SDL_CreateGPUComputePipeline(device, &c.SDL_GPUComputePipelineCreateInfo{
+        .code_size = code_size,
+        .code = code,
+        .entrypoint = entrypoint,
+        .format = format,
+        .num_samplers = num_samplers,
+        .num_readonly_storage_textures = 0,
+        .num_readonly_storage_buffers = num_readonly_storage_buffers,
+        .num_readwrite_storage_textures = num_readwrite_storage_textures,
+        .num_readwrite_storage_buffers = num_readwrite_storage_buffers,
+        .num_uniform_buffers = num_uniform_buffers,
+        .threadcount_x = threadcount_x,
+        .threadcount_y = threadcount_y,
+        .threadcount_z = threadcount_z,
+        .props = 0,
+    });
+}
+
 fn createDepthTexture(device: *c.SDL_GPUDevice, w: u32, h: u32, sample_count: engine_mod.SampleCount) ?*c.SDL_GPUTexture {
     return c.SDL_CreateGPUTexture(device, &c.SDL_GPUTextureCreateInfo{
         .type = c.SDL_GPU_TEXTURETYPE_2D,
@@ -645,6 +700,24 @@ pub fn initComputePipeline(self: *Engine) !void {
         return error.ComputePipelineFailed;
     };
 
+    // Fog injection compute pipeline: 1 readonly storage buffer (lights),
+    // 0 readwrite storage buffers, 1 readwrite storage TEXTURE (froxel image),
+    // 1 uniform, 2 samplers (shadow atlas + scene depth). Workgroup: 8x8x1.
+    self.fog_inject_pipeline = createComputePipelineEx(
+        device,
+        fog_inject_spv,
+        fog_inject_msl,
+        1, // readonly storage buffers (light buffer)
+        0, // readwrite storage buffers
+        1, // readwrite storage textures (froxel image)
+        1, // uniform buffers
+        2, // samplers (shadow atlas + scene depth for screen-space shadows)
+        8, 8, 1,
+    ) orelse {
+        std.debug.print("Failed to create fog inject pipeline: {s}\n", .{c.SDL_GetError()});
+        return error.ComputePipelineFailed;
+    };
+
     // Culling stats buffer: 3 u32 atomic counters written by compute, read back by CPU.
     self.culling_stats_buffer = c.SDL_CreateGPUBuffer(device, &c.SDL_GPUBufferCreateInfo{
         .usage = c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE,
@@ -685,6 +758,10 @@ pub const DirLightData = struct {
 
 /// Query the ECS for the first directional light, or return defaults.
 /// Uses the persistent dir_light_query + columnar access.
+pub fn gatherDirectionalLightPublic(self: *Engine) DirLightData {
+    return gatherDirectionalLight(self);
+}
+
 fn gatherDirectionalLight(self: *Engine) DirLightData {
     var result = DirLightData{
         .dir = .{ 0.4, 0.8, 0.4, 0.0 },

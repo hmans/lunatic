@@ -33,6 +33,7 @@ layout(set = 2, binding = 0) uniform sampler2D hdr_scene;  // HDR scene (after D
 layout(set = 2, binding = 1) uniform sampler2D bloom_tex;   // Bloom result (upsample chain output)
 layout(set = 2, binding = 2) uniform sampler2D flare_tex;   // Lens flare ghosts + halo
 layout(set = 2, binding = 3) uniform sampler2D dirt_tex;    // Lens dirt overlay texture
+layout(set = 2, binding = 4) uniform sampler2D fog_tex;     // Volumetric fog: rgb=scatter, a=transmittance
 
 layout(set = 3, binding = 0) uniform CompositeParams {
     vec4 params;   // .x = bloom_intensity, .y = exposure, .z = flare_intensity, .w = dirt_intensity
@@ -114,6 +115,14 @@ void main() {
         // dirt_intensity values from the user.
         color += dirt * glow * dirt_mask * dirt_intensity * 8.0;
     }
+
+    // ---- Volumetric Fog ----
+    // Apply fog scattering and extinction before exposure/tonemapping so it
+    // integrates naturally into the HDR pipeline. The fog texture contains
+    // accumulated in-scattered light (rgb) and remaining transmittance (a).
+    // Scene color is attenuated by transmittance, then fog color is added.
+    vec4 fog = texture(fog_tex, uv);
+    color = color * fog.a + fog.rgb;
 
     // ---- Exposure ----
     // Simple linear exposure control. Applied before tonemapping so it
