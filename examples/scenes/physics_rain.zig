@@ -158,6 +158,8 @@ pub fn update(self: *Self, engine: *Engine, dt: f32) void {
 
 pub fn cleanup(self: *Self, engine: *Engine) void {
     self.spawner_active = false;
+    // Jolt bodies are cleaned up automatically by the OnRemove observer
+    // when entities lose their RigidBody component (including on delete).
     for (&self.entities) |e| {
         if (e != 0) ecs.delete(engine.world, e);
     }
@@ -190,7 +192,7 @@ fn trackMat(self: *Self, _: *Engine, id: u32) u32 {
 }
 
 fn spawnPhysicsObject(self: *Self, engine: *Engine) void {
-    // Destroy whatever was in this ring slot
+    // Destroy whatever was in this ring slot (Jolt body cleaned up by OnRemove observer)
     if (self.body_ring[self.ring_head] != 0) {
         ecs.delete(engine.world, self.body_ring[self.ring_head]);
     }

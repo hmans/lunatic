@@ -184,6 +184,32 @@ pub fn addPhysicsSphere(self: *Engine, entity: ecs.entity_t, radius: f32, motion
     _ = ecs.set(self.world, entity, core.RigidBody, core.RigidBody{ .body_id = @intFromEnum(body_id) });
 }
 
+/// Register a flecs OnRemove observer for RigidBody so that Jolt bodies
+/// are automatically cleaned up when entities are deleted or lose their
+/// RigidBody component. Call once after initPhysics + component registration.
+pub fn registerPhysicsObserver(self: *Engine) void {
+    var desc = std.mem.zeroes(ecs.observer_desc_t);
+    desc.callback = &onRigidBodyRemove;
+    desc.ctx = self;
+    desc.events[0] = ecs.OnRemove;
+    desc.query.terms[0].id = ecs.id(core.RigidBody);
+    _ = ecs.OBSERVER(self.world, "physics_cleanup", &desc);
+}
+
+/// Flecs OnRemove callback: destroy the Jolt body when RigidBody is removed.
+fn onRigidBodyRemove(it: *ecs.iter_t) callconv(.c) void {
+    const engine: *Engine = @ptrCast(@alignCast(it.ctx));
+    const phys_sys = engine.physics.system orelse return;
+    const body_iface = phys_sys.getBodyInterfaceMut();
+
+    for (it.entities()) |entity| {
+        const rb = ecs.get(it.world, entity, core.RigidBody) orelse continue;
+        const body_id: zp.BodyId = @enumFromInt(rb.body_id);
+        if (body_id == .invalid) continue;
+        body_iface.removeAndDestroyBody(body_id);
+    }
+}
+
 // ============================================================
 // Built-in physics system
 // ============================================================

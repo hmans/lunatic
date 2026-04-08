@@ -1122,6 +1122,7 @@ pub const Engine = struct {
 
         // Physics
         try physics.initPhysics(self);
+        physics.registerPhysicsObserver(self);
 
         // Built-in Zig systems.
         // Systems with known component dependencies use proper flecs query terms
