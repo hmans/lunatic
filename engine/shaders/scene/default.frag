@@ -94,6 +94,7 @@ layout(std430, set = 1, binding = 5) readonly buffer LightIndexBuffer {
 };
 
 layout(location = 0) out vec4 out_color;
+layout(location = 1) out vec4 out_normal_roughness;  // xyz = world-space normal, w = roughness (for SSR)
 
 const float PI = 3.14159265359;
 
@@ -450,4 +451,9 @@ void main() {
     // this to compute circle of confusion without a separate depth buffer.
     // Background/sky fragments get alpha = 1000.0 from the clear color.
     out_color = vec4(color, frag_dist);
+
+    // Normal + roughness for screen-space reflections.
+    // N is the final world-space normal (after normal mapping + specular AA).
+    // Roughness is used to attenuate SSR (rough surfaces get less reflection).
+    out_normal_roughness = vec4(N * 0.5 + 0.5, roughness);  // Pack normal to [0,1]
 }

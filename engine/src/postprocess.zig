@@ -34,6 +34,12 @@ const lensflare_frag_spv = @embedFile("shader_lensflare_frag_spv");
 const lensflare_frag_msl = @embedFile("shader_lensflare_frag_msl");
 const hiz_downsample_frag_spv = @embedFile("shader_hiz_downsample_frag_spv");
 const hiz_downsample_frag_msl = @embedFile("shader_hiz_downsample_frag_msl");
+const ssr_frag_spv = @embedFile("shader_ssr_frag_spv");
+const ssr_frag_msl = @embedFile("shader_ssr_frag_msl");
+const ssr_composite_frag_spv = @embedFile("shader_ssr_composite_frag_spv");
+const ssr_composite_frag_msl = @embedFile("shader_ssr_composite_frag_msl");
+const ssr_resolve_frag_spv = @embedFile("shader_ssr_resolve_frag_spv");
+const ssr_resolve_frag_msl = @embedFile("shader_ssr_resolve_frag_msl");
 
 // ============================================================
 // Uniform structs (must match GLSL layouts)
@@ -90,6 +96,23 @@ pub const max_hiz_levels: u32 = 12;
 
 const HizDownsampleParams = extern struct {
     params: [4]f32, // .xy = texel size of source, .z = is_first_pass (1.0 = read alpha), .w = unused
+};
+
+/// Uniforms for the SSR temporal resolve shader. Must match ResolveParams in ssr_resolve.frag.
+const SSRResolveUniforms = extern struct {
+    vp: [4][4]f32,
+    inv_vp: [4][4]f32,
+    prev_vp: [4][4]f32,
+    params: [4]f32, // x = blend_factor, y = width, z = height, w = unused
+};
+
+/// Uniforms for the SSR ray-march shader. Must match SSRParams in ssr.frag.
+const SSRUniforms = extern struct {
+    vp: [4][4]f32, // Current frame view-projection
+    inv_vp: [4][4]f32, // Inverse VP (screen → world)
+    camera_pos: [4]f32, // xyz = camera world position
+    params: [4]f32, // x = intensity, y = max_distance, z = stride, w = thickness
+    screen: [4]f32, // x = width, y = height, z = max_mip, w = near
 };
 
 // ============================================================
@@ -159,6 +182,14 @@ pub const PostProcessState = struct {
     hiz_combined: ?*c.SDL_GPUTexture = null, // mipmapped R32F for compute shader sampling
     hiz_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
     hiz_sampler: ?*c.SDL_GPUSampler = null, // NEAREST filter (no depth averaging)
+
+    // Screen-Space Reflections (SSR)
+    ssr_texture: ?*c.SDL_GPUTexture = null, // RGBA16F, full res — current frame raw SSR trace
+    ssr_history: ?*c.SDL_GPUTexture = null, // RGBA16F, full res — previous frame's resolved SSR
+    ssr_resolved: ?*c.SDL_GPUTexture = null, // RGBA16F, full res — temporal resolve output
+    ssr_pipeline: ?*c.SDL_GPUGraphicsPipeline = null, // Ray march shader
+    ssr_resolve_pipeline: ?*c.SDL_GPUGraphicsPipeline = null, // Temporal resolve shader
+    ssr_composite_pipeline: ?*c.SDL_GPUGraphicsPipeline = null, // Blend SSR into scene
 };
 
 /// Per-camera post-processing settings, read from Camera component fields.
@@ -168,6 +199,17 @@ pub const CameraPostSettings = struct {
     dof_focus_dist: f32,
     dof_focus_range: f32,
     dof_blur_radius: f32,
+    ssr_intensity: f32,
+    ssr_max_distance: f32,
+    ssr_stride: f32,
+    ssr_thickness: f32,
+    // SSR needs VP/inv_vp/camera_pos for world-space reconstruction
+    vp: [4][4]f32 = undefined,
+    inv_vp: [4][4]f32 = undefined,
+    camera_pos: [4]f32 = .{ 0, 0, 0, 0 },
+    camera_near: f32 = 0.1,
+    prev_vp: [4][4]f32 = undefined,
+    frame_index: f32 = 0,
     vignette_intensity: f32,
     vignette_smoothness: f32,
     chromatic_aberration: f32,
@@ -478,6 +520,36 @@ pub fn initPostProcess(self: *Engine) !void {
         hdr_format, 1, 1,
     ) orelse return error.PipelineFailed;
 
+    // SSR ray-march pipeline: reads scene HDR + HiZ pyramid, outputs reflection color + confidence
+    self.postprocess.ssr_pipeline = createPostProcessPipeline(
+        device,
+        ssr_frag_spv,
+        ssr_frag_msl,
+        hdr_format,
+        1, // uniforms (SSRUniforms)
+        2, // samplers (scene_tex, hiz_tex)
+    ) orelse return error.PipelineFailed;
+
+    // SSR temporal resolve: blends current trace with reprojected history
+    self.postprocess.ssr_resolve_pipeline = createPostProcessPipeline(
+        device,
+        ssr_resolve_frag_spv,
+        ssr_resolve_frag_msl,
+        hdr_format,
+        1, // uniforms (SSRResolveUniforms)
+        3, // samplers (current_ssr, history_ssr, scene_tex)
+    ) orelse return error.PipelineFailed;
+
+    // SSR composite pipeline: blends SSR result into the scene HDR
+    self.postprocess.ssr_composite_pipeline = createPostProcessPipeline(
+        device,
+        ssr_composite_frag_spv,
+        ssr_composite_frag_msl,
+        hdr_format,
+        1, // uniforms (texel size for blur kernel)
+        2, // samplers (scene_tex, ssr_tex)
+    ) orelse return error.PipelineFailed;
+
     // HiZ downsample pipeline (R32_FLOAT target, NEAREST sampler, 1 uniform + 1 sampler)
     self.postprocess.hiz_pipeline = createPostProcessPipeline(
         device,
@@ -564,6 +636,14 @@ pub fn ensureTextures(self: *Engine, w: u32, h: u32) !void {
         pp.flare_texture = null;
     }
 
+    // SSR textures (full resolution, RGBA16F)
+    if (pp.ssr_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.ssr_history) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.ssr_resolved) |t| c.SDL_ReleaseGPUTexture(device, t);
+    pp.ssr_texture = createRenderTexture(device, hdr_format, w, h) orelse return error.TextureFailed;
+    pp.ssr_history = createRenderTexture(device, hdr_format, w, h) orelse return error.TextureFailed;
+    pp.ssr_resolved = createRenderTexture(device, hdr_format, w, h) orelse return error.TextureFailed;
+
     // HiZ mip chain: progressive 2:1 downsamples of linear depth.
     // Individual render target textures per level + one combined mipmapped texture.
     for (&pp.hiz_textures) |*ht| {
@@ -633,6 +713,13 @@ pub fn deinitPostProcess(self: *Engine) void {
     if (pp.dof_composite_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.dof_tent_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     if (pp.sampler) |s| c.SDL_ReleaseGPUSampler(device, s);
+    // SSR cleanup
+    if (pp.ssr_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.ssr_history) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.ssr_resolved) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (pp.ssr_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+    if (pp.ssr_resolve_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
+    if (pp.ssr_composite_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(device, p);
     // HiZ cleanup
     for (pp.hiz_textures) |ht| {
         if (ht) |t| c.SDL_ReleaseGPUTexture(device, t);
@@ -785,6 +872,100 @@ pub fn executePostProcess(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, swapchain
     const sw_hf: f32 = @floatFromInt(sw_h);
     const half_wf: f32 = @floatFromInt(half_w);
     const half_hf: f32 = @floatFromInt(half_h);
+
+    // === Screen-Space Reflections (before DoF, operates on HDR texture) ===
+    if (settings.ssr_intensity > 0) ssr_blk: {
+        const ssr_pipeline = pp.ssr_pipeline orelse break :ssr_blk;
+        const ssr_composite = pp.ssr_composite_pipeline orelse break :ssr_blk;
+        const ssr_tex = pp.ssr_texture orelse break :ssr_blk;
+        const normal_tex = self.normal_roughness_texture orelse break :ssr_blk;
+
+        // Pass 1: Ray-march SSR → ssr_texture
+        {
+            const pass = beginFullscreenPass(cmd, ssr_tex) orelse break :ssr_blk;
+            setFullscreenViewport(pass, sw_w, sw_h);
+            c.SDL_BindGPUGraphicsPipeline(pass, ssr_pipeline);
+
+            const bindings = [2]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = pp.hdr_texture.?, .sampler = sampler },
+                .{ .texture = normal_tex, .sampler = sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(pass, 0, &bindings, 2);
+
+            const max_mip: f32 = if (pp.hiz_count > 1) @as(f32, @floatFromInt(pp.hiz_count - 1)) else 0;
+            const ssr_uniforms = SSRUniforms{
+                .vp = settings.vp,
+                .inv_vp = settings.inv_vp,
+                .camera_pos = settings.camera_pos,
+                .params = .{ settings.ssr_intensity, settings.ssr_max_distance, settings.ssr_stride, settings.ssr_thickness },
+                .screen = .{ sw_wf, sw_hf, max_mip, settings.frame_index },
+            };
+            c.SDL_PushGPUFragmentUniformData(cmd, 0, &ssr_uniforms, @sizeOf(SSRUniforms));
+
+            drawFullscreenTriangle(pass);
+            c.SDL_EndGPURenderPass(pass);
+        }
+
+        // Pass 2: Temporal resolve — blend current SSR with reprojected history
+        const ssr_for_composite = if (pp.ssr_resolve_pipeline) |resolve_pipeline| blk: {
+            const history = pp.ssr_history orelse break :blk ssr_tex;
+            const resolved = pp.ssr_resolved orelse break :blk ssr_tex;
+
+            const pass = beginFullscreenPass(cmd, resolved) orelse break :blk ssr_tex;
+            setFullscreenViewport(pass, sw_w, sw_h);
+            c.SDL_BindGPUGraphicsPipeline(pass, resolve_pipeline);
+
+            const resolve_bindings = [3]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = ssr_tex, .sampler = sampler },
+                .{ .texture = history, .sampler = sampler },
+                .{ .texture = pp.hdr_texture.?, .sampler = sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(pass, 0, &resolve_bindings, 3);
+
+            const resolve_uniforms = SSRResolveUniforms{
+                .vp = settings.vp,
+                .inv_vp = settings.inv_vp,
+                .prev_vp = settings.prev_vp,
+                .params = .{ 0.1, sw_wf, sw_hf, 0 }, // blend_factor = 0.1 (90% history)
+            };
+            c.SDL_PushGPUFragmentUniformData(cmd, 0, &resolve_uniforms, @sizeOf(SSRResolveUniforms));
+
+            drawFullscreenTriangle(pass);
+            c.SDL_EndGPURenderPass(pass);
+
+            // Swap history: resolved becomes next frame's history
+            const tmp_hist = pp.ssr_history;
+            pp.ssr_history = pp.ssr_resolved;
+            pp.ssr_resolved = tmp_hist;
+
+            break :blk pp.ssr_history.?; // use the just-resolved result for composite
+        } else ssr_tex;
+
+        // Pass 3: Composite SSR into scene → hdr_texture_b
+        {
+            const pass = beginFullscreenPass(cmd, pp.hdr_texture_b.?) orelse break :ssr_blk;
+            setFullscreenViewport(pass, sw_w, sw_h);
+            c.SDL_BindGPUGraphicsPipeline(pass, ssr_composite);
+
+            const bindings = [2]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = pp.hdr_texture.?, .sampler = sampler },
+                .{ .texture = ssr_for_composite, .sampler = sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(pass, 0, &bindings, 2);
+
+            // Push texel size for the blur kernel
+            const composite_params = [4]f32{ 1.0 / sw_wf, 1.0 / sw_hf, 0, 0 };
+            c.SDL_PushGPUFragmentUniformData(cmd, 0, &composite_params, @sizeOf([4]f32));
+
+            drawFullscreenTriangle(pass);
+            c.SDL_EndGPURenderPass(pass);
+        }
+
+        // Swap: hdr_texture_b now has the SSR-composited scene
+        const tmp = pp.hdr_texture;
+        pp.hdr_texture = pp.hdr_texture_b;
+        pp.hdr_texture_b = tmp;
+    }
 
     // === Depth of Field (before bloom, operates on HDR texture) ===
     if (settings.dof_focus_dist > 0) {

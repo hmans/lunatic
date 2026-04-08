@@ -61,6 +61,9 @@ fn addShaders(b: *std.Build, mod: *std.Build.Module, pp_mod: *std.Build.Module) 
     addShader(b, pp_mod, "postprocess", "dof_tent", "frag", .fragment);
     addShader(b, pp_mod, "postprocess", "lensflare", "frag", .fragment);
     addShader(b, pp_mod, "postprocess", "hiz_downsample", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "ssr", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "ssr_composite", "frag", .fragment);
+    addShader(b, pp_mod, "postprocess", "ssr_resolve", "frag", .fragment);
 }
 
 /// Add all system include/lib paths from known prefixes where dependencies are found.

@@ -81,17 +81,12 @@ function scene.setup(cam)
   local max_bodies = 500
   local body_ring = {}
   local ring_head = 1
-  local ring_count = 0
 
   local function spawn_physics_object()
-    if ring_count >= max_bodies then
-      local oldest_idx = ((ring_head - ring_count - 1) % max_bodies) + 1
-      local oldest = body_ring[oldest_idx]
-      if oldest then
-        lunatic.destroy(oldest)
-        body_ring[oldest_idx] = nil
-      end
-      ring_count = ring_count - 1
+    -- Destroy whatever was in this ring slot before overwriting.
+    -- Simple and leak-proof: no count tracking needed, ring_head just wraps.
+    if body_ring[ring_head] then
+      pcall(lunatic.destroy, body_ring[ring_head])
     end
 
     local e = lunatic.spawn()
@@ -118,7 +113,6 @@ function scene.setup(cam)
 
     body_ring[ring_head] = e
     ring_head = (ring_head % max_bodies) + 1
-    ring_count = ring_count + 1
   end
 
   -- Spawner system (guarded — keeps creating entities so needs an off switch)
@@ -131,6 +125,7 @@ function scene.setup(cam)
       spawn_timer = spawn_timer - spawn_interval
     end
 
+    -- Destroy entities that fell off the world
     for i = 1, max_bodies do
       local e = body_ring[i]
       if e then
@@ -138,7 +133,6 @@ function scene.setup(cam)
         if ok and pos.y < -20 then
           lunatic.destroy(e)
           body_ring[i] = nil
-          ring_count = ring_count - 1
         end
       end
     end

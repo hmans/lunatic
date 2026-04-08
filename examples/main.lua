@@ -30,6 +30,10 @@ lunatic.add(cam, "camera", 60, 0.1, 100, 0, 0, 1, 1,
   0,     -- dof_focus_dist (0 = disabled)
   8,     -- dof_focus_range
   8,     -- dof_blur_radius
+  0,     -- ssr_intensity (0 = disabled)
+  50,    -- ssr_max_distance
+  4,     -- ssr_stride (pixels)
+  0.1,   -- ssr_thickness
   0.4,   -- vignette
   0.5,   -- vignette_smoothness
   0.08,  -- chromatic_aberration
@@ -113,6 +117,14 @@ lunatic.system("debug_ui", function(dt)
     cam_ref.dof_focus_dist = ui.slider_float("Focus Distance", cam_ref.dof_focus_dist, 0, 50)
     cam_ref.dof_focus_range = ui.slider_float("Focus Range", cam_ref.dof_focus_range, 0.5, 30)
     cam_ref.dof_blur_radius = ui.slider_float("Blur Radius", cam_ref.dof_blur_radius, 1, 20)
+  end
+
+  if ui.collapsing_header("Reflections (SSR)") then
+    local cam_ref = lunatic.ref(cam, "camera")
+    cam_ref.ssr_intensity = ui.slider_float("Intensity", cam_ref.ssr_intensity, 0, 1.0)
+    cam_ref.ssr_max_distance = ui.slider_float("Max Distance", cam_ref.ssr_max_distance, 5, 100)
+    cam_ref.ssr_stride = ui.slider_float("Stride (px)", cam_ref.ssr_stride, 1, 16)
+    cam_ref.ssr_thickness = ui.slider_float("Thickness", cam_ref.ssr_thickness, 0.01, 1.0)
   end
 
   if ui.collapsing_header("Lens Effects") then

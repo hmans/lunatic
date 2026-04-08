@@ -415,6 +415,8 @@ pub const Engine = struct {
     batch_count: u32 = 0,
     depth_texture: ?*c.SDL_GPUTexture = null,
     msaa_color_texture: ?*c.SDL_GPUTexture = null,
+    msaa_normal_texture: ?*c.SDL_GPUTexture = null, // MSAA resolve source for normal+roughness
+    normal_roughness_texture: ?*c.SDL_GPUTexture = null, // Resolved normal+roughness (for SSR)
     swapchain_format: c.SDL_GPUTextureFormat = c.SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
     sample_count: SampleCount = .@"1",
     rt_w: u32 = 0,
@@ -769,12 +771,28 @@ pub const Engine = struct {
 
                 // Phase 4: Post-process (DoF + bloom + composite)
                 const tpp0 = c.SDL_GetPerformanceCounter();
+                const vp = renderer.computeVPPublic(self, cam_entity, sw_w, sw_h);
+                const cam_pos = if (ecs.get(self.world, cam_entity, core_components.Position)) |p|
+                    [4]f32{ p.x, p.y, p.z, 0 }
+                else
+                    [4]f32{ 0, 0, 0, 0 };
+
                 const settings = postprocess.CameraPostSettings{
                     .exposure = cam.exposure,
                     .bloom_intensity = cam.bloom_intensity,
                     .dof_focus_dist = cam.dof_focus_dist,
                     .dof_focus_range = cam.dof_focus_range,
                     .dof_blur_radius = cam.dof_blur_radius,
+                    .ssr_intensity = cam.ssr_intensity,
+                    .ssr_max_distance = cam.ssr_max_distance,
+                    .ssr_stride = cam.ssr_stride,
+                    .ssr_thickness = cam.ssr_thickness,
+                    .vp = vp.m,
+                    .inv_vp = vp.invert().m,
+                    .camera_pos = cam_pos,
+                    .camera_near = cam.near,
+                    .prev_vp = self.prev_vp,
+                    .frame_index = @floatFromInt(self.current_frame % 256),
                     .vignette_intensity = cam.vignette,
                     .vignette_smoothness = cam.vignette_smoothness,
                     .chromatic_aberration = cam.chromatic_aberration,

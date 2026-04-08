@@ -441,7 +441,9 @@ pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
         .{ .slot = 0, .pitch = @sizeOf(Vertex), .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX, .instance_step_rate = 0 },
     };
 
+    // Two color targets: HDR scene (location 0) + normal+roughness (location 1)
     const color_target_desc = [_]c.SDL_GPUColorTargetDescription{
+        .{ .format = scene_format, .blend_state = std.mem.zeroes(c.SDL_GPUColorTargetBlendState) },
         .{ .format = scene_format, .blend_state = std.mem.zeroes(c.SDL_GPUColorTargetBlendState) },
     };
 
@@ -513,7 +515,27 @@ pub fn initPipeline(self: *Engine, config: engine_mod.Config) !void {
             std.debug.print("Failed to create MSAA color texture: {s}\n", .{c.SDL_GetError()});
             return error.DepthTextureFailed;
         };
+        self.msaa_normal_texture = createMsaaColorTexture(device, scene_format, config.width, config.height, config.msaa) orelse {
+            std.debug.print("Failed to create MSAA normal texture: {s}\n", .{c.SDL_GetError()});
+            return error.DepthTextureFailed;
+        };
     }
+    // Normal+roughness resolve target (same format as HDR, full res, single sample).
+    // Created here; also recreated in ensureTextures when resolution changes.
+    self.normal_roughness_texture = c.SDL_CreateGPUTexture(device, &c.SDL_GPUTextureCreateInfo{
+        .type = c.SDL_GPU_TEXTURETYPE_2D,
+        .format = scene_format,
+        .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = config.width,
+        .height = config.height,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+        .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+        .props = 0,
+    }) orelse {
+        std.debug.print("Failed to create normal+roughness texture: {s}\n", .{c.SDL_GetError()});
+        return error.DepthTextureFailed;
+    };
     self.rt_w = config.width;
     self.rt_h = config.height;
 }
@@ -1370,7 +1392,21 @@ pub fn prepareFrame(self: *Engine, w: u32, h: u32) FrameContext {
         if (self.sample_count.isMultisample()) {
             if (self.msaa_color_texture) |mt| c.SDL_ReleaseGPUTexture(device, mt);
             self.msaa_color_texture = createMsaaColorTexture(device, hdr_format, w, h, self.sample_count);
+            if (self.msaa_normal_texture) |mt| c.SDL_ReleaseGPUTexture(device, mt);
+            self.msaa_normal_texture = createMsaaColorTexture(device, hdr_format, w, h, self.sample_count);
         }
+        if (self.normal_roughness_texture) |t| c.SDL_ReleaseGPUTexture(device, t);
+        self.normal_roughness_texture = c.SDL_CreateGPUTexture(device, &c.SDL_GPUTextureCreateInfo{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = hdr_format,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = w,
+            .height = h,
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .props = 0,
+        });
         self.rt_w = w;
         self.rt_h = h;
     }
@@ -1401,6 +1437,12 @@ fn computeView(self: *Engine, cam_entity: ecs.entity_t) Mat4 {
 }
 
 /// Compute the view-projection matrix for a camera entity.
+/// Compute the view-projection matrix for a camera entity. Public for use by
+/// the post-process pipeline (SSR needs VP and inverse VP for world reconstruction).
+pub fn computeVPPublic(self: *Engine, cam_entity: ecs.entity_t, w: u32, h: u32) Mat4 {
+    return computeVP(self, cam_entity, w, h);
+}
+
 fn computeVP(self: *Engine, cam_entity: ecs.entity_t, w: u32, h: u32) Mat4 {
     const cam = ecs.get(self.world, cam_entity, Camera) orelse return Mat4.identity();
     const w_f: f32 = @floatFromInt(w);
@@ -1921,34 +1963,72 @@ pub fn executeScenePass(
     const hdr_clear = srgbToHdr4(self.clear_color, exposure);
     const clear_color = c.SDL_FColor{ .r = hdr_clear[0], .g = hdr_clear[1], .b = hdr_clear[2], .a = 1000.0 };
 
-    const color_target = if (is_msaa) c.SDL_GPUColorTargetInfo{
-        .texture = self.msaa_color_texture,
-        .mip_level = 0,
-        .layer_or_depth_plane = 0,
-        .clear_color = clear_color,
-        .load_op = c.SDL_GPU_LOADOP_CLEAR,
-        .store_op = c.SDL_GPU_STOREOP_RESOLVE_AND_STORE,
-        .resolve_texture = color_target_tex,
-        .resolve_mip_level = 0,
-        .resolve_layer = 0,
-        .cycle = true,
-        .cycle_resolve_texture = false,
-        .padding1 = 0,
-        .padding2 = 0,
-    } else c.SDL_GPUColorTargetInfo{
-        .texture = color_target_tex,
-        .mip_level = 0,
-        .layer_or_depth_plane = 0,
-        .clear_color = clear_color,
-        .load_op = c.SDL_GPU_LOADOP_CLEAR,
-        .store_op = c.SDL_GPU_STOREOP_STORE,
-        .resolve_texture = null,
-        .resolve_mip_level = 0,
-        .resolve_layer = 0,
-        .cycle = true,
-        .cycle_resolve_texture = false,
-        .padding1 = 0,
-        .padding2 = 0,
+    const normal_target_tex = self.normal_roughness_texture orelse return;
+    const normal_clear = c.SDL_FColor{ .r = 0.5, .g = 0.5, .b = 1.0, .a = 1.0 }; // default normal=(0,0,1), roughness=1
+
+    // Two color targets: [0] = HDR scene, [1] = normal+roughness
+    const color_targets = if (is_msaa) [2]c.SDL_GPUColorTargetInfo{
+        .{
+            .texture = self.msaa_color_texture,
+            .mip_level = 0,
+            .layer_or_depth_plane = 0,
+            .clear_color = clear_color,
+            .load_op = c.SDL_GPU_LOADOP_CLEAR,
+            .store_op = c.SDL_GPU_STOREOP_RESOLVE_AND_STORE,
+            .resolve_texture = color_target_tex,
+            .resolve_mip_level = 0,
+            .resolve_layer = 0,
+            .cycle = true,
+            .cycle_resolve_texture = false,
+            .padding1 = 0,
+            .padding2 = 0,
+        },
+        .{
+            .texture = self.msaa_normal_texture,
+            .mip_level = 0,
+            .layer_or_depth_plane = 0,
+            .clear_color = normal_clear,
+            .load_op = c.SDL_GPU_LOADOP_CLEAR,
+            .store_op = c.SDL_GPU_STOREOP_RESOLVE_AND_STORE,
+            .resolve_texture = normal_target_tex,
+            .resolve_mip_level = 0,
+            .resolve_layer = 0,
+            .cycle = true,
+            .cycle_resolve_texture = false,
+            .padding1 = 0,
+            .padding2 = 0,
+        },
+    } else [2]c.SDL_GPUColorTargetInfo{
+        .{
+            .texture = color_target_tex,
+            .mip_level = 0,
+            .layer_or_depth_plane = 0,
+            .clear_color = clear_color,
+            .load_op = c.SDL_GPU_LOADOP_CLEAR,
+            .store_op = c.SDL_GPU_STOREOP_STORE,
+            .resolve_texture = null,
+            .resolve_mip_level = 0,
+            .resolve_layer = 0,
+            .cycle = true,
+            .cycle_resolve_texture = false,
+            .padding1 = 0,
+            .padding2 = 0,
+        },
+        .{
+            .texture = normal_target_tex,
+            .mip_level = 0,
+            .layer_or_depth_plane = 0,
+            .clear_color = normal_clear,
+            .load_op = c.SDL_GPU_LOADOP_CLEAR,
+            .store_op = c.SDL_GPU_STOREOP_STORE,
+            .resolve_texture = null,
+            .resolve_mip_level = 0,
+            .resolve_layer = 0,
+            .cycle = false,
+            .cycle_resolve_texture = false,
+            .padding1 = 0,
+            .padding2 = 0,
+        },
     };
 
     const depth_target = c.SDL_GPUDepthStencilTargetInfo{
@@ -1964,7 +2044,7 @@ pub fn executeScenePass(
         .layer = 0,
     };
 
-    const render_pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target) orelse return;
+    const render_pass = c.SDL_BeginGPURenderPass(cmd, &color_targets, 2, &depth_target) orelse return;
     c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
 
     // Bind clustered lighting storage buffers to fragment shader

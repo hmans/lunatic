@@ -46,6 +46,10 @@ pub const Camera = struct {
     dof_focus_dist: f32 = 0.0, // 0 = DoF disabled. World-space focal distance.
     dof_focus_range: f32 = 5.0, // Width of in-focus band (smaller = shallower DoF)
     dof_blur_radius: f32 = 8.0, // Max blur radius in pixels (at half res)
+    ssr_intensity: f32 = 0.0, // 0 = off. Reflection strength (0.5-1.0 = typical)
+    ssr_max_distance: f32 = 50.0, // Max ray march distance in world units
+    ssr_stride: f32 = 4.0, // Ray march step size in pixels (smaller = higher quality, slower)
+    ssr_thickness: f32 = 0.1, // Depth comparison thickness (world units, for hit detection)
     vignette: f32 = 0.0, // 0 = off, 0.3-0.8 = subtle to strong
     vignette_smoothness: f32 = 0.5, // How gradual the falloff is (higher = larger bright center)
     chromatic_aberration: f32 = 0.0, // 0 = off, 0.5-2.0 = subtle to strong RGB fringing
