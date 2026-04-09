@@ -224,7 +224,10 @@ fn spawnPhysicsObject(self: *Self, engine: *Engine) void {
     _ = ecs.set(engine.world, e, core.MaterialHandle, .{ .id = mat });
     ecs.add(engine.world, e, core.ShadowCaster);
     ecs.add(engine.world, e, core.ShadowReceiver);
-    _ = ecs.set(engine.world, e, core.PhysicsInterpolation, .{});
+    _ = ecs.set(engine.world, e, core.PhysicsInterpolation, .{
+        .prev_px = x, .prev_py = y, .prev_pz = z,
+        .curr_px = x, .curr_py = y, .curr_pz = z,
+    });
     physics.addPhysicsSphere(engine, e, scale * 0.5, .dynamic, 0.3, 1.5);
 
     self.body_ring[self.ring_head] = e;
