@@ -83,20 +83,17 @@ void main() {
     // Neighborhood clamping: prevent ghosting by clamping the history to the
     // range of the current frame's nearby values. This rejects stale data
     // (e.g., when an object moves and reveals a previously hidden area).
-    // Sample a 3x3 neighborhood of the current SSR.
+    // 5-tap cross pattern (center + 4 cardinals) — nearly as effective as
+    // full 3x3 for SSR clamping, but saves 4 texture fetches per pixel.
     vec2 t = vec2(1.0 / params.y, 1.0 / params.z);
-    vec4 c0 = texture(current_ssr, frag_uv + vec2(-t.x, -t.y));
     vec4 c1 = texture(current_ssr, frag_uv + vec2(    0, -t.y));
-    vec4 c2 = texture(current_ssr, frag_uv + vec2( t.x, -t.y));
     vec4 c3 = texture(current_ssr, frag_uv + vec2(-t.x,     0));
     vec4 c4 = current;
     vec4 c5 = texture(current_ssr, frag_uv + vec2( t.x,     0));
-    vec4 c6 = texture(current_ssr, frag_uv + vec2(-t.x,  t.y));
     vec4 c7 = texture(current_ssr, frag_uv + vec2(    0,  t.y));
-    vec4 c8 = texture(current_ssr, frag_uv + vec2( t.x,  t.y));
 
-    vec4 nmin = min(min(min(c0, c1), min(c2, c3)), min(min(c4, c5), min(c6, min(c7, c8))));
-    vec4 nmax = max(max(max(c0, c1), max(c2, c3)), max(max(c4, c5), max(c6, max(c7, c8))));
+    vec4 nmin = min(min(c1, c3), min(min(c4, c5), c7));
+    vec4 nmax = max(max(c1, c3), max(max(c4, c5), c7));
 
     // Clamp history to neighborhood bounds (prevents ghosting)
     history = clamp(history, nmin, nmax);

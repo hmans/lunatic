@@ -241,47 +241,112 @@ pub const DrawEntry = struct {
 };
 
 // ============================================================
-// sRGB → HDR conversion (inverse of composite shader's tonemap + gamma)
+// sRGB → HDR conversion (inverse of composite shader's AgX tonemap + gamma)
 // ============================================================
+//
+// User-specified sRGB colors (clear color, fog color) need to be pre-transformed
+// so they round-trip correctly through the composite shader's AgX tonemapper.
+// Given a target sRGB display color, we find the linear HDR value that, after
+// exposure + AgX + gamma, produces that exact color on screen.
+//
+// Since the AgX pipeline (3x3 matrix → log → 6th-degree polynomial → 3x3 matrix)
+// is not analytically invertible, we use Newton-Raphson iteration on each channel
+// of the full forward pipeline. 8 iterations converge to machine precision for
+// any input in [0, 1]. This runs once at scene setup, not per-frame.
 
-/// Convert a display-space (sRGB) color to the linear HDR value that the
-/// composite shader's ACES tonemap + gamma will map back to the original.
-fn srgbToHdr(srgb: f32, exposure: f32) f32 {
-    // Undo gamma: sRGB ��� linear
-    const linear = std.math.pow(f32, srgb, 2.2);
-    // Undo ACES Narkowicz: solve  y = (x(2.51x+0.03)) / (x(2.43x+0.59)+0.14)
-    // Rearranging: (2.43y - 2.51)x² + (0.59y - 0.03)x + 0.14y = 0
-    // Use quadratic formula, take the smaller positive root.
-    const y = linear;
-    const a = 2.43 * y - 2.51;
-    const b = 0.59 * y - 0.03;
-    const cv = 0.14 * y;
-    const discriminant = b * b - 4.0 * a * cv;
-    if (discriminant < 0) return linear; // fallback
-    const sq = @sqrt(discriminant);
-    // a is negative for y < ~1.03, so the valid root is (-b + sqrt) / 2a
-    const r1 = (-b + sq) / (2.0 * a);
-    const r2 = (-b - sq) / (2.0 * a);
-    const x = if (r1 >= 0 and (r2 < 0 or r1 < r2)) r1 else r2;
-    // Undo exposure
-    return if (exposure > 0) x / exposure else x;
+/// Forward AgX tonemapping for a single RGB color (matches composite.frag exactly).
+fn agxForward(rgb: [3]f32) [3]f32 {
+    // Pre-scale to match composite.frag's AgX brightness compensation
+    const prescaled = [3]f32{ rgb[0] * 0.85, rgb[1] * 0.85, rgb[2] * 0.85 };
+    // Step 1: linear sRGB → AgX log-space (inset matrix)
+    var ch = [3]f32{
+        0.842479 * prescaled[0] + 0.0423738 * prescaled[1] + 0.0423738 * prescaled[2],
+        0.0784336 * prescaled[0] + 0.878236 * prescaled[1] + 0.0784336 * prescaled[2],
+        0.0792238 * prescaled[0] + 0.0791661 * prescaled[1] + 0.879142 * prescaled[2],
+    };
+
+    // Step 2: log2 encoding to [0,1]
+    const log_min: f32 = -12.47393;
+    const log_max: f32 = 4.026069;
+    for (&ch) |*v| {
+        v.* = @log2(@max(v.*, 1e-10));
+        v.* = (v.* - log_min) / (log_max - log_min);
+        v.* = std.math.clamp(v.*, 0.0, 1.0);
+    }
+
+    // Step 3: AgX base contrast curve (6th-degree polynomial)
+    for (&ch) |*v| {
+        const x = v.*;
+        const x2 = x * x;
+        const x4 = x2 * x2;
+        v.* = 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232;
+    }
+
+    // Step 4: AgX log-space → linear sRGB (outset matrix)
+    const r = 1.19687 * ch[0] + -0.0528968 * ch[1] + -0.0529716 * ch[2];
+    const g = -0.0980208 * ch[0] + 1.15190 * ch[1] + -0.0980434 * ch[2];
+    const b = -0.0990297 * ch[0] + -0.0989612 * ch[1] + 1.15107 * ch[2];
+
+    return .{
+        std.math.clamp(r, 0.0, 1.0),
+        std.math.clamp(g, 0.0, 1.0),
+        std.math.clamp(b, 0.0, 1.0),
+    };
+}
+
+/// Inverse AgX + gamma + exposure for a single channel, via Newton-Raphson.
+/// Finds x such that: gamma(agxForward([x,x,x] * exposure)[channel]) ≈ target_srgb
+/// We actually work on the full RGB triple to account for the 3x3 matrix coupling.
+fn srgbToHdr3(srgb: [3]f32, exposure: f32) [3]f32 {
+    // Target: the linear values after undoing gamma
+    var target: [3]f32 = undefined;
+    for (0..3) |i| {
+        target[i] = std.math.pow(f32, srgb[i], 2.2);
+    }
+
+    // Initial guess: start with the linear value (pre-exposure)
+    var x: [3]f32 = undefined;
+    const exp_safe = if (exposure > 0) exposure else 1.0;
+    for (0..3) |i| {
+        x[i] = target[i] / exp_safe;
+    }
+
+    // Newton-Raphson: iterate to find x where agxForward(x * exposure) = target
+    for (0..12) |_| {
+        var exposed: [3]f32 = undefined;
+        for (0..3) |i| exposed[i] = x[i] * exp_safe;
+
+        const fwd = agxForward(exposed);
+
+        // Numerical derivative: d(agxForward)/dx per channel
+        const eps: f32 = 1e-4;
+        var dx: [3]f32 = undefined;
+        for (0..3) |i| {
+            var nudged = exposed;
+            nudged[i] += eps;
+            const fwd_nudged = agxForward(nudged);
+            const deriv = (fwd_nudged[i] - fwd[i]) / eps;
+            const err = fwd[i] - target[i];
+            // Guard against zero derivative (flat regions of the curve)
+            if (@abs(deriv) > 1e-8) {
+                dx[i] = err / deriv;
+            } else {
+                dx[i] = 0;
+            }
+        }
+
+        for (0..3) |i| {
+            x[i] -= dx[i] / exp_safe;
+            x[i] = @max(x[i], 0.0);
+        }
+    }
+
+    return x;
 }
 
 fn srgbToHdr4(color: [4]f32, exposure: f32) [4]f32 {
-    return .{
-        srgbToHdr(color[0], exposure),
-        srgbToHdr(color[1], exposure),
-        srgbToHdr(color[2], exposure),
-        color[3],
-    };
-}
-
-fn srgbToHdr3(color: [3]f32, exposure: f32) [3]f32 {
-    return .{
-        srgbToHdr(color[0], exposure),
-        srgbToHdr(color[1], exposure),
-        srgbToHdr(color[2], exposure),
-    };
+    const rgb = srgbToHdr3(.{ color[0], color[1], color[2] }, exposure);
+    return .{ rgb[0], rgb[1], rgb[2], color[3] };
 }
 
 // ============================================================

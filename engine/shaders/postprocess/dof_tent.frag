@@ -10,7 +10,7 @@
 // The filter width scales with the local Circle of Confusion (stored in the
 // bokeh output's alpha channel). At small CoC values the filter stays tight
 // (standard 3x3 at single-texel spacing), but at large CoC values the offsets
-// widen to cover the larger gaps between the 48 spiral samples. Without this
+// widen to cover the larger gaps between the 71 spiral samples. Without this
 // adaptive scaling, extreme blur radii produce visible dotty patterns where
 // individual gather samples show through.
 //
@@ -42,10 +42,11 @@ void main() {
     // At small radii (<=3px), use 1-texel spacing (standard 3x3 tent).
     // At large radii, widen proportionally so the 9 taps span enough of
     // the disk to smooth out the sparse golden-angle sample pattern.
-    // The 0.4 factor is empirical: with 71 gather samples, the inter-sample
-    // spacing at the disk edge is roughly ~2*pi*R/sqrt(71) ≈ 0.75*R pixels.
-    // A tent offset of 0.4*R covers enough of the disk per tap direction to
-    // fill in the gaps without over-blurring sharp in-focus areas.
+    // The 0.4 factor is empirical: with 71 gather samples (SAMPLES in
+    // dof_bokeh.frag), the inter-sample spacing at the disk edge is roughly
+    // ~2*pi*R/sqrt(71) ≈ 0.75*R pixels. A tent offset of 0.4*R covers enough
+    // of the disk per tap direction to fill in the gaps without over-blurring
+    // sharp in-focus areas.
     float scale = max(1.0, disk_radius * 0.4);
     vec2 t = tent.params.xy * scale;
 

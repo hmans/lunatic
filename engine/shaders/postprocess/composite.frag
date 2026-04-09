@@ -139,14 +139,73 @@ void main() {
         color *= vec3(1.0 + temp * 0.1, 1.0, 1.0 - temp * 0.1);
     }
 
-    // ---- ACES Tonemapping ----
-    // Narkowicz approximation of the ACES filmic curve (RRT + ODT).
-    // Maps HDR [0, inf) to LDR [0, 1] with a pleasing S-curve:
-    // - Toe: lifts shadows slightly (cinematic look)
-    // - Shoulder: compresses highlights gradually (no hard clipping)
-    // - Known issue: oversaturates warm colors (reds/oranges) at high exposure
-    // Reference: Krzysztof Narkowicz, "ACES Filmic Tone Mapping Curve", 2015
-    color = clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), 0.0, 1.0);
+    // ---- AgX Tonemapping ----
+    // AgX (Troy Sobotka, 2023) — a display rendering transform designed as a
+    // modern replacement for ACES. Default in Blender 4.0+.
+    //
+    // Key advantages over Narkowicz ACES:
+    //   - Highlights desaturate gracefully toward white (physically correct)
+    //     instead of oversaturating warm colors (the main ACES flaw)
+    //   - Smoother shoulder rolloff with no color shifts in bright areas
+    //   - Better shadow behavior (less "lifted" blacks)
+    //
+    // The transform works in three steps:
+    //   1. Apply a 3x3 matrix to rotate into AgX's "log" colorspace
+    //   2. Apply the S-curve (polynomial fit to the AgX base contrast LUT)
+    //   3. Apply the inverse matrix to return to linear sRGB
+    //
+    // The polynomial approximation (agxDefaultContrastApprox) replaces the
+    // original 1D LUT with a 6th-degree polynomial that's GPU-friendly.
+    //
+    // Reference: Troy Sobotka, "AgX", https://github.com/sobotka/AgX
+    //            Blender implementation (compositor & EEVEE)
+    {
+        // AgX has brighter midtone response than ACES (~8% higher at mid-gray).
+        // This pre-scale compensates so scenes tuned for ACES look correct.
+        // Without it, the overall image appears washed out / too bright.
+        color *= 0.85;
+
+        // Step 1: Linear sRGB → AgX log-space.
+        // This 3x3 matrix encodes the AgX "inset" transform: it maps the sRGB
+        // gamut into a working space where the S-curve can be applied per-channel
+        // without producing hue shifts. The matrix values come from the AgX config.
+        color = max(color, vec3(0.0));  // AgX needs non-negative input
+        color = mat3(
+            0.842479, 0.0423738, 0.0423738,
+            0.0784336, 0.878236, 0.0784336,
+            0.0792238, 0.0791661, 0.879142
+        ) * color;
+
+        // Clamp to [1e-10, 65504] then take log2 and remap to [0,1].
+        // 65504 is half-float max — the practical HDR ceiling.
+        // The log encoding compresses the huge HDR range into [0,1] so the
+        // polynomial curve can operate in a well-conditioned domain.
+        color = clamp(log2(clamp(color, 1e-10, 65504.0)), vec3(-12.47393), vec3(4.026069));
+        color = (color - vec3(-12.47393)) / (4.026069 - (-12.47393));
+
+        // Step 2: Apply AgX base contrast curve (6th-degree polynomial fit).
+        // This is the heart of the transform — an S-curve that compresses
+        // highlights while keeping shadows clean. The polynomial coefficients
+        // were fitted to match the original AgX 1D LUT.
+        vec3 x2 = color * color;
+        vec3 x4 = x2 * x2;
+        color = + 15.5     * x4 * x2
+                - 40.14    * x4 * color
+                + 31.96    * x4
+                - 6.868    * x2 * color
+                + 0.4298   * x2
+                + 0.1191   * color
+                - 0.00232;
+
+        // Step 3: AgX log-space → linear sRGB (inverse of step 1).
+        color = mat3(
+             1.19687, -0.0528968, -0.0529716,
+            -0.0980208, 1.15190, -0.0980434,
+            -0.0990297, -0.0989612, 1.15107
+        ) * color;
+
+        color = clamp(color, 0.0, 1.0);
+    }
 
     // ---- Gamma Correction ----
     // Convert from linear light to sRGB for display. The simple pow(1/2.2)

@@ -24,7 +24,7 @@
 //   over a foreground character. But foreground CAN bleed onto background,
 //   simulating the way out-of-focus foreground objects appear as soft overlays.
 //
-// Runs at half resolution for performance (48 samples * half-res = manageable).
+// Runs at half resolution for performance (71 samples * half-res = manageable).
 //
 // Pipeline position: prefilter -> [this shader] -> tent smooth -> composite
 // ============================================================================

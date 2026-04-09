@@ -136,7 +136,53 @@ float geometrySmith(float NdotV, float NdotL, float roughness) {
 // At grazing angles, all surfaces become reflective (Fresnel effect).
 // F0 = reflectance at normal incidence (0.04 for dielectrics, albedo for metals).
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
-    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+    float t = clamp(1.0 - cosTheta, 0.0, 1.0);
+    float t2 = t * t;
+    // Manual pow(t, 5) = t^2 * t^2 * t — guaranteed fast on all drivers
+    // (some compile pow(x, 5.0) to exp(5*log(x)) instead of multiply chain)
+    return F0 + (1.0 - F0) * (t2 * t2 * t);
+}
+
+// Multi-scatter energy compensation (Kulla & Conty 2017, Filament formulation).
+//
+// Single-scatter GGX only accounts for light that bounces once off microfacets.
+// At high roughness, a significant fraction of light bounces multiple times
+// before leaving the surface. Without compensation, rough surfaces appear too
+// dark — energy is "lost" to the unmodeled bounces.
+//
+// This returns a per-channel multiplier for the specular BRDF that scales it
+// up to account for the missing inter-reflection energy. The key insight:
+// rather than adding a separate term (which can overwhelm dark surfaces),
+// we boost the existing specular contribution proportionally.
+//
+// The multiplier is: 1 + F0 * (1/Ess - 1), where Ess is the directional
+// albedo of the single-scatter BRDF (approximated analytically from
+// Lazarov 2013 / Karis 2014 split-sum fit).
+//
+// For smooth surfaces (Ess ≈ 1): multiplier ≈ 1 (no correction needed).
+// For rough metals (Ess << 1, F0 ≈ base_color): significant boost.
+// For rough dielectrics (F0 = 0.04): tiny boost (~4% of the missing energy).
+//
+// References:
+//   - Kulla & Conty, "Revisiting Physically Based Shading at Imageworks", 2017
+//   - Google Filament documentation, "Specular energy compensation"
+vec3 multiScatterCompensation(float NdotV, vec3 F0, float roughness) {
+    float a = roughness;
+    float a2 = a * a;
+    // Approximate Ess: directional albedo of the single-scatter BRDF.
+    // This polynomial fit matches the precomputed BRDF integration LUT.
+    float one_minus_NdotV = 1.0 - NdotV;
+    float omn2 = one_minus_NdotV * one_minus_NdotV;
+    float omn5 = omn2 * omn2 * one_minus_NdotV;
+    float scale = 1.0 - a2 * (0.04 + 0.96 * omn5);
+    float bias = a2 * omn5;
+    vec3 Ess = F0 * scale + vec3(bias);
+
+    // Specular energy compensation multiplier.
+    // Ess = fraction of energy the single-scatter BRDF reflects.
+    // 1/Ess = what we'd need to reach full energy conservation.
+    // F0 * (1/Ess - 1) = the fraction F0 would contribute from bounces 2+.
+    return 1.0 + F0 * (1.0 / max(Ess, vec3(0.001)) - 1.0);
 }
 
 // ============================================================================
@@ -182,8 +228,6 @@ float sampleShadowCascade(vec3 pos, int cascade) {
 
     // 4-tap PCF (percentage-closer filtering) for softer shadow edges.
     // Samples a 2x2 pattern offset by one texel in each direction.
-    // More taps = smoother edges but higher cost. 4 is the minimum for
-    // acceptable quality. Consider upgrading to 8-16 tap Poisson disk.
     float texel = 1.0 / shadow.shadow_params.x;  // 1 texel in atlas UV space
     float result = 0.0;
     result += depth <= texture(shadow_atlas, atlas_uv + vec2(-texel, -texel)).r ? 1.0 : 0.0;
@@ -237,7 +281,7 @@ float sampleShadow(vec3 frag_world_pos, vec3 N, vec3 L) {
 // fragment from the clustered lighting loop.
 
 vec3 evaluateLight(GPULight light, vec3 N, vec3 V, float NdotV, vec3 frag_pos,
-                   vec3 base_color, float metallic, float roughness, vec3 F0) {
+                   vec3 base_color, float metallic, float roughness, vec3 F0, vec3 energyComp) {
     vec3 L_vec = light.pos_radius.xyz - frag_pos;
     float dist = length(L_vec);
     float radius = light.pos_radius.w;
@@ -291,6 +335,7 @@ vec3 evaluateLight(GPULight light, vec3 N, vec3 V, float NdotV, vec3 frag_pos,
     vec3  F = fresnelSchlick(HdotV, F0);
 
     vec3 specular = (D * G * F) / (4.0 * NdotV * NdotL + 0.0001);
+    specular *= energyComp;  // Multi-scatter energy compensation
     vec3 kD = (1.0 - F) * (1.0 - metallic);  // Metals have no diffuse
     vec3 diffuse = kD * base_color / PI;
 
@@ -367,6 +412,12 @@ void main() {
     vec3 kD = (1.0 - F) * (1.0 - metallic);
     vec3 diffuse = kD * base_color / PI;
 
+    // Multi-scatter energy compensation: scales up specular to account for
+    // energy lost to unmodeled inter-reflections at high roughness.
+    // This is a multiplier (not additive), so it can't make dark surfaces bright.
+    vec3 Fms = multiScatterCompensation(NdotV, F0, roughness);
+    specular *= Fms;
+
     // ---- Direct Lighting (Sun) ----
 
     float shadow_factor = receives_shadow > 0.5 ? sampleShadow(world_pos, N, L) : 1.0;
@@ -418,7 +469,7 @@ void main() {
         for (uint i = 0u; i < count; i++) {
             uint light_idx = light_indices[offset + i];
             color += evaluateLight(lights[light_idx], N, V, NdotV, world_pos,
-                                   base_color, metallic, roughness, F0);
+                                   base_color, metallic, roughness, F0, Fms);
         }
     }
 
