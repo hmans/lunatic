@@ -80,6 +80,9 @@ pub const PhysicsState = struct {
     bp_layer_iface: BPLayerInterface = .{},
     obj_vs_bp_filter: ObjVsBPFilter = .{},
     obj_pair_filter: ObjPairFilter = .{},
+    /// Persistent query for entities with Position + Rotation + RigidBody.
+    /// Created once at init, reused every physics step for transform sync.
+    sync_query: ?*ecs.query_t = null,
     initialized: bool = false,
 };
 
@@ -106,10 +109,15 @@ pub fn initPhysics(self: *Engine) !void {
         },
     );
     self.physics.initialized = true;
+
+    // Create persistent query for transform sync (Position + Rotation + RigidBody).
+    const ids = physicsQueryIds();
+    self.physics.sync_query = queryInit(self.world, &ids, &.{});
 }
 
 pub fn deinitPhysics(self: *Engine) void {
     if (!self.physics.initialized) return;
+    if (self.physics.sync_query) |q| ecs.query_fini(q);
     if (self.physics.system) |sys| sys.destroy();
     zp.deinit();
     self.physics.initialized = false;
@@ -232,17 +240,20 @@ fn physicsQueryIds() [3]ecs.id_t {
     return .{ ecs.id(core.Position), ecs.id(core.Rotation), ecs.id(core.RigidBody) };
 }
 
-/// Sync current Jolt transforms into ECS Position/Rotation.
+/// Sync Jolt transforms into ECS Position/Rotation.
+/// Only updates active (non-sleeping) bodies to avoid wasting cycles
+/// on the hundreds of bodies that Jolt has deactivated.
 fn syncCurrentTransforms(self: *Engine, body_iface: *const zp.BodyInterface) void {
-    const ids = physicsQueryIds();
-    const q = queryInit(self.world, &ids, &.{});
-    defer ecs.query_fini(q);
+    const q = self.physics.sync_query orelse return;
     var it = ecs.query_iter(self.world, q);
 
     while (ecs.query_next(&it)) for (it.entities()) |entity| {
         const rb = ecs.get(self.world, entity, core.RigidBody) orelse continue;
         const body_id: zp.BodyId = @enumFromInt(rb.body_id);
         if (body_id == .invalid) continue;
+
+        // Skip sleeping bodies — their transforms haven't changed.
+        if (!body_iface.isActive(body_id)) continue;
 
         const jolt_pos = body_iface.getPosition(body_id);
         const jolt_rot = body_iface.getRotation(body_id);
