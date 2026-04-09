@@ -1198,6 +1198,11 @@ pub const Engine = struct {
                 _ = ecs.SYSTEM(self.world, "physics", &phys_desc);
             }
 
+            // physics_interpolation: lerps between physics states every frame for
+            // entities with PhysicsInterpolation. Runs on PreStore so it writes
+            // Position/Rotation after all game systems but before rendering.
+            self.addSystem("physics_interpolation", &physics.physicsInterpolationSystem, ecs.PreStore);
+
             // stats_overlay: ImGui overlay, no ECS deps — needs immediate (ImGui context).
             self.addSystem("stats_overlay", &Engine.statsOverlaySystem, ecs.OnStore);
         }

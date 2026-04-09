@@ -83,6 +83,10 @@ pub const PhysicsState = struct {
     /// Persistent query for entities with Position + Rotation + RigidBody.
     /// Created once at init, reused every physics step for transform sync.
     sync_query: ?*ecs.query_t = null,
+    /// Persistent query for interpolated entities (Position + Rotation + PhysicsInterpolation).
+    interp_query: ?*ecs.query_t = null,
+    /// Time accumulated since last physics step, for interpolation alpha.
+    time_since_step: f32 = 0,
     initialized: bool = false,
 };
 
@@ -110,13 +114,16 @@ pub fn initPhysics(self: *Engine) !void {
     );
     self.physics.initialized = true;
 
-    // Create persistent query for transform sync (Position + Rotation + RigidBody).
-    const ids = physicsQueryIds();
-    self.physics.sync_query = queryInit(self.world, &ids, &.{});
+    // Create persistent queries.
+    const sync_ids = physicsQueryIds();
+    self.physics.sync_query = queryInit(self.world, &sync_ids, &.{});
+    const interp_ids = [_]ecs.id_t{ ecs.id(core.Position), ecs.id(core.Rotation), ecs.id(core.PhysicsInterpolation) };
+    self.physics.interp_query = queryInit(self.world, &interp_ids, &.{});
 }
 
 pub fn deinitPhysics(self: *Engine) void {
     if (!self.physics.initialized) return;
+    if (self.physics.interp_query) |q| ecs.query_fini(q);
     if (self.physics.sync_query) |q| ecs.query_fini(q);
     if (self.physics.system) |sys| sys.destroy();
     zp.deinit();
@@ -233,6 +240,35 @@ pub fn physicsSystem(self: *Engine, _: f32) void {
 
     phys.update(physics_timestep, .{}) catch return;
     syncCurrentTransforms(self, body_iface);
+
+    // Reset interpolation timer — a physics step just happened.
+    self.physics.time_since_step = 0;
+}
+
+/// Interpolation system: runs every frame (PreStore phase), lerps between
+/// previous and current physics transforms for entities with PhysicsInterpolation.
+/// This produces smooth motion at render rate even with low physics tick rates.
+pub fn physicsInterpolationSystem(self: *Engine, dt: f32) void {
+    self.physics.time_since_step += dt;
+    const alpha = std.math.clamp(self.physics.time_since_step / physics_timestep, 0, 1);
+
+    const q = self.physics.interp_query orelse return;
+    var it = ecs.query_iter(self.world, q);
+
+    while (ecs.query_next(&it)) for (it.entities()) |entity| {
+        const interp = ecs.get(self.world, entity, core.PhysicsInterpolation) orelse continue;
+
+        if (ecs.get_mut(self.world, entity, core.Position)) |pos| {
+            pos.x = lerp(interp.prev_px, interp.curr_px, alpha);
+            pos.y = lerp(interp.prev_py, interp.curr_py, alpha);
+            pos.z = lerp(interp.prev_pz, interp.curr_pz, alpha);
+        }
+        if (ecs.get_mut(self.world, entity, core.Rotation)) |rot| {
+            rot.x = lerpAngle(interp.prev_rx, interp.curr_rx, alpha);
+            rot.y = lerpAngle(interp.prev_ry, interp.curr_ry, alpha);
+            rot.z = lerpAngle(interp.prev_rz, interp.curr_rz, alpha);
+        }
+    };
 }
 
 /// Build component IDs for the physics query at runtime.
@@ -240,9 +276,10 @@ fn physicsQueryIds() [3]ecs.id_t {
     return .{ ecs.id(core.Position), ecs.id(core.Rotation), ecs.id(core.RigidBody) };
 }
 
-/// Sync Jolt transforms into ECS Position/Rotation.
-/// Only updates active (non-sleeping) bodies to avoid wasting cycles
-/// on the hundreds of bodies that Jolt has deactivated.
+/// Sync Jolt transforms into ECS. For entities with PhysicsInterpolation,
+/// shifts current→prev and writes new Jolt state as current (the interpolation
+/// system handles the actual Position/Rotation lerp). For entities without
+/// interpolation, writes directly to Position/Rotation as before.
 fn syncCurrentTransforms(self: *Engine, body_iface: *const zp.BodyInterface) void {
     const q = self.physics.sync_query orelse return;
     var it = ecs.query_iter(self.world, q);
@@ -251,23 +288,39 @@ fn syncCurrentTransforms(self: *Engine, body_iface: *const zp.BodyInterface) voi
         const rb = ecs.get(self.world, entity, core.RigidBody) orelse continue;
         const body_id: zp.BodyId = @enumFromInt(rb.body_id);
         if (body_id == .invalid) continue;
-
-        // Skip sleeping bodies — their transforms haven't changed.
         if (!body_iface.isActive(body_id)) continue;
 
         const jolt_pos = body_iface.getPosition(body_id);
         const jolt_rot = body_iface.getRotation(body_id);
         const euler = quatToEuler(jolt_rot);
 
-        var ecs_pos = ecs.get_mut(self.world, entity, core.Position) orelse continue;
-        ecs_pos.x = jolt_pos[0];
-        ecs_pos.y = jolt_pos[1];
-        ecs_pos.z = jolt_pos[2];
+        // If entity has PhysicsInterpolation, store prev/current for lerping.
+        // The interpolation system writes to Position/Rotation each frame.
+        if (ecs.get_mut(self.world, entity, core.PhysicsInterpolation)) |interp| {
+            interp.prev_px = interp.curr_px;
+            interp.prev_py = interp.curr_py;
+            interp.prev_pz = interp.curr_pz;
+            interp.prev_rx = interp.curr_rx;
+            interp.prev_ry = interp.curr_ry;
+            interp.prev_rz = interp.curr_rz;
+            interp.curr_px = jolt_pos[0];
+            interp.curr_py = jolt_pos[1];
+            interp.curr_pz = jolt_pos[2];
+            interp.curr_rx = euler[0];
+            interp.curr_ry = euler[1];
+            interp.curr_rz = euler[2];
+        } else {
+            // No interpolation — snap directly.
+            var ecs_pos = ecs.get_mut(self.world, entity, core.Position) orelse continue;
+            ecs_pos.x = jolt_pos[0];
+            ecs_pos.y = jolt_pos[1];
+            ecs_pos.z = jolt_pos[2];
 
-        var ecs_rot = ecs.get_mut(self.world, entity, core.Rotation) orelse continue;
-        ecs_rot.x = euler[0];
-        ecs_rot.y = euler[1];
-        ecs_rot.z = euler[2];
+            var ecs_rot = ecs.get_mut(self.world, entity, core.Rotation) orelse continue;
+            ecs_rot.x = euler[0];
+            ecs_rot.y = euler[1];
+            ecs_rot.z = euler[2];
+        }
     };
 }
 
@@ -279,6 +332,18 @@ fn syncCurrentTransforms(self: *Engine, body_iface: *const zp.BodyInterface) voi
 // ============================================================
 // Helpers
 // ============================================================
+
+fn lerp(a: f32, b: f32, t: f32) f32 {
+    return a + (b - a) * t;
+}
+
+/// Lerp between two angles in degrees, handling wraparound.
+fn lerpAngle(a: f32, b: f32, t: f32) f32 {
+    var diff = b - a;
+    if (diff > 180) diff -= 360;
+    if (diff < -180) diff += 360;
+    return a + diff * t;
+}
 
 /// Convert quaternion [x,y,z,w] to Euler angles [pitch,yaw,roll] in degrees.
 fn quatToEuler(q: [4]f32) [3]f32 {

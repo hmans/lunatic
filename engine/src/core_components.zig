@@ -109,6 +109,17 @@ pub const RigidBody = struct {
     body_id: u32 = 0,
 };
 
+/// Opt-in smooth interpolation between physics steps. Add this alongside
+/// RigidBody to get lerped Position/Rotation at render rate instead of
+/// snapping to the latest physics state. The physics system stores prev/current
+/// transforms here; a PreStore system lerps them every frame.
+pub const PhysicsInterpolation = struct {
+    prev_px: f32 = 0, prev_py: f32 = 0, prev_pz: f32 = 0,
+    curr_px: f32 = 0, curr_py: f32 = 0, curr_pz: f32 = 0,
+    prev_rx: f32 = 0, prev_ry: f32 = 0, prev_rz: f32 = 0,
+    curr_rx: f32 = 0, curr_ry: f32 = 0, curr_rz: f32 = 0,
+};
+
 /// Tag: entity's mesh is rendered into the shadow map.
 pub const ShadowCaster = struct {};
 
@@ -116,7 +127,7 @@ pub const ShadowCaster = struct {};
 pub const ShadowReceiver = struct {};
 
 /// Core component tuple — engine modules reference these directly.
-pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, PointLight, SpotLight, LookAt, FlyCamera, Age, RigidBody, ShadowCaster, ShadowReceiver };
+pub const all = .{ Position, Rotation, Scale, MeshHandle, MaterialHandle, Camera, DirectionalLight, PointLight, SpotLight, LookAt, FlyCamera, Age, RigidBody, PhysicsInterpolation, ShadowCaster, ShadowReceiver };
 
 /// Concatenate core components with example-specific ones.
 /// Usage: `pub const all = core.withExtra(.{ Spin, Player });`
