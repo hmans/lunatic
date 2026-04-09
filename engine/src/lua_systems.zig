@@ -486,12 +486,14 @@ pub const LuaSystemManager = struct {
 // ============================================================
 
 fn luaSystemCallback(it: *ecs.iter_t) callconv(.c) void {
+    const sdl = engine_mod.c;
     const engine: *Engine = @ptrCast(@alignCast(it.ctx));
     const sys_idx: usize = @intFromPtr(it.callback_ctx);
     var sys = &engine.lua_sys.systems[sys_idx];
 
     if (!sys.enabled) return;
     const L = sys.lua_state orelse return;
+    const t0 = sdl.SDL_GetPerformanceCounter();
 
     sys.elapsed += it.delta_time;
     lc.lua_pushnumber(L, @floatCast(sys.elapsed));
@@ -528,6 +530,9 @@ fn luaSystemCallback(it: *ecs.iter_t) callconv(.c) void {
             }
         }
     }
+
+    const t1 = sdl.SDL_GetPerformanceCounter();
+    engine.recordSystemTime(it.system, t1 - t0);
 }
 
 // ============================================================

@@ -159,6 +159,27 @@ pub const Config = struct {
 // Engine
 // ============================================================
 
+pub const SystemTimeEntry = struct {
+    entity: ecs.entity_t = 0,
+    time_us: f64 = 0, // averaged microseconds per frame (from last snapshot)
+    acc_ticks: u64 = 0, // accumulator (raw performance counter ticks)
+    acc_frames: u32 = 0,
+
+    fn record(self: *SystemTimeEntry, entity: ecs.entity_t, elapsed_ticks: u64) void {
+        self.entity = entity;
+        self.acc_ticks += elapsed_ticks;
+        self.acc_frames += 1;
+    }
+
+    fn snapshot(self: *SystemTimeEntry, pf: u64) void {
+        if (self.acc_frames > 0) {
+            self.time_us = @as(f64, @floatFromInt(self.acc_ticks)) * 1_000_000.0 / @as(f64, @floatFromInt(pf)) / @as(f64, @floatFromInt(self.acc_frames));
+            self.acc_ticks = 0;
+            self.acc_frames = 0;
+        }
+    }
+};
+
 pub const FrameStats = struct {
     draw_calls: u32 = 0,
     entities_rendered: u32 = 0,
@@ -167,12 +188,14 @@ pub const FrameStats = struct {
     occlusion_culled: u32 = 0, // entities rejected by HiZ occlusion culling
     physics_active: u32 = 0,
     physics_total: u32 = 0,
-    // Render sub-timings (raw + smoothed)
+    // CPU sub-timings (raw + smoothed, microseconds)
+    time_systems_us: u64 = 0, // ecs.progress (all systems)
     time_prepare_us: u64 = 0,
     time_instances_us: u64 = 0,
     time_scene_us: u64 = 0,
     time_postprocess_us: u64 = 0,
     time_imgui_us: u64 = 0,
+    avg_systems: f64 = 0,
     avg_prepare: f64 = 0,
     avg_instances: f64 = 0,
     avg_scene: f64 = 0,
@@ -180,6 +203,7 @@ pub const FrameStats = struct {
     avg_imgui: f64 = 0,
 
     // Accumulate samples, snapshot averages twice per second
+    acc_systems: u64 = 0,
     acc_prepare: u64 = 0,
     acc_instances: u64 = 0,
     acc_scene: u64 = 0,
@@ -189,6 +213,7 @@ pub const FrameStats = struct {
     snapshot_frames: u32 = 1, // frames in last snapshot (for system avg)
 
     pub fn accumulate(self: *FrameStats) void {
+        self.acc_systems += self.time_systems_us;
         self.acc_prepare += self.time_prepare_us;
         self.acc_instances += self.time_instances_us;
         self.acc_scene += self.time_scene_us;
@@ -200,11 +225,13 @@ pub const FrameStats = struct {
         if (self.acc_frames >= 30) {
             self.snapshot_frames = self.acc_frames;
             const n: f64 = @floatFromInt(self.acc_frames);
+            self.avg_systems = @as(f64, @floatFromInt(self.acc_systems)) / n;
             self.avg_prepare = @as(f64, @floatFromInt(self.acc_prepare)) / n;
             self.avg_instances = @as(f64, @floatFromInt(self.acc_instances)) / n;
             self.avg_scene = @as(f64, @floatFromInt(self.acc_scene)) / n;
             self.avg_postprocess = @as(f64, @floatFromInt(self.acc_postprocess)) / n;
             self.avg_imgui = @as(f64, @floatFromInt(self.acc_imgui)) / n;
+            self.acc_systems = 0;
             self.acc_prepare = 0;
             self.acc_instances = 0;
             self.acc_scene = 0;
@@ -315,9 +342,12 @@ fn zigSystemCallback(comptime func: ZigSystemFn) ecs.iter_action_t {
     return &struct {
         fn callback(it: *ecs.iter_t) callconv(.c) void {
             const engine: *Engine = @ptrCast(@alignCast(it.ctx));
+            const t0 = c.SDL_GetPerformanceCounter();
             ecs.defer_suspend(engine.world);
             func(engine, it.delta_time);
             ecs.defer_resume(engine.world);
+            const t1 = c.SDL_GetPerformanceCounter();
+            engine.recordSystemTime(it.system, t1 - t0);
         }
     }.callback;
 }
@@ -454,6 +484,9 @@ pub const Engine = struct {
     current_frame: u64 = 0,
     stats: FrameStats = .{},
 
+    // Per-system profiling: tracks previous time_spent for delta calculation.
+    system_prev_time: [64]SystemTimeEntry = .{SystemTimeEntry{}} ** 64,
+
     // Debug server (HTTP API for external tools)
     dbg_server: debug_server.DebugServer = .{},
 
@@ -482,6 +515,10 @@ pub const Engine = struct {
             .debug_stats = config.debug_stats,
         };
         errdefer _ = ecs.fini(world);
+
+        // Enable per-system time measurement for profiling.
+        ecs.measure_system_time(world, true);
+        ecs.measure_frame_time(world, true);
 
         // Register all component types with flecs (required before use),
         // then register their struct metadata for the Explorer's reflection UI.
@@ -601,7 +638,10 @@ pub const Engine = struct {
             // Run all systems via the flecs pipeline scheduler.
             // This ticks game systems (age, physics, fly_camera, user systems)
             // and internal flecs modules (REST API, stats).
+            const tsys0 = c.SDL_GetPerformanceCounter();
             _ = ecs.progress(self.world, dt);
+            const tsys1 = c.SDL_GetPerformanceCounter();
+            self.stats.time_systems_us = (tsys1 - tsys0) * 1_000_000 / c.SDL_GetPerformanceFrequency();
 
             // Process debug server requests (after systems, before rendering)
             self.dbg_server.drainRequests();
@@ -790,6 +830,9 @@ pub const Engine = struct {
             self.stats.time_imgui_us = (tui1 - tui0) * 1_000_000 / pf;
 
             self.stats.accumulate();
+            // Snapshot per-system timings when frame stats snapshot
+            // (acc_frames == 1 means accumulate() just reset and started a new period)
+            if (self.stats.acc_frames == 1) self.snapshotSystemTimes();
 
             // Screenshot: blit to swapchain + download from intermediate texture
             if (self.screenshot_requested and self.screenshot_texture != null) {
@@ -1642,9 +1685,10 @@ pub const Engine = struct {
             }
         }
 
-        // Render sub-phases
+        // CPU timing breakdown
         if (c.igCollapsingHeader("Render", 0)) {
-            const render_phases = [_]struct { name: []const u8, avg: f64 }{
+            const phases = [_]struct { name: []const u8, avg: f64 }{
+                .{ .name = "systems (ECS)", .avg = s.avg_systems },
                 .{ .name = "prepare", .avg = s.avg_prepare },
                 .{ .name = "instances", .avg = s.avg_instances },
                 .{ .name = "scene", .avg = s.avg_scene },
@@ -1652,7 +1696,7 @@ pub const Engine = struct {
                 .{ .name = "imgui", .avg = s.avg_imgui },
             };
 
-            for (render_phases) |phase| {
+            for (phases) |phase| {
                 var phase_buf: [128]u8 = undefined;
                 const phase_line = std.fmt.bufPrintZ(&phase_buf, "{d:.2}ms {s}", .{
                     phase.avg / 1000.0,
@@ -1662,7 +1706,48 @@ pub const Engine = struct {
             }
         }
 
+        // Per-system profiling (from flecs time_spent)
+        if (c.igCollapsingHeader("Systems", 0)) {
+            self.drawSystemTimings();
+        }
+
         c.igEnd();
+    }
+
+    /// Record a system's execution time in performance counter ticks.
+    pub fn recordSystemTime(self: *Engine, system_entity: ecs.entity_t, elapsed_ticks: u64) void {
+        // Find existing slot or allocate a new one
+        var empty: ?*SystemTimeEntry = null;
+        for (&self.system_prev_time) |*entry| {
+            if (entry.entity == system_entity) {
+                entry.record(system_entity, elapsed_ticks);
+                return;
+            }
+            if (empty == null and entry.entity == 0) empty = entry;
+        }
+        if (empty) |slot| slot.record(system_entity, elapsed_ticks);
+    }
+
+    /// Snapshot all per-system timing averages. Called alongside FrameStats.accumulate.
+    fn snapshotSystemTimes(self: *Engine) void {
+        const pf = c.SDL_GetPerformanceFrequency();
+        for (&self.system_prev_time) |*entry| {
+            if (entry.entity != 0) entry.snapshot(pf);
+        }
+    }
+
+    /// Draw per-system timing in ImGui.
+    fn drawSystemTimings(self: *Engine) void {
+        for (&self.system_prev_time) |*entry| {
+            if (entry.entity == 0) continue;
+            const name_ptr: [*:0]const u8 = ecs.get_name(self.world, entry.entity) orelse continue;
+            var sys_buf: [128]u8 = undefined;
+            const line = std.fmt.bufPrintZ(&sys_buf, "{d:>6.3}ms {s}", .{
+                entry.time_us / 1000.0,
+                @as([]const u8, std.mem.span(name_ptr)),
+            }) catch continue;
+            c.igTextUnformatted(line);
+        }
     }
 
     // ageSystem and flyCameraSystem are now proper flecs systems with query
