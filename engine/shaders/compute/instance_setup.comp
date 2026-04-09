@@ -62,7 +62,7 @@ struct EntityData {
 struct InstanceData {
     mat4 mvp;
     mat4 model;
-    vec4 flags;  // .x = receives_shadow
+    vec4 flags;  // .x = receives_shadow, .yzw = 1/scale² (for normal matrix)
 };
 
 // ---------------------------------------------------------------------------
@@ -234,6 +234,7 @@ void main() {
             return;
         }
         mat4 model = buildModelMatrix(e.position.xyz, e.rotation.xyz, e.scale_flags.xyz);
+        // Shadow pass doesn't need normal correction, but we still write the struct
         instances[idx] = InstanceData(vp * model, model, vec4(0.0));
         return;
     }
@@ -265,7 +266,15 @@ void main() {
     // Visible: build matrices and compact into batch region
     mat4 model = buildModelMatrix(e.position.xyz, e.rotation.xyz, e.scale_flags.xyz);
     mat4 mvp = vp * model;
-    vec4 out_flags = vec4(e.position.w, 0.0, 0.0, 0.0);
+
+    // Pack 1/scale² into flags.yzw for the vertex shader's normal matrix.
+    // The normal matrix (inverse-transpose of model 3x3) equals R·S⁻¹.
+    // Rather than passing a full mat3, the vertex shader reconstructs it as:
+    //   N = normalize(model * vec4(normal * inv_scale_sq, 0.0))
+    // because M_3x3 · diag(1/s²) · n = (R·S) · diag(1/s²) · n = R·S⁻¹·n
+    vec3 scl = e.scale_flags.xyz;
+    vec3 inv_scale_sq = 1.0 / (scl * scl);
+    vec4 out_flags = vec4(e.position.w, inv_scale_sq);
 
     // Atomically claim a slot in this batch's indirect draw command.
     // The returned value is the local instance index within the batch.

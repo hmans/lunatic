@@ -50,7 +50,7 @@ const fog_inject_msl = @embedFile("shader_fog_inject_comp_msl");
 pub const InstanceData = extern struct {
     mvp: [4][4]f32,
     model: [4][4]f32,
-    flags: [4]f32, // .x = receives_shadow (1.0 = yes, 0.0 = no)
+    flags: [4]f32, // .x = receives_shadow, .yzw = 1/scale² (for normal matrix)
 };
 
 const SceneUniforms = extern struct {
@@ -965,7 +965,8 @@ fn uploadInstances(self: *Engine, cmd: *c.SDL_GPUCommandBuffer, vp: Mat4, draw_c
         const model = Mat4.mul(Mat4.translate(pos.x, pos.y, pos.z), Mat4.mul(rotation, scl));
         const mvp = Mat4.mul(vp, model);
         const receives = if (ecs.has_id(self.world, entry.entity, ecs.id(ShadowReceiver))) @as(f32, 1.0) else @as(f32, 0.0);
-        instances[i] = .{ .mvp = mvp.m, .model = model.m, .flags = .{ receives, 0, 0, 0 } };
+        const s = if (ecs.get(self.world, entry.entity, Scale)) |sv| [3]f32{ sv.x, sv.y, sv.z } else [3]f32{ 1, 1, 1 };
+        instances[i] = .{ .mvp = mvp.m, .model = model.m, .flags = .{ receives, 1.0 / (s[0] * s[0]), 1.0 / (s[1] * s[1]), 1.0 / (s[2] * s[2]) } };
     }
 
     c.SDL_UnmapGPUTransferBuffer(self.gpu_device.?, transfer);

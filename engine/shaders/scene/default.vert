@@ -30,7 +30,7 @@ layout(location = 3) in vec4 in_tangent;  // .xyz = tangent direction, .w = hand
 struct InstanceData {
     mat4 mvp;    // Pre-multiplied: projection * view * model
     mat4 model;  // Model-to-world transform (used for lighting in world space)
-    vec4 flags;  // .x = receives_shadow (1.0 or 0.0)
+    vec4 flags;  // .x = receives_shadow, .yzw = 1/scale² (for normal matrix)
 };
 
 layout(std430, set = 0, binding = 0) readonly buffer InstanceBuffer {
@@ -50,12 +50,18 @@ void main() {
     gl_Position = inst.mvp * vec4(in_position, 1.0);
     world_pos = (inst.model * vec4(in_position, 1.0)).xyz;
 
-    // Transform normal and tangent to world space.
-    // Using vec4(..., 0.0) ignores translation — we only want rotation+scale.
-    // Note: for non-uniform scale, the normal should use the inverse-transpose
-    // of the model matrix. Currently the engine assumes uniform scale.
-    vec3 N = normalize((inst.model * vec4(in_normal, 0.0)).xyz);
+    // Transform normal to world space using the inverse-transpose of the model
+    // matrix, which handles non-uniform scale correctly. The normal matrix
+    // (R·S⁻¹) is reconstructed from the model matrix and 1/scale² stored in
+    // flags.yzw:  model_3x3 · diag(1/s²) · n = (R·S)·diag(1/s²)·n = R·S⁻¹·n
+    vec3 inv_scale_sq = inst.flags.yzw;
+    vec3 N = normalize((inst.model * vec4(in_normal * inv_scale_sq, 0.0)).xyz);
+
+    // Transform tangent by the model matrix (tangents transform like directions,
+    // not normals), then re-orthogonalize against the corrected normal to keep
+    // the TBN basis orthonormal under non-uniform scale.
     vec3 T = normalize((inst.model * vec4(in_tangent.xyz, 0.0)).xyz);
+    T = normalize(T - dot(T, N) * N);  // Gram-Schmidt re-orthogonalization
 
     // Bitangent is perpendicular to both N and T. The handedness factor
     // (in_tangent.w) accounts for mirrored UVs in the mesh data.
