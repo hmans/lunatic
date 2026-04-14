@@ -1,2 +1,11 @@
 [tools]
 zig = "latest"
+
+[tasks.setup]
+description = "Install all dependencies and prepare the repo for building"
+run = [
+  "brew install sdl3 luajit shaderc spirv-cross git-lfs",
+  "git lfs install",
+  "git lfs pull",
+  "cd mcp && npm install",
+]

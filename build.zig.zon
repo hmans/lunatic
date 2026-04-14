@@ -3,7 +3,7 @@
     .version = "0.15.2",
     .dependencies = .{
         .zflecs = .{
-            .url = "git+https://github.com/zig-gamedev/zflecs",
+            .url = "git+https://github.com/zig-gamedev/zflecs#631b46c4a284ad093c6963c45737d1568edddf71",
             .hash = "zflecs-0.2.0-dev-1PN3yg0OQQD8uFm8oLV-Bt-7rJGD8oTCso_X4i3dMmFm",
         },
         .zphysics = .{
